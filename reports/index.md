@@ -11,7 +11,7 @@ AI Agent と MCP（Model Context Protocol）を用いて、実験データの分
 
 ## 目次
 
-> **執筆進捗**: 本編 5 / 15 章、付録 0 / 3（第1章〜第5章 執筆済）
+> **執筆進捗**: 本編 6 / 15 章、付録 0 / 3（第1章〜第6章 執筆済）
 
 
 ### 第I部　なぜ必要か・何を作るか
@@ -28,7 +28,7 @@ AI Agent と MCP（Model Context Protocol）を用いて、実験データの分
 |---|---|---|
 | 第4章 | [ハンズオン0：環境構築](chapter-04.md) | ✅ 執筆済 |
 | 第5章 | [Jupyter MCPで最小の自然言語分析を動かす](chapter-05.md) | ✅ 執筆済 |
-| 第6章 | MCPの安全な使い方とHuman-in-the-loop | ⬜ 未着手 |
+| 第6章 | [MCPの安全な使い方とHuman-in-the-loop](chapter-06.md) | ✅ 執筆済 |
 
 ### 第III部　Skillを作る
 
