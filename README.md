@@ -1,26 +1,111 @@
-# Research Project: ARIMAgentDataAnalysisBook
+# AI エージェント時代のデータ分析入門
 
-**Project ID**: pj00001  
-**Created**: 2026-07-03
+> *An Agentic Data Analysis Cookbook —— for materials & nanotech researchers*
 
-## Directory Structure
+AI Agent と MCP（Model Context Protocol）を用いて、実験データの分析を **自然言語で** 実行できるようにするための実践書です。ARIM データポータルの材料・ナノテク研究者を主対象に、Python/Jupyter 経験者が **自分の実験データ向けの「データ分析用 Skill」を 1 つ以上自力で作成できる** 状態まで到達することを目標としています。
+
+## 📖 本書について
+
+| 項目 | 内容 |
+|---|---|
+| **対象読者** | ARIM データポータル会員（材料・ナノテク研究者）／Python・Jupyter 経験あり／MCP・AI Agent 未経験 |
+| **合格ライン** | 自分の実験データに対応する Skill を **動く・検証済み・再現できる** の 3 拍子で作れること |
+| **標準環境** | Python + JupyterLab + Jupyter MCP + GitHub Copilot CLI + ToolUniverse MCP（FastMCP / arXiv MCP / Paper Search MCP） |
+| **本編** | 全 15 章（第 I〜V 部） |
+| **付録** | A: プロンプト・Skill テンプレート集／B: MCP カタログ／C: トラブルシューティング（執筆予定） |
+| **執筆状況** | 本編 **15 / 15 章** 完了 ✅ 付録 0 / 3 |
+
+> [!NOTE]
+> 本書は多様な装置カテゴリを **6 つのデータ型**（スペクトル型／クロマトグラム・時系列型／画像・顕微鏡型／回折・散乱パターン型／表形式・プロセス条件型／マルチモーダル統合型）に抽象化して扱います。1 つの型で Skill を作れれば、同じ型の他装置へ骨格を転用できます。
+
+## 🗂 目次
+
+**➡︎ 完全な目次と各章へのリンクは [reports/index.md](reports/index.md) を参照してください。**
+
+### 第Ⅰ部　なぜ必要か・何を作るか
+- 第1章 なぜ今「AI エージェント時代のデータ分析」なのか
+- 第2章 ARIM データと実験ワークフローの全体像
+- 第3章 AI Agent・MCP・Skill の全体像
+
+### 第Ⅱ部　最小環境で動かす
+- 第4章 ハンズオン 0：環境構築
+- 第5章 Jupyter MCP で最小の自然言語分析を動かす
+- 第6章 MCP の安全な使い方と Human-in-the-loop
+
+### 第Ⅲ部　Skill を作る
+- 第7章 データ分析用 Skill の設計原則
+- 第8章 実験データを分析可能な形に整える
+- 第9章 ハンズオン 1：単一データ解析 Skill を作る
+
+### 第Ⅳ部　Skill を拡張・検証する
+- 第10章 ハンズオン 2：文献・知識統合で考察を強化する
+- 第11章 ハンズオン 3：複数モダリティ連携 Skill を作る
+- 第12章 分析結果の検証・評価・レポート化
+
+### 第Ⅴ部　横展開と運用
+- 第13章 装置カテゴリ別の適用テンプレート
+- 第14章 失敗パターンとリスク管理
+- 第15章 運用設計と組織導入（終章）
+
+## 🚀 読み進め方
+
+| 目的 | 推奨ルート |
+|---|---|
+| **最短で「動く」を体験したい** | 第 1 → 3 → 4 → 5 章 |
+| **最初の Skill を自力で作りたい** | 第 1 〜 9 章を順に（特に第 6 章・第 8 章は飛ばさない） |
+| **自分の現場・組織へ展開したい** | 第 10 〜 15 章 + 付録 A（予定） |
+| **失敗を先に知っておきたい** | 第 14 章 → 該当章に戻る |
+
+## 📁 リポジトリ構成
 
 ```
-pj00001_ARIMAgentDataAnalysisBook_20260703/
-├── manifest.yaml # プロジェクト管理マニフェスト
-├── prompts/      # ユーザー入力プロンプト履歴
-│   └── ...       # 元プロンプト、構造化プロンプト等
-├── research/     # Web検索で得られた情報
-│   └── ...       # 検索結果、ソースメモ等
-└── reports/      # 最終的なレポート
-    └── ...       # 分析レポート、提案書等
+agentic-data-analysis-cookbook/
+├── README.md               # 本ファイル
+├── manifest.yaml           # プロジェクト管理マニフェスト
+├── reports/                # 本編・付録の Markdown 原稿
+│   ├── index.md            # 全 15 章 + 付録の目次
+│   ├── chapter-outline.md  # 執筆計画・章別責務分離
+│   ├── chapter-01.md 〜 chapter-15.md
+│   └── appendix-*.md       # 付録（執筆予定）
+├── research/               # 執筆過程で収集した情報・引用ソース
+└── prompts/                # 執筆時のプロンプト履歴
 ```
 
-## Research Notes
+## 🛠 執筆・レビュー方針
 
-(Add your research notes here)
+- **記法**: GitHub Flavored Markdown。注釈は `> [!NOTE] / [!WARNING] / [!TIP] / [!IMPORTANT]`
+- **図**: Mermaid を優先（ASCII 図は必要な場合のみ）
+- **章末**: 到達目標／扱うこと・扱わないこと／章末ワーク／本章のまとめ／参考資料
+- **品質保証**: 各章について「執筆 → 実機テスト → rubber-duck review → 修正 → 再テスト → commit」のサイクル
 
-## Sources
+## 📜 ライセンスと利用について
 
-(Track your sources here)
+- 原稿（本書テキスト・図表）: **CC BY 4.0**（帰属明示のうえ再利用可）
+- コード例・スクリプト: **MIT License**
+- 引用元の第三者コンテンツ（論文・ツール・データ）は各出典元のライセンスに従います
 
+> [!WARNING]
+> 本書に登場する装置別の物理定数・分解温度・帰属候補値は **参考情報** です。実験・論文投稿時は必ず一次文献・自装置校正データで確認してください。
+
+## 🤝 コントリビュート
+
+Issue / PR は歓迎します。特に以下は大歓迎です：
+
+- 誤植・技術的誤り・引用漏れの指摘
+- 装置カテゴリ別の失敗事例（第 14 章）や運用パターン（第 15 章）の追加
+- 環境構築の再現ログ（第 4 章）
+- 他分野研究者からの「6 つのデータ型」枠組みへのフィードバック
+
+## 🔗 関連リンク
+
+- [ARIM データポータル](https://nanonet.go.jp/data_service/page/textbook.html)
+- [Model Context Protocol 仕様](https://modelcontextprotocol.io/)
+- [GitHub Copilot CLI](https://github.com/features/copilot)
+
+## 👤 著者
+
+- **仁科 直哉**（[@nahisaho](https://github.com/nahisaho)）
+
+---
+
+**Status**: 本編 15 / 15 章 完成 ✅ ｜ 付録 執筆中 🚧 ｜ Last update: 2026-07-04
