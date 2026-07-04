@@ -75,6 +75,24 @@ with pm.Model() as model:
 - `observed=` が**付く**確率変数 = 尤度（データが実現値）
 - `pm.Deterministic` は事後保存対象にしたい派生量にのみ使う（すべてを Deterministic にしない）
 
+> [!IMPORTANT]
+> **上記は in-sample 専用**：`x_obs` が plain NumPy array のままだと、**同じモデルを新規データの予測に再利用できません**（`x_obs` がフィット時の値に固定されるため）。out-of-sample 予測を Skill として提供する場合は、入力を `pm.Data` に包み、`pm.set_data` で差し替えます：
+>
+> ```python
+> with pm.Model(coords={"sample": np.arange(len(y_data))}) as model:
+>     x = pm.Data("x", x_obs, dims="sample")
+>     alpha = pm.Normal("alpha", mu=0.0, sigma=1.0)
+>     beta  = pm.Normal("beta",  mu=0.0, sigma=1.0)
+>     sigma = pm.HalfNormal("sigma", sigma=1.0)
+>     mu = pm.Deterministic("mu", alpha + beta * x, dims="sample")
+>     y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_data, dims="sample")
+>
+> # 予測時
+> with model:
+>     pm.set_data({"x": x_new}, coords={"sample": np.arange(len(x_new))})
+>     idata_pred = pm.sample_posterior_predictive(idata, random_seed=42)
+> ```
+
 > [!TIP]
 > **命名規則**：Skill 仕様書 ⑤（禁止事項）と揃えて、パラメータ名は **snake_case・単位付きコメント**を推奨します（`alpha  # eV, offset`）。ArviZ の可視化で名前がそのまま軸ラベルになるため、後から書き換えるコストが大きい。
 
@@ -101,7 +119,7 @@ with pm.Model(coords=coords) as model:
 
 ```python
 with model:
-    prior_pred = pm.sample_prior_predictive(samples=500, random_seed=42)
+    prior_pred = pm.sample_prior_predictive(draws=500, random_seed=42)
 ```
 
 `prior_pred.prior_predictive["y_obs"]` が **prior のみから生成された仮想観測**（500 × n_samples 行列）。これを ArviZ でプロットして、**物理的に不可能な値**（負の bandgap、100% を超える収率など）が高頻度で出ていないかを確認します。
@@ -161,18 +179,22 @@ with model:
 
 ### 収束診断の「見る場所」
 
-**5 つのシグナル**を、常に同じ順序で見ます：
+**5 つのシグナル + 1 目視**を、常に同じ順序で見ます：
 
 | 順序 | 診断量 | 見方 | 警告の閾値 |
 |---|---|---|---|
-| 1 | `divergences` | `idata.sample_stats["diverging"].sum()` | > 0 で要調査、> 10 で対処必須 |
-| 2 | $\hat{R}$（R-hat） | `az.summary(idata)["r_hat"]` | > 1.01 で要注意、> 1.05 で対処必須 |
-| 3 | ESS bulk / ESS tail | `az.summary(idata)[["ess_bulk", "ess_tail"]]` | < 400 で分位点推定が不安定 |
+| 0（目視） | Trace plot | `az.plot_trace(idata, var_names=["alpha", "beta", "sigma"])` | chain が"毛虫状"に重なっているか（分離・段差は不整合） |
+| 1 | `divergences` | `int(idata.sample_stats["diverging"].sum().item())` | > 0 で要調査、> 10 で対処必須 |
+| 2 | $\hat{R}$（R-hat） | `az.summary(idata)["r_hat"]` | > 1.01 で要確認、> 1.05 は明確な未収束の強い警告 |
+| 3 | ESS bulk / ESS tail | `az.summary(idata)[["ess_bulk", "ess_tail"]]` | 4 chains の総 ESS で 400 が最低ライン。tail quantile / threshold probability / rare-event 推定はより大きな ESS を要求 |
 | 4 | Tree depth | `sample_stats["tree_depth"]` の最大 | `max_treedepth`（デフォルト 10）に張り付いていたら reparameterize |
-| 5 | Energy（BFMI） | `az.bfmi(idata)` | < 0.3 で階層モデル要疑い |
+| 5 | Energy（BFMI） | `az.bfmi(idata)` | < 0.3 で階層構造・スケーリング・重い裾・prior 広すぎを疑う |
 
 > [!IMPORTANT]
-> **$\hat{R}$ の推奨閾値は 1.01**：かつては 1.1 が使われましたが、Vehtari et al. (2021) 以降 **1.01** が標準です [[10-1]](#ref-10-1)。ArviZ もこの閾値をベースに実装されています。
+> **$\hat{R}$ の推奨閾値は 1.01**：かつては 1.1 が使われましたが、Vehtari et al. (2021) 以降 **1.01** が標準です [[10-1]](#ref-10-1)。ArviZ もこの閾値をベースに実装されています。「> 1.05 対処必須」は本書の運用目安であり、Skill 認定の合否ラインは組織で調整してください。
+
+> [!TIP]
+> **YAML 保存時のスカラ変換**：`idata.sample_stats["diverging"].sum()` は xarray の scalar DataArray を返します。provenance にそのまま書くと型互換で事故ります。`int(x.item())` / `float(x.item())` で Python scalar に変換してから記録します（後述の `diagnostics_summary` テンプレはこれを想定した値）。
 
 ### divergences への一次対応
 
@@ -186,11 +208,18 @@ Skill provenance に**必ず記録**する診断量：
 
 ```yaml
 diagnostics_summary:
+  diagnostics_pass:  true               # 下記 thresholds を全て満たしたかの派生ブール
+  thresholds:
+    max_rhat:        1.01
+    min_ess_bulk:    400                # 全パラメータの最小値に対する下限
+    min_ess_tail:    400
+    max_divergences: 0
+    min_bfmi:        0.3
   n_divergences:     0
   max_rhat:          1.003
-  min_ess_bulk:      1250
-  min_ess_tail:      980
-  max_tree_depth:    8              # max_treedepth 未満なら健全
+  min_ess_bulk:      1250               # 全パラメータ中の最小値
+  min_ess_tail:      980                # 同上
+  max_tree_depth:    8                  # max_treedepth 未満なら健全
   bfmi_min:          0.85
   sampler:           pymc.NUTS
   target_accept:     0.90
@@ -203,6 +232,9 @@ diagnostics_summary:
   random_seed:       42
 ```
 
+> [!NOTE]
+> `min_ess_bulk` / `min_ess_tail` は **モデル内の全パラメータの最小値**として運用します。特定パラメータ（例：関心量）だけの ESS を別途記録したい場合は `key_parameters: {x_unknown: {ess_bulk: 1450, ess_tail: 1100}}` を追加。
+
 ---
 
 ## 10.5 Posterior predictive check：事後で観測を再現できるか
@@ -211,14 +243,15 @@ diagnostics_summary:
 
 ```python
 with model:
-    ppc = pm.sample_posterior_predictive(idata, random_seed=42)
-    idata.extend(ppc)
+    pm.sample_posterior_predictive(
+        idata, random_seed=42, extend_inferencedata=True,
+    )
 
 import arviz as az
 az.plot_ppc(idata, num_pp_samples=100)
 ```
 
-`az.plot_ppc` は観測データのヒストグラムに、事後予測分布からのサンプルを重ねます。**分布形が一致するか**、**外れ値の位置・量が現実的か**を見ます。
+`az.plot_ppc` は**観測データの分布**（デフォルトでは KDE）に、事後予測分布からのサンプルを重ねます。**分布形が一致するか**、**外れ値の位置・量が現実的か**を見ます。
 
 ### 診断の観点
 
@@ -240,7 +273,7 @@ az.plot_ppc(idata, num_pp_samples=100)
 az.plot_bpv(idata, kind="p_value")       # Bayesian p-value
 ```
 
-Bayesian p-value が **0.05〜0.95** に収まっているのが健全。0 や 1 近傍は「観測の特徴を事後予測が説明できていない」サインです。
+Bayesian p-value が **0 または 1 に極端に近い場合**、観測の特徴を事後予測が説明できていないサインです。**0.05〜0.95 は粗い目安**であり、頻度論の仮説検定のような厳密な合否ラインではありません。**モデル不整合の検出用シグナル**として使います。
 
 ---
 
@@ -275,34 +308,47 @@ with pm.Model(coords={"sample": np.arange(len(y_obs))}) as calibration:
 
 # --- 5 ステップ ---
 with calibration:
-    prior_pred = pm.sample_prior_predictive(500, random_seed=42)   # ② prior predictive
-    idata      = pm.sample(1000, tune=1000, chains=4,
-                           target_accept=0.90, random_seed=42)     # ③ サンプリング
-    idata.extend(pm.sample_posterior_predictive(idata,
-                                                random_seed=42))    # ⑤ posterior predictive
+    prior_pred = pm.sample_prior_predictive(draws=500, random_seed=42)     # ② prior predictive
+    idata      = pm.sample(draws=1000, tune=1000, chains=4,
+                           target_accept=0.90, random_seed=42)             # ③ サンプリング
+    pm.sample_posterior_predictive(idata, random_seed=42,
+                                   extend_inferencedata=True)              # ⑤ posterior predictive
 ```
 
 ### 未知試料の濃度予測
 
-未知信号 $y^\star$ が観測されたときの $x^\star$ の**事後分布**は、通常は逆問題として別途モデル化します（信号→濃度の逆写像）。最も透明な方法は、**未知濃度 $x^\star$ 自体をパラメータとして扱う**ことです：
+未知信号 $y^\star$ が観測されたときの $x^\star$ の**事後分布**は、通常は逆問題として別途モデル化します（信号→濃度の逆写像）。最も透明な方法は、**未知濃度 $x^\star$ 自体をパラメータとして扱う**ことです（Bayesian inverse regression）：
 
 ```python
-with pm.Model(coords={"sample": np.arange(len(y_obs))}) as inverse_cal:
+with pm.Model(coords={"std": np.arange(len(y_std_obs))}) as inverse_cal:
     alpha = pm.Normal("alpha", mu=0.0, sigma=5.0)
     beta  = pm.Normal("beta",  mu=1.0, sigma=1.0)
     sigma = pm.HalfNormal("sigma", sigma=1.0)
 
     # 既知標準の観測
     mu_std = alpha + beta * x_std
-    pm.Normal("y_std", mu=mu_std, sigma=sigma, observed=y_std_obs, dims="sample")
+    pm.Normal("y_std", mu=mu_std, sigma=sigma, observed=y_std_obs, dims="std")
 
-    # 未知試料の濃度（推定対象パラメータ）
-    x_unknown = pm.Normal("x_unknown", mu=0.0, sigma=5.0)
-    mu_unk    = alpha + beta * x_unknown
+    # 未知試料の濃度（推定対象パラメータ、物理的に非負・校正範囲内に制約）
+    x_unknown = pm.TruncatedNormal(
+        "x_unknown", mu=0.0, sigma=5.0,
+        lower=x_std.min(), upper=x_std.max(),   # 校正範囲外への外挿を抑制
+    )
+    mu_unk = alpha + beta * x_unknown
     pm.Normal("y_unknown", mu=mu_unk, sigma=sigma, observed=y_unknown_obs)
+
+    idata_inverse = pm.sample(
+        draws=1000, tune=1000, chains=4,
+        target_accept=0.90, random_seed=42,
+    )
+
+az.summary(idata_inverse, var_names=["x_unknown"])
 ```
 
-`az.summary(idata, var_names=["x_unknown"])` が **95% CrI 付きの未知濃度の事後分布**を返します。頻度論の外挿は逆行列演算で近似 CI を出しますが、ベイズ版はそのまま逆問題として自然に扱えます。
+`az.summary(...)` が **95% CrI 付きの未知濃度の事後分布**を返します。頻度論の外挿は逆行列演算で近似 CI を出しますが、ベイズ版はそのまま逆問題として自然に扱えます。
+
+> [!WARNING]
+> **物理制約を prior で入れる**：`Normal(0, 5)` のように制約なしにすると、**負の濃度・校正範囲外の値**が事後に混入し得ます。上記の `TruncatedNormal(..., lower=x_std.min(), upper=x_std.max())` は最小限の物理制約。ドメインに応じて `LogNormal`, `Uniform(0, C_max)`, `HalfNormal` なども検討してください。**校正範囲外の外挿は prior 依存が急激に強まる**ため、Skill 仕様書の適用範囲節で明示的に禁止します。
 
 > [!NOTE]
 > **仕様書の `uncertainty_scheme.posterior_quantity`** をここで使い分けます：
@@ -362,6 +408,26 @@ provenance:
   data_hash:          sha256:...
   random_seed:        42
 
+  # 第9章で導入済み（Skill 実行前に凍結）
+  prior_specification:
+    parameter:                       bandgap_offset
+    distribution:                    Normal
+    hyperparameters:                 {mu: 0.0, sigma: 0.5}
+    units:                           eV
+    parameter_scale:                 original
+    support:                         [-3.0, 3.0]
+    likelihood_context:              "Normal observation model with sigma_obs estimated"
+    justification:                   "内部レポート XX (2024)"
+    literature_ref:                  [ref-lab-report-2024]
+    justification_document:          docs/priors/bandgap_offset.md
+    data_cutoff_for_prior:           2025-12-31
+    prior_predictive_check_required: true
+    sensitivity_alternatives:
+      - {distribution: Normal, sigma: 1.0, label: weaker}
+      - {distribution: Normal, sigma: 0.2, label: stronger}
+    reviewed_by:                     "PI name"
+    review_date:                     2026-XX-XX
+
   # 第10章で追加
   sampler_config:
     sampler:          NUTS
@@ -382,22 +448,25 @@ provenance:
     sha256:           ...
 
   diagnostics_summary:
-    # §10.4 の diagnostics_summary をそのまま貼る
+    # §10.4 の diagnostics_summary をそのまま貼る（thresholds + diagnostics_pass を含む）
 
   prior_predictive_summary:
-    # §10.3 の記録
+    # §10.3 の記録（prior_specification.prior_predictive_check_required=true の実行結果）
   posterior_predictive_summary:
     bayesian_p_value:      0.42
     kolmogorov_smirnov_p:  0.35    # 参考、閾値ではない
 
   sensitivity_analysis:
-    # §10.7 の記録
+    # §10.7 の記録（prior_specification.sensitivity_alternatives の実行結果）
 
   uncertainty_scheme:
     # 第9章 §9.5 のスキームをそのまま
 ```
 
 **エージェント時代の運用**：この provenance を **Skill 実行の出力に強制的に含めさせる**設計にします（テンプレを出力しない Skill は監査違反）。第14章の失敗パターンで再登場します。
+
+> [!NOTE]
+> **依存関係**：`prior_predictive_summary` は `prior_specification` の子、`sensitivity_analysis` は `prior_specification.sensitivity_alternatives` の実行結果、`diagnostics_summary.diagnostics_pass` が `false` なら Skill は成功条件④を満たしません。この 4 者は**独立に書き換えてはいけない**ため、Skill 実行時にワンショットで生成します。
 
 ---
 
