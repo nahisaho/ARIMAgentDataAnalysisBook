@@ -16,7 +16,7 @@
 | 線形回帰 + 正則化 | `Ridge`, `Lasso`, `ElasticNet` | `alpha` | 特徴量スケール前提 |
 | ロジスティック回帰 | `LogisticRegression` | `C`, `penalty`, `class_weight` | `C = 1/alpha` |
 | PLS | `PLSRegression` | `n_components` | 内部で中心化・スケーリング |
-| RandomForest | `RandomForestRegressor`, `-Classifier` | `n_estimators`, `max_depth`, `min_samples_leaf` | OOB スコアは per-tree |
+| RandomForest | `RandomForestRegressor`, `-Classifier` | `n_estimators`, `max_depth`, `min_samples_leaf` | OOB は `bootstrap=True` 時に各サンプルを OOB trees の集約予測で評価 |
 | Gradient Boosting | `GradientBoostingRegressor`, `HistGradientBoostingRegressor` | `learning_rate`, `n_estimators`, `max_depth` | Hist は欠損対応 |
 | PCA | `PCA` | `n_components` | `explained_variance_ratio_` を確認 |
 | k-means | `KMeans` | `n_clusters`, `init`, `n_init` | 初期化で結果変動 |
@@ -49,7 +49,7 @@ pipe.set_output(transform="pandas")   # 特徴量名維持
 | 状況 | CV | 引数 |
 |---|---|---|
 | iid・シャッフル可 | `KFold` | `shuffle=True, random_state=<int>` |
-| 群単位で予測 | `GroupKFold` | `groups=group_key` |
+| 群単位で予測 | `GroupKFold` | `groups=group_key`（sklearn 1.4+ で metadata routing 有効時は `params={"groups": g}`） |
 | クラス不均衡 + 群 | `StratifiedGroupKFold` | `groups=, y=` |
 | 時系列 | `TimeSeriesSplit` | `n_splits=, gap=<int>` |
 | Nested CV | `GridSearchCV` inside `cross_validate` | outer/inner を別々に |
@@ -112,9 +112,9 @@ res = cross_validate(pipe, X, y, cv=cv, groups=g,
 |---|---|---|
 | 実数（正負両方、スケール既知） | `Normal(mu, sigma)` | `Normal(0, 5)` |
 | 正のスケールパラメータ | `HalfNormal(sigma)` or `HalfCauchy(beta)` | `HalfNormal(1)` |
-| 相関行列 | `LKJCholeskyCov(eta, sd_dist=HalfNormal(1))` | `eta=2` で弱い相関 |
+| 相関行列（コレスキー分解） | `LKJCholeskyCov(name, eta, n, sd_dist=...)` | `chol, corr, sigmas = pm.LKJCholeskyCov("chol", eta=2, n=K, sd_dist=pm.HalfNormal.dist(1.0, size=K))` — `sd_dist` は `.dist()` 経由、`n` は次元数 |
 | Group effect（sum-to-zero） | `ZeroSumNormal(sigma, dims=...)` | identifiable |
-| Weakly informative | `Normal(0, 2.5)`（標準化後） | Gelman recommendation |
+| Weakly informative（標準化済み特徴量の回帰係数、特にロジスティック） | `Normal(0, 2.5)` | Gelman recommendation（対象は必ず標準化後） |
 | Wide "flat" | `Normal(0, 100)` | **避けるべき**（Ch14 §14.5） |
 | 制約付き（[0, 1]） | `Beta(alpha, beta)` | `Beta(2, 2)` は中央寄り |
 | 分散比 | `HalfStudentT(nu=3, sigma)` | 重い裾で robust |
@@ -125,12 +125,14 @@ res = cross_validate(pipe, X, y, cv=cv, groups=g,
 
 | 指標 | しきい値（既定） | 意味 | 対処 |
 |---|---|---|---|
-| $\hat{R}$ (rhat) | ≤ 1.01 | chain 間の一致 | `target_accept` を上げる、`tune` 増やす |
+| $\hat{R}$ (rhat) | ≤ 1.01 | chain 間の一致 | `tune` 増、初期値散開、`chains` 増 |
 | ESS bulk | ≥ 400（chain あたり 100） | 有効サンプルサイズ（中心） | `draws` 増やす |
 | ESS tail | ≥ 400 | 裾のサンプル効率 | non-centered 化 |
-| divergences | 0（許容 0.5%） | HMC の発散 | `target_accept=0.99`, 非中心化 |
+| divergences | **0**（非ゼロは保留・再フィット） | HMC の発散 | 発散点の localize → scale/標準化 → 非中心化 → 最終手段で `target_accept` を上げる |
 | BFMI | ≥ 0.3 | エネルギー適応度 | reparameterize |
-| max treedepth | reached < 1% | tree 深さ天井到達率 | `max_treedepth=12` |
+| max treedepth | `reached_max_treedepth == False` | tree 深さ天井到達 | まず幾何を確認、その後 `max_treedepth=15` 検討 |
+
+> **divergences のしきい値**：Ch12 §12.9 では認定要件として **非ゼロは不許可**。「〜% までなら OK」ではなく、原因（曲率・スケール・パラメータ化）を必ず特定してから再サンプルする。
 
 ### B.2.4 事後予測チェック（Ch12 §12.5）
 
@@ -163,10 +165,12 @@ with open("artifacts/posterior_v1.nc", "rb") as f:
 
 | 状況 | バックエンド | 引数 |
 |---|---|---|
-| 小規模・PyMC 標準 | PyTensor NUTS | （default） |
+| 小規模・PyMC 標準 | PyTensor NUTS | `nuts_sampler="pymc"`（明示推奨） |
 | 中〜大規模階層 | NumPyro NUTS on CPU | `nuts_sampler="numpyro"` |
 | GPU 利用可 | NumPyro NUTS on GPU | `+ jax.config.update("jax_platform_name", "gpu")` |
 | Rust NUTS | NutPie | `nuts_sampler="nutpie"` |
+
+> **`nuts_sampler` を必ず明示する**：PyMC の内部デフォルトはバージョンや導入済みパッケージによって変わり得る（例: `nutpie` が入っていれば自動選択されるケースがある）。再現性・provenance のために **`nuts_sampler=` を省略しない**。認定実行では固定必須（Ch14 §14.7）。
 
 ### B.3.2 環境設定（NumPyro/JAX）
 
@@ -185,12 +189,16 @@ print(jax.devices())                              # 実行デバイス確認
 
 ## B.4 MCMC トラブル対処早見表
 
-| 症状 | 原因候補 | 対処 |
+**対処の優先順位（Ch12 §12.6 の梯子）**：
+`(1) 発散点の localize` → `(2) スケール・標準化見直し` → `(3) 非中心化・reparameterize` → `(4) 最終手段で target_accept を上げる`。
+いきなり `target_accept=0.99` にすると根本原因が隠れる。
+
+| 症状 | 原因候補 | 対処（優先順） |
 |---|---|---|
-| `divergences > 0` | 事後の曲率が急峻、centered parameterization | `target_accept=0.99` → 非中心化 |
+| `divergences > 0` | 事後の曲率が急峻、centered parameterization、スケール不整合 | localize（`az.plot_pair` で発散点確認）→ 標準化 → 非中心化 → `target_accept=0.99` |
 | `rhat > 1.01` | chain が混ざっていない | `tune` 増、初期値散開、`chains` 増 |
 | `ESS_tail` 小 | 裾のサンプル効率悪 | 非中心化、`draws` 増 |
-| `max_treedepth reached` | tree が浅すぎ | `max_treedepth=12`（デフォルト 10） |
+| `reached_max_treedepth == True` | tree が浅すぎ／幾何が悪い | まず幾何・スケールを確認、それでもダメなら `max_treedepth=15` |
 | `NaN` in log_prob | 数値不安定、prior 極端 | prior 見直し、`jitter` 増 |
 | `BFMI < 0.3` | エネルギー分布が悪い | reparameterize、scale 調整 |
 | 予測が prior に張り付く | prior が狭すぎ | Prior sensitivity（Ch14 §14.5） |
@@ -240,7 +248,7 @@ mu = pm.Deterministic("mu", mu_raw * sigma_group, dims="group")
 | `bernoulli(p)` | `pm.Bernoulli(name, p)` |
 | `binomial(n, p)` | `pm.Binomial(name, n, p)` |
 | `poisson(lambda)` | `pm.Poisson(name, lambda)` |
-| `lkj_corr_cholesky(eta)` | `pm.LKJCholeskyCov(name, eta, ...)` |
+| `lkj_corr_cholesky(eta)` | `pm.LKJCorr(name, eta, n)`（相関のみ）／ `pm.LKJCholeskyCov(name, eta, n, sd_dist=...)`（共分散、SD 付き） |
 
 ### B.5.3 モデル対応例：線形回帰
 
@@ -254,15 +262,17 @@ data {
 parameters {
   real alpha;
   real beta;
-  real<lower=0> sigma;
+  real<lower=0> sigma;      // half-normal は「制約 + normal」で表現
 }
 model {
   alpha ~ normal(0, 5);
   beta ~ normal(0, 5);
-  sigma ~ half_normal(0, 1);
+  sigma ~ normal(0, 1);     // 制約 <lower=0> により half-normal になる
   y ~ normal(alpha + beta * x, sigma);
 }
 ```
+
+> **Stan には `half_normal` という分布関数はない**。`real<lower=0>` の制約付きパラメータに `normal(0, sigma)` を書くと自動的に half-normal として扱われる。
 
 **PyMC**:
 ```python
@@ -294,8 +304,8 @@ transformed parameters {
 }
 model {
   mu_grand ~ normal(0, 5);
-  sigma_group ~ half_normal(1);
-  sigma_y ~ half_normal(1);
+  sigma_group ~ normal(0, 1);  // <lower=0> により half-normal
+  sigma_y ~ normal(0, 1);      // 同上
   eta ~ normal(0, 1);
   for (n in 1:N)
     y[n] ~ normal(mu_j[group[n]], sigma_y);
@@ -322,7 +332,12 @@ with pm.Model(coords=coords) as m:
 
 **Stan**:
 ```stan
-data { int N; matrix[N, K] X; array[N] int y; }
+data {
+  int<lower=1> N;
+  int<lower=1> K;                       // 特徴量数
+  matrix[N, K] X;
+  array[N] int<lower=0, upper=1> y;
+}
 parameters { vector[K] beta; real alpha; }
 model {
   beta ~ normal(0, 2.5);
