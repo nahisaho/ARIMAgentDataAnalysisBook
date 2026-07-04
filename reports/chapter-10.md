@@ -13,6 +13,9 @@
 > [!NOTE]
 > 本章は **第9章との差分中心** の構成です。Skill ディレクトリ構造・progressive disclosure・6評価基準・承認ゲートといった共通事項はすべて第9章で説明済みですので、必要に応じて第9章を参照してください。
 
+> [!IMPORTANT]
+> 本書の合格ラインは「**動く・検証済み・再現できる**」の3拍子であり、「**失敗しない**」ことではありません。文献照合Skillも例外ではなく、外部DBの応答が変わっても「候補提示までは動き、記録された検索日・クエリ・返却IDから同じ手順を再現できる」ことを目指します。
+
 ---
 
 ## 10.1　この章で作るSkillの概要（差分）
@@ -51,6 +54,9 @@ flowchart LR
 ---
 
 ## 10.2　arXiv MCP と Paper Search MCP の使い分け
+
+> [!IMPORTANT]
+> **arXiv MCP / Paper Search MCP は本書の標準5点環境には含まれない発展構成**です（第3章参照）。標準5点は「Python + JupyterLab + Jupyter MCP + GitHub Copilot CLI + ToolUniverse MCP」で、本章のみ発展構成としてこの2つを追加します。標準5点だけで第9章までのハンズオンは完結できるため、本章に進む前に必要性を判断してください。
 
 詳細は付録B「MCPカタログ」に集約しています。ここでは本章のハンズオンに必要な最小限を整理します。
 
@@ -117,8 +123,11 @@ tags: [literature, cross-check, materials, spectroscopy]
 - **物質名（Si・ダイヤモンド・グラファイト等）を推定して出力すること**（人間の判断領域）
 - Agent の**チャット応答**で物質同定・帰属を口頭で提示すること（第9章と同じ）
 - 検索件数がゼロの場合に「該当なし」以外の推測を書くこと
+- **Skill および AI Agent は、候補文献が同定・帰属を「確認した」「妥当性を裏付けた」と判定しない**（候補提示・波数マッチ根拠の提示までに止め、最終判断は人間の研究者。第7章の循環設計問題・第15章 `common_forbidden.yaml` と対応）
+- **物質同定・ピーク帰属・相同定・Rietveld による組成/相の自動確定を、出力ファイルにも Agent のチャット応答にも含めない**
+- **外部検索クエリに `sample_id` / 組成 / プロセス条件（成膜・熱処理条件など） / 装置メタデータ / 共同研究先名 / 課題番号 / APIトークン を含めない**（第6章 §6.6 の漏洩対象と整合）。`material_hint` を使う場合も、公開可能な一般名称に限定し、送信前にクエリ文字列を人間が承認する
 
-**⑥ 再現性条件**：`arxiv-mcp` `paper-search-mcp` のバージョン、検索クエリ、Δ 幅、検索日時（UTC）、返却された `doi` / `arxiv_id` の完全リストを `discussion` に記録する。同じ入力＋同じ検索日でも、外部DBの更新により結果が変わりうることを明記する。
+**⑥ 再現性条件**：`arxiv-mcp` `paper-search-mcp` のバージョン、検索クエリ、Δ 幅、検索日時（UTC）、返却された `doi` / `arxiv_id` の完全リストを `discussion` に記録する。加えて **標準環境バージョン**（第4章と揃える）：Python / JupyterLab / GitHub Copilot CLI / `jupyter-mcp-server==0.14.4` / `tooluniverse==1.4.4` と、本章の発展構成である文献MCPの実バージョンも `references/env-lock.txt` に記録する。同じ入力＋同じ検索日でも、外部DBの更新により結果が変わりうることを明記する。
 
 ---
 
@@ -153,12 +162,13 @@ tags: [literature, cross-check, materials, spectroscopy]
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["title", "matched_wavenumber_cm_inv", "source"],
+              "required": ["title", "url", "accessed_at_utc", "matched_wavenumber_cm_inv", "source"],
               "properties": {
                 "title":    {"type": "string"},
                 "doi":      {"type": ["string", "null"]},
                 "arxiv_id": {"type": ["string", "null"]},
                 "url":      {"type": "string", "format": "uri"},
+                "accessed_at_utc": {"type": "string", "format": "date-time"},
                 "matched_wavenumber_cm_inv": {"type": "number"},
                 "source":   {"type": "string", "enum": ["arxiv", "paper-search"]},
                 "excerpt":  {"type": "string"}
@@ -287,8 +297,8 @@ sequenceDiagram
 
 ### 実行例（成功）— 実機検証済み
 
-- 入力：第9章の実測ピーク `[519.65, 1331.96, 2900.88]` cm⁻¹、Δ=±10
-- **実機検証**（arXiv 公開APIを本Skillのバックエンドとして直接呼び出し）：クエリ `abs:"1332 cm" AND abs:diamond` で以下の実在論文3件を取得。
+- 入力：第9章の実測ピーク `[519.65, 1331.96, 2900.88]` cm⁻¹、Δ=±10、`material_hint=null`
+- **実機検証**（arXiv 公開APIを本Skillのバックエンドとして直接呼び出し）：`material_hint=null` のため物質名を含まないクエリ `abs:"1332 cm" AND abs:Raman` で以下の実在論文3件を取得（**物質名を検索語に入れるのは、人間が `material_hint` に public / non-confidential な値を明示して承認した場合のみ**）。
   - `arxiv_id=0806.1485` "Growth of Diamond Films from Tequila"
   - `arxiv_id=1608.07375` "Raman spectroscopic features of the neutral vacancy in diamond ..."
   - `arxiv_id=2202.06632` "Size-dependent thermal stability and optical properties of ultra-small nanodiamo..."
@@ -316,8 +326,11 @@ sequenceDiagram
 > 該当候補：Smith et al., "Raman study of Si nanostructures", DOI: 10.1234/fake.2024.
 
 **After**（Skill の validate_output.py が fatal を返した場合）：
-> literature-cross-check: fatal: invalid DOI format: 10.1234/fake.2024.
-> → Skill 実行を中止し、Agent が「候補なし（検索結果が形式検証で却下されました）」と `discussion` に記録。
+> literature-cross-check: fatal: DOI 10.1234/fake.2024 not found in MCP response (arxiv-mcp / paper-search-mcp のいずれのレスポンスにも含まれていない `doi`／`arxiv_id` は却下する — ガード1「MCP レスポンスとの突合」)。
+> → Skill 実行を中止し、Agent が「候補なし（検索結果が MCP 突合で却下されました）」と `discussion` に記録。
+
+> [!NOTE]
+> `10.1234/fake.2024` は DOI 正規表現 `^10\.\d{4,9}/[-._;()/:A-Z0-9]+$` を通過するため、regex 単体では検知できません。したがって `validate_output.py` は **MCP レスポンスの `doi` / `arxiv_id` allowlist との突合**（ガード1）を必ず併用し、Skill が出力する候補は「そのセッションで実際に MCP が返した ID の部分集合」に限定します。
 
 ---
 
