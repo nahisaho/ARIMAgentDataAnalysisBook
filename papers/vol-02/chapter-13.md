@@ -61,25 +61,40 @@
 > [!TIP]
 > **どちらを選ぶか**：物性値の scalar 回帰から入りたければ MatBench、スペクトル前処理も含めて練習したければ RRUFF。以降のコード例は MatBench の `matbench_expt_gap` を仮定します（実測バンドギャップ回帰）。RRUFF を選んだ場合は、Layer 1 の `X` に PLS 用のスペクトル行列を、`y` にピーク面積などの物性ラベルを差し込む形で読み替えてください。
 
-### データ契約と cache
+### データ契約と 3 分割（train / calibration / test）
 
-第4章の anti-leakage 契約（`data_split` を fit 前に凍結）に従います：
+Layer 2 はベイズ校正で「Layer 1 の予測 → 真値」を推定します。この校正モデルを **test set で fit すると評価用データが漏洩**します。そのため本章では 3 分割を採用します：
+
+| 分割 | 用途 |
+|---|---|
+| `train` | Layer 1（sklearn）を fit |
+| `calibration` | Layer 2（PyMC 校正曲線）を fit |
+| `test` | 3 層すべてを一切触らない**最終評価専用** |
+
+第4章の anti-leakage 契約は「fit 前に凍結」を要求します。ここでは 3 分割それぞれのハッシュを凍結します：
 
 ```python
 from sklearn.model_selection import train_test_split
 
-X_train, X_test, y_train, y_test = train_test_split(
+X_temp, X_test, y_temp, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, shuffle=True,
 )
-# split は「凍結」して provenance に記録：
+X_train, X_calib, y_train, y_calib = train_test_split(
+    X_temp, y_temp, test_size=0.25, random_state=43, shuffle=True,  # 0.25 * 0.8 = 0.2
+)
+
 data_split = dict(
-    method="random",
-    test_size=0.2,
-    random_state=42,
+    method="random_three_way",
+    fractions={"train": 0.6, "calibration": 0.2, "test": 0.2},
+    random_states=[42, 43],
     train_sha256=sha256_of(X_train, y_train),
+    calib_sha256=sha256_of(X_calib, y_calib),
     test_sha256 =sha256_of(X_test,  y_test),
 )
 ```
+
+> [!IMPORTANT]
+> **Layer 2 は calibration set で fit、test set は最後まで触らない**：これは **training-time calibration** の設計です。deployment 段階で新しい観測が来たときに再校正する **deployment recalibration** の運用は別で、その場合は運用中の別 hold-out を用意します。本章では training-time calibration を採用します。
 
 ### 合成階層データ層
 
@@ -116,7 +131,21 @@ cv_rmse_mean = -scores.mean()
 cv_rmse_std  = scores.std()
 
 pipe.fit(X_train, y_train)
-y_pred_test = pipe.predict(X_test)
+y_pred_calib = pipe.predict(X_calib)   # Layer 2 へ渡す
+y_pred_test  = pipe.predict(X_test)    # 最終評価まで開封しない
+```
+
+### Layer 1 の出力ハッシュ（次層 upstream 用）
+
+```python
+import hashlib, numpy as np
+def sha256_of_array(*arrs):
+    h = hashlib.sha256()
+    for a in arrs: h.update(np.ascontiguousarray(a).tobytes())
+    return h.hexdigest()
+
+y_pred_calib_sha256 = sha256_of_array(y_pred_calib)
+y_pred_test_sha256  = sha256_of_array(y_pred_test)
 ```
 
 ### Layer 1 の provenance（Ch4-8 の集約）
@@ -126,10 +155,14 @@ layer_1_regression:
   skill_id:      sklearn-regression-matbench-expt-gap
   skill_version: 1.0.0
   input_sha256:  <hash of X_train,y_train>
-  data_split:    {method: random, test_size: 0.2, random_state: 42, train_sha256: ..., test_sha256: ...}
+  data_split:    {method: random_three_way, fractions: {train: 0.6, calibration: 0.2, test: 0.2}, random_states: [42, 43], train_sha256: ..., calib_sha256: ..., test_sha256: ...}
   cv_scheme:     {type: KFold, n_splits: 5, shuffle: true, random_state: 42, group_key: null}
   model_config:  {estimator: Ridge, alpha: 1.0, scaler: StandardScaler}
-  metrics:       {cv_rmse_mean: <value>, cv_rmse_std: <value>, test_rmse: <value>, test_r2: <value>}
+  metrics:       {cv_rmse_mean: <value>, cv_rmse_std: <value>}   # test_* は最終評価まで空
+  output_artifacts:
+    y_pred_calib: {split: calibration, sha256: <y_pred_calib_sha256>, shape: [<n_calib>], dtype: float64}
+    y_pred_test:  {split: test,        sha256: <y_pred_test_sha256>,  shape: [<n_test>],  dtype: float64}
+    model_sha256: <fit 済み pipeline artifact hash>
   applicability_domain: {feature_ranges: {...}, y_range: [<min>,<max>]}
   package_versions:     {sklearn: "1.5.x", numpy: "1.26.x", ...}
   random_seed:          42
@@ -137,24 +170,26 @@ layer_1_regression:
 ```
 
 > [!IMPORTANT]
-> **Layer 1 の失敗パターン**：`cross_val_score` を pipeline **外の**スケーリングと組み合わせるとリーク（第14章で詳述）。ここでは `Pipeline` を作って CV に渡すことで自動的に fold 内で scaler が fit されます。
+> **Layer 1 の失敗パターン**：`cross_val_score` を pipeline **外の**スケーリングと組み合わせるとリーク（第14章で詳述）。ここでは `Pipeline` を作って CV に渡すことで自動的に fold 内で scaler が fit されます。また、Layer 2 で使うのは `y_pred_calib` のみ、`y_pred_test` は最終評価まで**開封しない**（実装上は変数として保持しますが、Skill の出力ファイルとしては test 系を暗号化してもよい）。
 
 ---
 
 ## 13.4 Layer 2：PyMC 校正曲線スキル
 
-Layer 1 は**点予測**しか出しません。実験判断（合否・出荷）には**予測不確実性**が要ります。Layer 2 は Layer 1 の予測を「観測」として、真値 y との関係をベイズ校正します（第10章 §10.6 の再掲）。
+Layer 1 は**点予測**しか出しません。実験判断（合否・出荷）には**予測不確実性**が要ります。Layer 2 は Layer 1 の **calibration split の予測** `y_pred_calib` を「観測」として、真値 `y_calib` との関係をベイズ校正します（第10章 §10.6 の再掲）。**test set は最後まで触りません**。
 
 ```python
-import pymc as pm
+import numpy as np, pymc as pm
 
-with pm.Model() as calib:
-    x_pred = pm.Data("x_pred", y_pred_test)  # Layer 1 の予測を入力に
-    alpha = pm.Normal("alpha", 0.0, 1.0)
-    beta  = pm.Normal("beta",  1.0, 0.5)     # 理想は 1
-    sigma = pm.HalfNormal("sigma", 1.0)
-    mu    = alpha + beta * x_pred
-    y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_test, dims="sample")
+coords = {"sample": np.arange(len(y_calib))}
+
+with pm.Model(coords=coords) as calib:
+    x_pred = pm.Data("x_pred", y_pred_calib, dims="sample")   # Layer 1 の calibration 予測
+    alpha  = pm.Normal("alpha", 0.0, 1.0)
+    beta   = pm.Normal("beta",  1.0, 0.5)                     # 理想は 1
+    sigma  = pm.HalfNormal("sigma", 1.0)
+    mu     = pm.Deterministic("mu", alpha + beta * x_pred, dims="sample")
+    y_obs  = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_calib, dims="sample")
     idata = pm.sample(
         draws=1000, tune=2000, chains=8,
         random_seed=list(range(42, 50)),
@@ -164,6 +199,9 @@ with pm.Model() as calib:
     pm.sample_posterior_predictive(idata, extend_inferencedata=True, random_seed=42)
 ```
 
+> [!TIP]
+> **新しい予測に差し替える**：Skill をデプロイして新しい `y_pred_new` に対する事後分布を得るときは、`pm.set_data({"x_pred": y_pred_new}, coords={"sample": np.arange(len(y_pred_new))})` で入れ替え、`pm.sample_posterior_predictive` を呼び出します（第10章 §10.6 の out-of-sample パターン）。
+
 ### Layer 2 の診断（第12章 `check_diagnostics()` を適用）
 
 ```python
@@ -171,14 +209,21 @@ diag = check_diagnostics(idata)     # 第12章 §12.2
 assert diag["diagnostics_pass"], f"L2 診断不合格: {diag['checks']}"
 ```
 
-### Layer 2 の provenance（Ch9-10 の集約）
+### Layer 2 の provenance（Ch9-10 の集約 + upstream 接続）
 
 ```yaml
 layer_2_calibration:
   skill_id:      pymc-calibration-linear
   skill_version: 1.0.0
-  input_sha256:  <hash of (y_pred_test, y_test)>
-  upstream:      {layer_1: {skill_id: sklearn-regression-matbench-expt-gap, skill_version: 1.0.0, input_sha256: <L1 と一致>}}
+  inputs:
+    y_pred:
+      upstream_layer:  layer_1
+      artifact_name:   y_pred_calib
+      sha256:          <Layer 1 の output_artifacts.y_pred_calib.sha256 と一致>
+    y_true:
+      sha256:          <hash of y_calib>
+      split:           calibration
+  input_sha256:    <hash of (y_pred_calib || y_calib)>
   uncertainty_scheme: bayesian_inference
   prior_specification:
     alpha: {dist: Normal, mu: 0, sigma: 1, rationale: "校正切片は 0 中心弱情報"}
@@ -188,7 +233,7 @@ layer_2_calibration:
   backend_config:  {pymc_version: "5.x", numpyro_version: "0.x", arviz_version: "0.17.x", jax_x64: true}
   posterior_artifact: {netcdf_path: ..., sha256: ...}
   diagnostics_summary: <check_diagnostics() の返り値 + runtime/versions>
-  backend_reproducibility: {reference_backend: numpyro, tolerance: {...}, cross_backend_tested: true}
+  backend_reproducibility: {reference_backend: numpyro, tolerance: {posterior_mean_diff_sd_units: 0.1, cri_endpoint_diff_sd_units: 0.2}, cross_backend_tested: true}
 ```
 
 > [!TIP]
@@ -202,29 +247,43 @@ layer_2_calibration:
 
 ### モデル設計（Ch11 §11.8 の 3 階層版）
 
+`lab_eff` と `inst_eff` の両方に **sum-to-zero 制約**を入れ、`mu_grand` と交絡しないようにします。`lot_eff` は装置内でランダム効果として非中心化のみ（ロット単位の平均は `inst_eff` に吸収される想定で、ロット内の変動だけを推定）。
+
 ```python
 import pymc as pm, numpy as np
 
-n_lab, n_inst, n_lot = 3, 8, 60  # 装置総数 8（lab をまたぐ）、ロット総数 60
-lab_of_inst = np.array([...])    # 装置 -> lab の写像
-lot_of_obs  = np.array([...])    # 観測 -> ロット
-inst_of_obs = np.array([...])    # 観測 -> 装置
-y_obs       = np.array([...])    # 観測値
+n_lab, n_inst, n_lot = 3, 8, 60      # 装置総数 8（lab をまたぐ）、ロット総数 60
+lab_of_inst = np.array([...])         # 装置 -> lab の写像 (len n_inst)
+inst_of_obs = np.array([...])         # 観測 -> 装置 (len N)
+lot_of_obs  = np.array([...])         # 観測 -> ロット (len N)
+lab_of_obs  = lab_of_inst[inst_of_obs]  # 観測 -> lab（読みやすさのため事前計算）
+y_obs       = np.array([...])         # 観測値 (len N)
 
-with pm.Model(coords={"lab": range(n_lab), "inst": range(n_inst), "lot": range(n_lot)}) as capstone:
+coords = {
+    "lab":    np.arange(n_lab),
+    "inst":   np.arange(n_inst),
+    "lot":    np.arange(n_lot),
+    "sample": np.arange(len(y_obs)),
+}
+
+with pm.Model(coords=coords) as capstone:
     mu_grand  = pm.Normal("mu_grand", 0.0, 1.0)
 
-    # 実験室効果（sum-to-zero, Ch11 §11.8）
+    # 実験室効果（sum-to-zero, non-centered scale）
     lab_raw   = pm.Normal("lab_raw", 0.0, 1.0, dims="lab")
-    lab_eff   = pm.Deterministic("lab_eff", lab_raw - lab_raw.mean(), dims="lab")
     sigma_lab = pm.HalfNormal("sigma_lab", 1.0)
+    lab_eff   = pm.Deterministic(
+        "lab_eff", sigma_lab * (lab_raw - lab_raw.mean()), dims="lab"
+    )
 
-    # 装置効果（lab 内で sum-to-zero、非中心化）
+    # 装置効果（sum-to-zero + non-centered、mu_grand との交絡を防ぐ）
     inst_raw  = pm.Normal("inst_raw", 0.0, 1.0, dims="inst")
     sigma_inst= pm.HalfNormal("sigma_inst", 0.5)
-    inst_eff  = pm.Deterministic("inst_eff", sigma_inst * inst_raw, dims="inst")
+    inst_eff  = pm.Deterministic(
+        "inst_eff", sigma_inst * (inst_raw - inst_raw.mean()), dims="inst"
+    )
 
-    # ロット効果（非中心化）
+    # ロット効果（装置内のランダム変動、非中心化）
     lot_raw   = pm.Normal("lot_raw", 0.0, 1.0, dims="lot")
     sigma_lot = pm.HalfNormal("sigma_lot", 0.5)
     lot_eff   = pm.Deterministic("lot_eff", sigma_lot * lot_raw, dims="lot")
@@ -232,10 +291,11 @@ with pm.Model(coords={"lab": range(n_lab), "inst": range(n_inst), "lot": range(n
     # 観測ノイズ
     sigma_y   = pm.HalfNormal("sigma_y", 0.5)
 
-    mu = (mu_grand
-          + sigma_lab * lab_eff[lab_of_inst][inst_of_obs]
-          + inst_eff[inst_of_obs]
-          + lot_eff[lot_of_obs])
+    mu = pm.Deterministic(
+        "mu",
+        mu_grand + lab_eff[lab_of_obs] + inst_eff[inst_of_obs] + lot_eff[lot_of_obs],
+        dims="sample",
+    )
     y  = pm.Normal("y", mu=mu, sigma=sigma_y, observed=y_obs, dims="sample")
 
     idata = pm.sample(
@@ -245,6 +305,9 @@ with pm.Model(coords={"lab": range(n_lab), "inst": range(n_inst), "lot": range(n
     )
     pm.sample_posterior_predictive(idata, extend_inferencedata=True, random_seed=100)
 ```
+
+> [!IMPORTANT]
+> **`sigma_lab` と少数群の落とし穴**：`lab_raw - lab_raw.mean()` は zero-sum non-centered parameterization ですが、`G` 個の効果の marginal sd は厳密には `sigma_lab` ではなく `sigma_lab * sqrt((G-1)/G)` です。`G = 3` では ~18% の差になり、真値回収の検証時に注意が必要です。**そもそも `n_lab = 3` は少数群**（Ch11 §11.4）で `sigma_lab` は prior に強く依存します。真値 sd との一致を「近ければ良し」で緩め、必ず sensitivity 分析（`sigma_lab` の HalfNormal(0.5)/HalfNormal(2.0) の切替）を回してください。
 
 ### 診断と識別性チェック
 
@@ -264,16 +327,29 @@ posterior_sigma_lab = az.summary(idata, var_names=["sigma_lab", "sigma_inst", "s
 layer_3_hierarchical:
   skill_id:      pymc-hierarchical-3level-synthetic
   skill_version: 1.0.0
-  input_sha256:  <hash of synthetic dataset>
-  data_source:   synthetic  # 合成データであることを明示
+  input_sha256:  <hash of synthetic dataset arrays>
+  data_source:   synthetic          # 合成データであることを明示
+  synthetic_dataset:
+    generator_script_sha256: <付録 A の生成スクリプト hash>
+    generator_version:       "1.0.0"
+    generation_seed:         2024
+    true_parameters:
+      mu_grand_true:  0.0
+      sigma_lab_true: 0.4
+      sigma_inst_true:0.3
+      sigma_lot_true: 0.2
+      sigma_y_true:   0.15
   hierarchical_structure:
-    model_formula: "y ~ mu_grand + lab_eff[lab_of_inst[inst]] + inst_eff[inst] + lot_eff[lot]"
-    structure_type: nested   # lab -> inst -> lot
-    index_mapping: {lab_of_inst: [...], inst_of_obs: [...], lot_of_obs: [...]}
-    zero_sum_constraints: [lab_eff]  # lab 効果のみ sum-to-zero
-    parameterization: {lab_eff: sum-to-zero, inst_eff: non-centered, lot_eff: non-centered}
+    model_formula: "y ~ mu_grand + lab_eff[lab_of_obs] + inst_eff[inst_of_obs] + lot_eff[lot_of_obs]"
+    structure_type: nested            # lab -> inst -> lot
+    index_mapping:  {lab_of_inst: [...], inst_of_obs: [...], lot_of_obs: [...]}
+    zero_sum_constraints: [lab_eff, inst_eff]   # 両方に sum-to-zero
+    parameterization:
+      lab_eff:  zero-sum-non-centered
+      inst_eff: zero-sum-non-centered
+      lot_eff:  non-centered
   identifiability_check:
-    grand_mean_lab_confounded: false  # lab_eff の sum-to-zero で解消
+    grand_mean_lab_confounded: false   # lab_eff / inst_eff の sum-to-zero で解消
     posterior_correlations_max: <値>
   shrinkage_summary:
     inst_shrinkage_factor: <各装置の 1 - |α_partial - μ|/|α_no_pool - μ|>
@@ -294,42 +370,79 @@ layer_3_hierarchical:
 
 ## 13.6 3 層の統合実行と provenance チェイン
 
-3 層を一つの capstone Skill として繋ぎます。
+3 層を一つの capstone Skill として繋ぎます。各 `run_*` 関数の返り値スキーマを揃えると provenance チェインの検証が容易になります。
+
+### 各層 Skill の返り値スキーマ（推奨）
 
 ```python
-def run_capstone(X_real, y_real, synthetic_dataset):
+def run_sklearn_regression(X_train, y_train, X_calib, X_test) -> dict:
+    """
+    Returns:
+      {
+        "y_pred_calib": np.ndarray,
+        "y_pred_test":  np.ndarray,
+        "cv_metrics":   {"cv_rmse_mean": float, "cv_rmse_std": float},
+        "provenance":   {..., "output_artifacts": {"y_pred_calib": {"sha256": str, ...}, "y_pred_test": {...}}},
+      }
+    """
+
+def run_pymc_calibration(y_pred_calib, y_calib, upstream_prov) -> dict:
+    """
+    Args:
+      upstream_prov: Layer 1 の provenance dict（upstream 検証用）
+    Returns:
+      {"idata": az.InferenceData, "provenance": {..., "inputs": {"y_pred": {"sha256": ..., "upstream_layer": "layer_1", ...}}}}
+    """
+
+def run_hierarchical_bayes(synthetic_dataset) -> dict:
+    """
+    Returns:
+      {"idata": az.InferenceData, "provenance": {..., "data_source": "synthetic", "synthetic_dataset": {...}}}
+    """
+```
+
+### capstone 実行
+
+```python
+def run_capstone(X_train, y_train, X_calib, y_calib, X_test, y_test, synthetic_dataset):
     # Layer 1
-    l1_result = run_sklearn_regression(X_real, y_real)   # 点予測 + CV metrics
-    # Layer 2
-    l2_result = run_pymc_calibration(
-        y_pred_test=l1_result["y_pred_test"], y_test=l1_result["y_test"],
+    l1 = run_sklearn_regression(X_train, y_train, X_calib, X_test)
+    # Layer 2（calibration split で fit、test は触らない）
+    l2 = run_pymc_calibration(
+        y_pred_calib=l1["y_pred_calib"], y_calib=y_calib,
+        upstream_prov=l1["provenance"],
     )
-    # Layer 3
-    l3_result = run_hierarchical_bayes(synthetic_dataset)
-
-    return {
-        "layer_1": l1_result,
-        "layer_2": l2_result,
-        "layer_3": l3_result,
-        "provenance_chain": {
-            "layer_1": l1_result["provenance"],
-            "layer_2": {**l2_result["provenance"], "upstream": l1_result["provenance"]["skill_id_version_hash"]},
-            "layer_3":  l3_result["provenance"],   # 合成データなので Layer 1-2 とは切り離す
-        },
-    }
+    # Layer 3（合成階層データ、上流なし）
+    l3 = run_hierarchical_bayes(synthetic_dataset)
+    return {"layer_1": l1, "layer_2": l2, "layer_3": l3}
 ```
 
-### provenance チェインの検証
+### provenance チェインの検証（改竄検知）
+
+Layer 2 の `inputs.y_pred.sha256` が Layer 1 の `output_artifacts.y_pred_calib.sha256` と**バイト単位で一致**することを確認します：
 
 ```python
-prov = capstone_result["provenance_chain"]
-# Layer 2 の upstream ハッシュが Layer 1 の出力ハッシュと一致
-assert prov["layer_2"]["upstream"] == prov["layer_1"]["skill_id_version_hash"]
-# Layer 3 は独立（合成データなので上流を持たない）
-assert "upstream" not in prov["layer_3"]
+def verify_provenance_chain(result):
+    p1 = result["layer_1"]["provenance"]
+    p2 = result["layer_2"]["provenance"]
+    p3 = result["layer_3"]["provenance"]
+
+    # Layer 2 の y_pred 入力ハッシュ == Layer 1 の y_pred_calib 出力ハッシュ
+    assert p2["inputs"]["y_pred"]["sha256"] == p1["output_artifacts"]["y_pred_calib"]["sha256"], \
+        "Layer 1 → Layer 2 の provenance チェインが破損"
+    assert p2["inputs"]["y_pred"]["upstream_layer"] == "layer_1"
+
+    # Layer 2 の y_true ハッシュが calibration split のハッシュと一致
+    assert p2["inputs"]["y_true"]["sha256"] == p1["data_split"]["calib_sha256"]
+
+    # Layer 3 は上流を持たない
+    assert p3["data_source"] == "synthetic"
+    assert "upstream_layer" not in p3.get("inputs", {})
+
+    return True
 ```
 
-**Layer 3 だけ独立している**理由：Layer 1-2 は同じ実データで繋がりますが、Layer 3 は合成データを使うので上流には接続しません。実データで階層構造を扱える段階になったら Layer 3 も upstream を持つチェインに変わります（付録 C 参照）。
+**Layer 3 だけ独立している**理由：Layer 1-2 は同じ実データで繋がりますが、Layer 3 は合成データを使うので実データ上流には接続しません。ただし Layer 3 も `synthetic_dataset.generator_script_sha256` によって**合成データ生成の再現性**は担保されます。実データで階層構造を扱える段階になったら Layer 3 も upstream を持つチェインに変わります（付録 C 参照）。
 
 ---
 
@@ -337,12 +450,14 @@ assert "upstream" not in prov["layer_3"]
 
 第12章の **14 項目チェックリスト**を、Layer 2 と Layer 3 それぞれに適用します。Layer 1（sklearn）は診断項目が異なるため、別の 4 項目セットで確認します。
 
-### Layer 1（sklearn）のチェック（4 項目）
+### Layer 1（sklearn）のチェック（6 項目）
 
-1. ☐ `data_split` が fit 前に凍結され、`train_sha256`/`test_sha256` が記録済み
+1. ☐ `data_split` が fit 前に 3 分割（train / calibration / test）で凍結され、それぞれの SHA-256 が記録済み
 2. ☐ CV は Pipeline を通しており、fold 内で scaler が fit されている（漏洩なし）
-3. ☐ `cv_scheme` が group を要する場合、`group_key` を指定した GroupKFold を使っている
-4. ☐ `applicability_domain` の特徴量範囲・y 範囲が記録済み
+3. ☐ Layer 2 に渡す予測は **calibration split の予測** `y_pred_calib`、test 予測 `y_pred_test` は最終評価まで開封しない
+4. ☐ `cv_scheme` が group を要する場合、`group_key` を指定した GroupKFold を使っている
+5. ☐ `applicability_domain` の特徴量範囲・y 範囲が記録済み
+6. ☐ `output_artifacts.y_pred_calib.sha256` / `y_pred_test.sha256` / `model_sha256` が記録済み
 
 ### Layer 2・Layer 3（PyMC）のチェック（各 14 項目）
 
@@ -350,10 +465,10 @@ assert "upstream" not in prov["layer_3"]
 
 ### Capstone 全体の合否
 
-- **Layer 1 の 4 項目**すべて ✅
-- **Layer 2 の 14 項目**すべて ✅（項目 13 は該当なしで OK）
+- **Layer 1 の 6 項目**すべて ✅
+- **Layer 2 の 14 項目**すべて ✅（項目 13 = 階層 provenance は該当なしで OK）
 - **Layer 3 の 14 項目**すべて ✅
-- **provenance チェイン**の `upstream` ハッシュが一致
+- **provenance チェイン**：`layer_2.inputs.y_pred.sha256 == layer_1.output_artifacts.y_pred_calib.sha256` かつ `layer_2.inputs.y_true.sha256 == layer_1.data_split.calib_sha256`
 
 以上をすべて満たしたときのみ `capstone_certification_pass: true` を最終 provenance に記録します。
 
@@ -365,7 +480,7 @@ assert "upstream" not in prov["layer_3"]
 2. **Layer 2 の校正曲線に inverse を追加**：第10章 §10.6 の inverse モデルを組み込み、新しい観測 x に対する y の CrI を返す関数を実装
 3. **合成階層データを増やす**：`sigma_lab_true` を大きくして生成し、Layer 3 が sigma を大きく推定するか確認（sensitivity テスト）
 4. **Layer 3 で ロット数 G < 5 の場合を再実行**：Ch11 §11.4 の警告どおり `sigma_lot` が prior 依存になるかを観察
-5. **provenance チェインの改竄検知**：Layer 1 の出力を人為的にいじって Layer 2 を走らせ、`upstream` ハッシュ不一致で assert が failing することを確認
+5. **provenance チェインの改竄検知**：Layer 1 の `y_pred_calib` を人為的にいじって Layer 2 を走らせ、`layer_2.inputs.y_pred.sha256 != layer_1.output_artifacts.y_pred_calib.sha256` で `verify_provenance_chain` の assert が failing することを確認
 6. **14 項目チェックリストを Python 関数化**：`certify_capstone(prov: dict) -> dict` を実装し、失敗項目を列挙する形にする
 
 ---
@@ -374,9 +489,9 @@ assert "upstream" not in prov["layer_3"]
 
 - **Ch4-12 の Skill を 3 層に統合**：sklearn 回帰 → PyMC 校正 → 階層モデル
 - 実データは Layer 1-2 で、階層構造は Layer 3 の合成データで扱う（実データの階層構造データは付録 C）
-- Layer 2 は Layer 1 の出力を `upstream` として引き継ぐ。**provenance チェインをハッシュで検証**できる
+- Layer 2 は Layer 1 の `y_pred_calib` を入力に取り、その **SHA-256 を `inputs.y_pred.sha256` に記録**。**provenance チェインをハッシュで検証**でき、Layer 1 出力の改竄を検知できる
 - Layer 3 は合成データを使うため上流を持たない。`data_source: synthetic` を必ず記録
-- **合否は機械的に決める**：Layer 1（4 項目）+ Layer 2（14 項目）+ Layer 3（14 項目）+ provenance チェイン整合。すべて ✅ で `capstone_certification_pass: true`
+- **合否は機械的に決める**：Layer 1（6 項目）+ Layer 2（14 項目）+ Layer 3（14 項目）+ provenance チェインのハッシュ整合。すべて ✅ で `capstone_certification_pass: true`
 
 vol-02 の**組み立て**はこれで完成しました。第14章では、この capstone を壊す「失敗パターン」を体系的に扱います。
 
