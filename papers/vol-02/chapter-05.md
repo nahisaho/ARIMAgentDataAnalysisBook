@@ -23,7 +23,7 @@
 | ハンズオン | データ | 目的変数 | 主に使う手法 | 該当節 |
 |---|---|---|---|---|
 | A. 校正曲線 | 標準試料の測定値と真値ペア（vol-01 由来の合成データ） | 濃度・強度など連続値 | **線形回帰**（単純・多項式） | §5.6 |
-| B. 物性予測 | MatBench `matbench_expt_gap` (n≈4,602) | バンドギャップ (eV) | **ランダムフォレスト / 勾配ブースティング** | §5.7 |
+| B. 物性予測 | MatBench `matbench_expt_gap` (n=4,604) | バンドギャップ (eV) | **ランダムフォレスト / 勾配ブースティング** | §5.7 |
 | C. スペクトル分類 | RRUFF Raman データ | 鉱物種ラベル | **PLS-DA / ロジスティック回帰** | §5.8 |
 
 **共通構造**は第4章のテンプレートに準拠します：①目的 / ②入力条件 / ③出力形式 / ④成功条件（3 点セット）/ ⑤禁止事項（severity 付き）/ ⑥再現性条件。**本章では、この 6 要素にコードを対応させる**ことに集中し、CV 設計の細部（第7章）や解釈（第8章）は後段に譲ります。
@@ -54,32 +54,57 @@
 ### 実装スケルトン（第5章共通の契約チェッカ）
 
 ```python
+class LeakageError(RuntimeError):
+    """契約違反時の fatal 例外（第4章 §4.5 分類 A に対応）。"""
+
 def check_split_contract(
     X_train, X_test, y_train, y_test,
-    sample_id_col=None, group_id_col=None, timestamp_col=None,
+    *,
+    id_train=None, id_test=None,          # sample_id の値配列
+    group_train=None, group_test=None,    # group_id の値配列
+    ts_train=None, ts_test=None,          # timestamp の値配列
     target_lineage: set[str] = frozenset(),
+    requires_sample_id: bool = True,       # デフォルトで必須
+    requires_group_id: bool = False,       # 該当データのみ True
+    requires_timestamp: bool = False,      # 時系列データのみ True
 ) -> None:
     """全ハンズオンの入り口で呼ぶ。契約違反があれば raise（fatal）。"""
     # 1. sample_id 重複禁止
-    if sample_id_col is not None:
-        overlap = set(X_train[sample_id_col]) & set(X_test[sample_id_col])
+    if requires_sample_id:
+        if id_train is None or id_test is None:
+            raise LeakageError("sample_id が必須だが与えられていない")
+        overlap = set(id_train) & set(id_test)
         if overlap:
             raise LeakageError(f"sample_id overlap: {len(overlap)} 件")
     # 2. group_id 重複禁止
-    if group_id_col is not None:
-        overlap = set(X_train[group_id_col]) & set(X_test[group_id_col])
+    if requires_group_id:
+        if group_train is None or group_test is None:
+            raise LeakageError("group_id が必須だが与えられていない")
+        overlap = set(group_train) & set(group_test)
         if overlap:
             raise LeakageError(f"group_id overlap: {len(overlap)} 件")
-    # 3. 時系列順序
-    if timestamp_col is not None:
-        if X_train[timestamp_col].max() >= X_test[timestamp_col].min():
-            raise LeakageError("train が test より未来を含む")
+    # 3. 時系列順序（本章では最小 holdout 用のみ扱う）
+    if requires_timestamp:
+        if ts_train is None or ts_test is None:
+            raise LeakageError("timestamp が必須だが与えられていない")
+        if pd.isna(ts_train).any() or pd.isna(ts_test).any():
+            raise LeakageError("timestamp に欠損あり")
+        if ts_train.max() >= ts_test.min():
+            raise LeakageError("train が test より未来を含む、または同時刻を共有")
     # 4. 目的変数派生量チェック
     illegal = set(X_train.columns) & target_lineage
     if illegal:
         raise LeakageError(f"目的変数派生量が特徴量に混入: {illegal}")
     # 5. スケーリング契約は Pipeline で担保 (§5.4)
 ```
+
+**設計上のポイント**：
+
+- **`sample_id` はデフォルトで必須**。指定を忘れると即 `LeakageError`
+- **特徴量 `X` と識別子 `id_*` は分離**（`X_train` に `sample_id` 列を含めると Pipeline が特徴量として学習してしまう）
+- **`requires_timestamp=True` は本章の最小 holdout 用**。rolling / expanding CV は第7章
+- **同一 timestamp 内リーク** は `>=` で拾う（等号を許すと同時刻測定が train/test に分散するため）
+
 
 > [!WARNING]
 > `LeakageError` は **fatal 例外**として扱い、Skill 実行を停止します（第4章 §4.5 分類 A）。「警告だけ出して続行」は禁止です——エージェントが自動継続してしまうと、後段で「動いた」ように見えるからです。
@@ -162,7 +187,10 @@ scores = cross_validate(
 )
 ```
 
-`return_indices=True`（scikit-learn 1.5+）を使うと、`data_split`（第4章 §4.6）を provenance にそのまま保存できます。
+`return_indices=True`（scikit-learn 1.3+ で利用可能）を使うと、`data_split`（第4章 §4.6）を provenance にそのまま保存できます。古い環境では splitter の `split()` 結果を自前保存してください。返り値の `scores["indices"]["train"]` / `scores["indices"]["test"]` は numpy 配列なので、JSON/YAML 保存時は `.tolist()` 化が必要です。
+
+> [!WARNING]
+> ここでは説明のために `KFold` を素で使っていますが、**反復測定・同一ロットが含まれるデータでは `GroupKFold`（第7章）が本来の姿**です。本章のスケルトンは「型のデモ」であり、実データで運用する際は必ずグループ構造を確認します。
 
 ### ブロック 5 の要：provenance の最小セット
 
@@ -239,23 +267,30 @@ provenance = {
 ### 実装スケルトン
 
 ```python
+FEATURES = ["measured"]
+METADATA = ["sample_id"]
+
 def fit_calibration(df, degree=1, cv_splits=5, random_state=42):
-    X = df[["measured"]]
+    # 特徴量と識別子を分離（sample_id を特徴量にしない）
+    X = df[FEATURES]
     y = df["true_value"]
-    # 1. 入力検証（sample_id 契約）
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state,
-        stratify=None,  # 校正は連続値のため層化なし
+    ids = df["sample_id"]
+    # 1. 分割 → 入力検証（sample_id 契約）
+    X_train, X_test, y_train, y_test, id_train, id_test = train_test_split(
+        X, y, ids, test_size=0.2, random_state=random_state,
     )
-    check_split_contract(X_train, X_test, y_train, y_test,
-                         sample_id_col="sample_id")
+    check_split_contract(
+        X_train, X_test, y_train, y_test,
+        id_train=id_train, id_test=id_test,
+        requires_sample_id=True,
+    )
     # 2. Pipeline
     pipeline = Pipeline([
         ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
         ("scaler", StandardScaler()),
         ("model", Ridge(alpha=1.0)),
     ])
-    # 3. 学習 + CV
+    # 3. 学習 + CV（同一 sample_id が反復測定される場合は GroupKFold 推奨、第7章）
     cv = KFold(n_splits=cv_splits, shuffle=True, random_state=random_state)
     scores = cross_validate(pipeline, X_train, y_train, cv=cv,
                             scoring=["neg_root_mean_squared_error", "r2"],
@@ -279,7 +314,7 @@ def fit_calibration(df, degree=1, cv_splits=5, random_state=42):
 
 ## 5.7 ハンズオン B：物性予測 Skill
 
-**目的**：組成・記述子から物性値（バンドギャップ等）を予測する。MatBench `matbench_expt_gap` (n≈4,602) を使う。
+**目的**：組成・記述子から物性値（バンドギャップ等）を予測する。MatBench `matbench_expt_gap` (n=4,604) を使う。
 
 ### Skill 仕様書（要約 + A との差分）
 
@@ -288,9 +323,12 @@ def fit_calibration(df, degree=1, cv_splits=5, random_state=42):
 | ① 目的 | 多変量回帰、`task_type=regression` |
 | ② 入力 | 組成記述子（Magpie 等で生成）、または CIF から特徴量抽出。n≈数千 |
 | ③ 出力 | RF or GBM の学習済み Pipeline、特徴量重要度（第8章で扱う）、外挿警告 |
-| ④ 成功条件 | RMSE ≤ 0.5 eV、CV 平均 R² ≥ 0.7 が MatBench の目安 |
+| ④ 成功条件 | RF/Magpie ベースラインの目安：**MatBench 公式 5-fold で RMSE ≈ 0.8–0.9 eV**。RMSE ≤ 0.5 eV は上位モデル・高度特徴量・専用モデルの目標であり本章の合格基準にはしない。詳細な数値は本節末尾の外部参考を参照 |
 | ⑤ 禁止事項 | 特徴量重要度で選んだ変数だけで再学習して独立テストを見る（後付け特徴量選択） |
 | ⑥ 再現性 | RF/GBM のハイパーパラメータ（`n_estimators`, `max_depth`, `learning_rate` 等）全指定 |
+
+> [!NOTE]
+> **MatBench は公式 5-fold の nested-CV benchmark** です。leaderboard 数値と比較したい場合は、任意の `KFold` ではなく **MatBench 公式 fold（`matbench` パッケージ）を使う**必要があります。本章は Skill 構造を学ぶための練習として `KFold` を使いますが、公式リーダーボード比較は付録B / 第7章で扱います。
 
 ### 実装スケルトン（RF）
 
@@ -340,9 +378,9 @@ pipeline = Pipeline([
 |---|---|
 | ① 目的 | 多クラス分類、`task_type=classification` |
 | ② 入力 | 波数（列）× 試料（行）の tabular（p ≈ 500〜2000、n ≈ 数百〜千） |
-| ③ 出力 | 学習済み Pipeline、各クラスの確率、混同行列 |
+| ③ 出力 | 学習済み Pipeline、**PLS 潜在空間でのクラススコア + argmax 判別**（校正確率が必要なら `CalibratedClassifierCV` を後段に）、混同行列 |
 | ④ 成功条件 | macro F1 ≥ 0.85、各クラス recall ≥ 0.75、クラス数 K で K が大きい場合は per-class 集計 |
-| ⑤ 禁止事項 | ベースライン補正・正規化を全データで実施（Pipeline 化必須）、同一鉱物の複数スペクトルを train/test 両方に分散配置 |
+| ⑤ 禁止事項 | ベースライン補正・正規化を全データで実施（Pipeline 化必須）、同一標本（specimen）の複数スペクトルを train/test 両方に分散配置 |
 | ⑥ 再現性 | 前処理チェイン（ベースライン推定法、平滑化、L2 正規化）を仕様書で固定 |
 
 ### PLS-DA（PLS 判別分析）を使う理由
@@ -363,21 +401,37 @@ from sklearn.preprocessing import LabelBinarizer
 lb = LabelBinarizer()
 Y_train = lb.fit_transform(y_train)   # (n, K)
 
+# PLSRegression は内部で中心化・スケーリングを行うため
+# 外側の StandardScaler は使わない（二重処理を防ぐ）
 pipeline = Pipeline([
-    ("scaler", StandardScaler(with_std=False)),  # スペクトルは中心化のみ
-    ("pls",    PLSRegression(n_components=10)),
+    ("pls", PLSRegression(n_components=10, scale=True)),
 ])
 pipeline.fit(X_train, Y_train)
-Y_pred = pipeline.predict(X_test)
-y_pred = lb.inverse_transform(Y_pred)
+Y_score = pipeline.predict(X_test)           # クラス score（確率ではない）
+y_pred = lb.classes_[np.argmax(Y_score, 1)]  # argmax で判別
 ```
 
-`n_components`（潜在変数の数）は **CV で選ぶ**が、独立テストを見た後の後付け変更は禁止（§4.4 循環設計）。
+**PLS-DA の出力は「クラス score」であり、確率校正されていない点に注意**します。ROC/PR 曲線や意思決定閾値の設計が必要な場合は、後段に `sklearn.calibration.CalibratedClassifierCV` を置くか、L2 正則化ロジスティック回帰に切り替えます。`n_components`（潜在変数の数）は **CV で選ぶ**が、独立テストを見た後の後付け変更は禁止（§4.4 循環設計）。
 
-### 波長依存の落とし穴
+### Raman 前処理の一般論
 
-- **サンプル数を稼ぐために同一鉱物の複数スペクトルを重複投入**すると、`sample_id` レベルで leak します。RRUFF は同一鉱物種で複数の測定を持つので、**鉱物種を group_id にして GroupKFold**（第7章）を使うのが本来の姿ですが、本章では最低限「同一 spectrum_id が train/test に無い」ことを契約チェッカで担保します
-- **波長軸の不揃い**：試料ごとに測定波長点が違うと、事前補間が必須。補間は Pipeline 内に組み込み（`FunctionTransformer` 経由）、fold 内で実施
+上記スケルトンは PLS-DA の最小例です。実運用では、次を Pipeline 内に組み込みます：
+
+- **ベースライン補正**（Asymmetric Least Squares 等、`FunctionTransformer` 経由）
+- **強度正規化**（vector normalization、area normalization、SNV のいずれか、目的に応じて選択）
+- **平滑化**（Savitzky-Golay filter、必要に応じて微分）
+- **波長軸の統一補間**（試料ごとに波長点が異なる場合）
+
+前処理はすべて Pipeline 内で実施し、fold ごとに fit されることを担保します。前処理の選択自体を CV で最適化する場合は、これも独立テストを見る前に固定します。
+
+### group leak と `GroupKFold`
+
+「サンプル数を稼ぐために同一標本の複数スペクトルを重複投入」すると、`sample_id` レベルで leak します。RRUFF では **同一標本（specimen）** に複数の測定エントリがある場合があり、この場合は **`specimen_id`（標本 ID）を `group_id` にして `GroupKFold`（第7章）** を使うのが本来の姿です。
+
+> [!WARNING]
+> **鉱物種ラベル（分類の目的変数）を group に使うのは誤り**です。それをすると、fold ごとに特定クラスが train から消え、通常の多クラス分類として評価が成立しません（それは open-set / zero-shot 分類という別問題で、本書では扱いません）。group は「同一標本」「同一測定セッション」「同一 RRUFF entry」など、**目的変数と直交する識別子**を選びます。
+
+本章では最低限「同一 `specimen_id` が train/test 両方に無い」ことを §5.2 の契約チェッカで担保します。波長軸の不揃いは事前補間を Pipeline 内に組み込み（`FunctionTransformer` 経由）、fold 内で実施します。
 
 ---
 
@@ -390,6 +444,7 @@ y_pred = lb.inverse_transform(Y_pred)
 | CV スコアが良いのに独立テストが悪い | 前処理を Pipeline 化せず全データで実施 | `Pipeline` 経由に変更 | §5.4 |
 | CV スコアが良いのに実運用で悪化 | 同一試料/ロットの train/test 混在 | `check_split_contract` を fatal で拒否 | §5.2 |
 | ハイパーパラメータを増やすと CV スコアが上がり続ける | 探索空間が広すぎる + テストを繰り返し見ている | ネスト CV（第7章）、独立テストは 1 回のみ | §5.5, 第7章 |
+| 結果を見た後で指標・閾値・除外条件を変更した（p-hacking の統計版） | 探索と本評価が分離されていない | 仕様書に frozen date と diff を記録、audit violation として扱う | §4.4, §4.5 |
 | 特徴量重要度で選んだ変数だけで再学習 → 精度改善 | 特徴量選択のリーク | 特徴量選択も Pipeline 内で fold ごとに実施 | §5.7, 第7章 |
 | 学習データに無い組成/波長域で予測 → 非現実的な値 | 外挿域予測の警告なし | applicability domain チェックを予測時に組み込み | §5.10 |
 
@@ -411,18 +466,28 @@ y_pred = lb.inverse_transform(Y_pred)
 ### applicability domain チェックの最小版
 
 ```python
-def check_applicability_domain(X_train, X_pred, threshold_quantile=0.99):
-    """予測点が学習データの近傍にあるかを最近傍距離で判定。"""
+def check_applicability_domain(X_train_transformed, X_pred_transformed,
+                               k=5, threshold_quantile=0.99):
+    """予測点が学習データの近傍にあるかを最近傍距離で判定。
+
+    重要：Pipeline の前処理を通した後の空間で距離計算すること。
+    生の組成特徴量やスペクトル強度をそのまま渡すと、
+    列ごとのスケール差で距離の意味が壊れる。
+    """
     from sklearn.neighbors import NearestNeighbors
-    nn = NearestNeighbors(n_neighbors=5).fit(X_train)
-    d_train, _ = nn.kneighbors(X_train)
-    d_pred, _  = nn.kneighbors(X_pred)
+    # train 側：自己近傍を含めないよう k+1 を取り、先頭（距離 0）を捨てる
+    nn_train = NearestNeighbors(n_neighbors=k + 1).fit(X_train_transformed)
+    d_train, _ = nn_train.kneighbors(X_train_transformed)
+    d_train = d_train[:, 1:]  # 自己距離を除外
+    # 予測点：train を基準に k 近傍
+    nn_ref = NearestNeighbors(n_neighbors=k).fit(X_train_transformed)
+    d_pred, _ = nn_ref.kneighbors(X_pred_transformed)
     threshold = np.quantile(d_train.mean(axis=1), threshold_quantile)
     is_extrapolation = d_pred.mean(axis=1) > threshold
     return is_extrapolation  # True の予測点は warning 対象
 ```
 
-これは **暫定的な最小実装**です。組成データでは Mahalanobis 距離、スペクトルでは PLS 残差など、より適切な距離が知られています。詳細は付録B のチートシートに載せます。
+これは **暫定的な最小実装**です。組成データでは Mahalanobis 距離、スペクトルでは PLS 残差など、より適切な距離が知られています（Roy 2015 参照）。また、Pipeline 前段の前処理が入っている場合は `pipeline[:-1].transform(X)` で最終モデル直前の空間を作り、そこで距離を測ります。詳細は付録B のチートシートに載せます。
 
 ---
 
@@ -476,5 +541,5 @@ def check_applicability_domain(X_train, X_pred, threshold_quantile=0.99):
 - scikit-learn Pipeline: <https://scikit-learn.org/stable/modules/compose.html>
 - Dunn, A., Wang, Q., Ganose, A. et al. "Benchmarking materials property prediction methods: the Matbench test set and Automatminer reference algorithm." *npj Computational Materials* **6**, 138 (2020). <https://doi.org/10.1038/s41524-020-00406-3>
 - Wold, S., Sjöström, M., & Eriksson, L. "PLS-regression: a basic tool of chemometrics." *Chemometrics and Intelligent Laboratory Systems* **58**, 109–130 (2001). <https://doi.org/10.1016/S0169-7439(01)00155-1>
-- Ke, G., Meng, Q., Finley, T. et al. "LightGBM: A Highly Efficient Gradient Boosting Decision Tree." *NeurIPS 2017*.
+- Ke, G., Meng, Q., Finley, T. et al. "LightGBM: A Highly Efficient Gradient Boosting Decision Tree." *Advances in Neural Information Processing Systems* **30** (NIPS 2017).
 - Roy, K., Kar, S., & Ambure, P. "On a simple approach for determining applicability domain of QSAR models." *Chemometrics and Intelligent Laboratory Systems* **145**, 22–29 (2015).
