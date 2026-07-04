@@ -14,6 +14,9 @@
 
 ## 9.1　この章で作るSkillの概要
 
+> [!IMPORTANT]
+> 本書の合格ラインは「**動く・検証済み・再現できる**」の3拍子であり、「**失敗しない**」ことではありません。本章では初めての実装Skillを作りますが、目指すのは「動く」だけの Skill ではなく、成功条件を数値で検証でき、同じ入力から同じ結果を再現できる Skill です。
+
 本章では、第5章で自然言語プロンプトから実行した「**ラマンスペクトルのピーク検出**」を、**再利用可能な分析Skill**に格上げします。Skill化する意味は次の3点です。
 
 - **再現性**：同じ手順が名前つきの契約として保存される（第7章 ⑥再現性条件）
@@ -160,22 +163,25 @@ compatibility: python>=3.11, scipy>=1.11,<2.0, numpy, pandas, matplotlib
 - `references/` を参照せず本文だけで判断すること
 - ベースライン補正・積み重ね比較・第2主成分分析への流用（別Skill）
 - **`discussion` および Agent のチャット応答で、物質同定・ピーク帰属・物理的妥当性を推測すること**（第10章の文献照合Skillおよび第12章の実行後検証に委ねる）
+- **物質同定・ピーク帰属・相同定・Rietveld による組成/相の自動確定を、出力ファイルにも Agent のチャット応答にも含めない**（第7章・第15章 `common_forbidden.yaml` と整合）。候補提示までに止め、最終判断は研究者が標準試料・文献・既存手法で行う
 
 ## ⑥再現性条件
-- SciPy `find_peaks(prominence=0.1, distance=20)` を既定値とする（要件により変更可、変更時はプロンプトに明記）
+- SciPy `find_peaks(prominence=0.2, distance=50)` を既定値とする（要件により変更可、変更時はプロンプトに明記）
 - Python 3.11 / SciPy 1.11 系で動作確認済み
+- **標準環境バージョン**（第4章と揃える）：Python / JupyterLab / GitHub Copilot CLI / `jupyter-mcp-server==0.14.4` / `tooluniverse==1.4.4`。`pip freeze` 出力（または uv のロックファイル）を `references/env-lock.txt` として保存
 - `scripts/validate_input.py` を呼び入力を検証する
+- 出力 JSON に **入力ファイルの SHA-256** (`provenance.input_sha256`)、Skill バージョン (`skill_version`)、実行日時 (`run_datetime_utc`)、使用パッケージ版 (`package_versions`) を必ず記録する（第7章 §7.4 ⑥・第8章 §8.10 と対応）
 - 出力の `discussion` に **Skillバージョン (v1.0.0)** と **使用パラメータ** を必ず含める
 
 ## 実行手順
 
 1. 入力データが標準形式であることを確認する。標準形式でない場合は `<装置名>-loader` Skillを先に呼ぶよう提案する
 2. `scripts/validate_input.py` を実行し、fatal 条件を1件でも満たす場合はエラーを返す（欠損率 5% 超は warning としてログに残す）
-3. `intensity` に対して `scipy.signal.find_peaks(prominence=0.1, distance=20)` を適用
+3. `intensity` に対して `scipy.signal.find_peaks(prominence=0.2, distance=50)` を適用
 4. 検出された各ピークの FWHM を **cm⁻¹ 単位で** 算出する。`scipy.signal.peak_widths` はサンプル点インデックス単位で幅を返すため、`left_ips` / `right_ips` を `x` 軸へ補間して cm⁻¹ に変換する：
    ```python
    from scipy.signal import find_peaks, peak_widths
-   peaks, props = find_peaks(y, prominence=0.1, distance=20)
+   peaks, props = find_peaks(y, prominence=0.2, distance=50)
    widths, _, left_ips, right_ips = peak_widths(y, peaks, rel_height=0.5)
    idx = np.arange(len(x))
    left_x  = np.interp(left_ips,  idx, x)
@@ -239,7 +245,7 @@ Agent は以下の順で処理する：
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["peaks", "plot_path", "discussion"],
+  "required": ["peaks", "plot_path", "discussion", "provenance"],
   "properties": {
     "peaks": {
       "type": "array",
@@ -255,7 +261,17 @@ Agent は以下の順で処理する：
       }
     },
     "plot_path":  {"type": "string"},
-    "discussion": {"type": "string"}
+    "discussion": {"type": "string"},
+    "provenance": {
+      "type": "object",
+      "required": ["input_sha256", "skill_version", "run_datetime_utc", "package_versions"],
+      "properties": {
+        "input_sha256":      {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "skill_version":     {"type": "string"},
+        "run_datetime_utc":  {"type": "string"},
+        "package_versions":  {"type": "object"}
+      }
+    }
   }
 }
 ```
@@ -358,11 +374,12 @@ copilot
 1. `● Read (sample.csv)` — 生ファイル確認
 2. `● Skill: raman-loader` — 標準形式へ変換
 3. `● Skill: raman-peak-detection` — 本Skill 呼び出し
-4. `● Execute Cell (MCP: jupyter)` — 検証・検出・可視化
-5. `● Write (peak_report.json)` — **承認要求** → ユーザーが承認 → 書き込み
+4. `● use_notebook (MCP: jupyter)` — 対象ノートブックの選択
+5. `● insert_execute_code_cell (MCP: jupyter)` — 検証・検出・可視化
+6. `● Write (peak_report.json)` — **承認要求** → ユーザーが承認 → 書き込み
 
 > [!NOTE]
-> 第5章の実機検証で確認したとおり、Copilot CLI で非対話モード（`-p`）を使う場合は `--allow-all-tools` の指定が必要です（第6章）。ハンズオン中は対話モードで動かし、承認ゲートを1つずつ確認することを推奨します。
+> **本章の標準手順では非対話モードを使わない**でください。第5章で確認したとおり、Copilot CLI で非対話モード（`-p`）を使う場合は `--allow-all-tools` が必要で、これは第6章の「機密データを扱うセッションでは非対話モードを避ける」方針と衝突します。ハンズオン中は対話モードで動かし、承認ゲートを1件ずつ確認してください。どうしても非対話モードで動かす必要がある場合は、第6章に従って `--deny-tool` / `--deny-url` / `--add-dir` で入力・出口を厳しく絞ってから起動します。
 
 ---
 
@@ -393,7 +410,7 @@ copilot
 /tmp/arim-ch9 で seed=42 の合成スペクトル（3本ピーク：520/1332/2900 cm⁻¹、Lorentzian 幅 w=4/5/12 cm⁻¹）を用いて検証した実測値です。
 
 ```
-User: raman_synth.csv のピーク位置と幅を教えて（prominence=0.1, distance=20）
+User: raman_synth.csv のピーク位置と幅を教えて（prominence=0.2, distance=50）
       物質同定・ピーク帰属・物理的妥当性の推測は行わず、検出された数値だけを要約すること。
 
 Agent:
@@ -401,7 +418,7 @@ Agent:
   ● Skill: raman-loader → 標準形式 (points=1024, calibrated=True)
   ● Skill: raman-peak-detection
     - validate_input.py OK
-    - find_peaks: 3 peaks
+    - find_peaks: 3 peaks (prominence=0.2, distance=50)
     - peak_widths → x へ補間: FWHM 8.93 / 10.43 / 27.03 cm⁻¹
     - noise_std = 0.062  (window=51 移動平均残差)
     - plot saved: peaks.png
@@ -411,7 +428,7 @@ Agent:
       {position_cm_inv: 1331.96, intensity: 0.704, fwhm_cm_inv: 10.43, confidence: 1.00},
       {position_cm_inv: 2900.88, intensity: 0.538, fwhm_cm_inv: 27.03, confidence: 1.00}
     ]
-    discussion: "主要ピーク3本を検出。Skill v1.0.0, prominence=0.1, distance=20."
+    discussion: "主要ピーク3本を検出。Skill v1.0.0, prominence=0.2, distance=50."
 ```
 
 > [!NOTE]
@@ -429,7 +446,7 @@ Agent:
 
 ### 改善版：失敗例1（0本）の修正
 
-- **原因**：入力の相対強度が 0〜0.05 で、prominence=0.1 は達成不可能
+- **原因**：入力の相対強度が 0〜0.05 で、prominence=0.2 は達成不可能
 - **対策**：SKILL.md の実行手順3で「`prominence` は入力 `intensity` の 5–10 パーセンタイル差を目安に自動決定してもよい（既定を上書きしたときは discussion に理由を明記）」と補足
 - **再テスト**：評価サンプルで再度3本検出できることを確認
 
