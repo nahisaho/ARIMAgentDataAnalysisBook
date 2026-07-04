@@ -11,7 +11,7 @@ AI Agent と MCP（Model Context Protocol）を用いて、実験データの分
 
 ## 目次
 
-> **執筆進捗**: 本編 12 / 15 章、付録 0 / 3（第1章〜第12章 執筆済）
+> **執筆進捗**: 本編 13 / 15 章、付録 0 / 3（第1章〜第13章 執筆済）
 
 
 ### 第I部　なぜ必要か・何を作るか
@@ -50,7 +50,7 @@ AI Agent と MCP（Model Context Protocol）を用いて、実験データの分
 
 | 章 | タイトル | 状態 |
 |---|---|---|
-| 第13章 | 装置カテゴリ別の適用テンプレート | ⬜ 未着手 |
+| 第13章 | [装置カテゴリ別の適用テンプレート](chapter-13.md) | ✅ 執筆済 |
 | 第14章 | 失敗パターンとリスク管理 | ⬜ 未着手 |
 | 第15章 | 運用設計と組織導入 | ⬜ 未着手 |
 
@@ -68,9 +68,4 @@ AI Agent と MCP（Model Context Protocol）を用いて、実験データの分
 - **最初のSkillを作りたい**: 第1〜9章を順に（特に第6章・第8章は飛ばさない）
 - **自分の現場へ展開したい**: 第10章以降と第13章、付録A
 
-## 関連資料
 
-- 章構成の詳細: [chapter-outline.md](chapter-outline.md)
-- 前回資料（参考・全面刷新）: https://nanonet.go.jp/data_service/data/doc/1778725311_doc_16_0.pdf
-- MCP基準資料: https://qiita.com/hisaho/items/dc64fda8f0db972c392b
-- 装置カテゴリ一覧: https://nanonet.go.jp/data_service/page/textbook.html
