@@ -91,6 +91,9 @@ flowchart LR
 
 ---
 
+> [!IMPORTANT]
+> **データ機密性ゲート（全レイヤ共通・第8章 §8.11・第11章 §11.2・第13章 §13.9）**：どのレイヤでも、Agent に渡してよいのは `agent_visible_metadata`（匿名化 `sample_id`・装置カテゴリ・非機密条件）のみです。raw 絶対パス・課題番号・共同研究先名・装置PCアカウント・未公開プロセス条件などは `private_provenance` に隔離し、Skill 出力・Agent チャット応答・共有ログ・監査ログ集約・PR には**一切載せない**でください。未公開・機密データを扱う Skill は `~/.copilot/skills/` に配置し、リポジトリに含めません。
+
 ## 15.3　監査ログ：軽量版と本格版
 
 「監査ログ」というと重いイメージがありますが、本書の合格ライン維持のためには**極めて軽量**な形で十分です。
@@ -100,7 +103,8 @@ flowchart LR
 個人・小規模チームでは、次の 2 つの組み合わせで十分な監査性を実現できます。
 
 1. **Skill 出力の `provenance.json`**（第14章 §14.7 ⑯で必須化済み）
-   - skill_version / package_versions / run_datetime_utc / 乱数種 / 入力データのハッシュ
+   - `provenance.input_sha256` / `skill_version` / `run_datetime_utc` / `package_versions` / `random_seed`（乱数使用時）
+   - **マルチモーダル Skill の場合**は加えて `provenance.modality_inputs`（各モダリティの `input_sha256` + `skill_version` 連鎖・第11章 canonical）
 2. **Notebook の git commit**（Skill を呼び出した Jupyter Notebook 全体をコミット）
    - `nbstripout` で出力セルを除外するか、`nbdime` で差分管理
 
@@ -119,17 +123,19 @@ flowchart LR
 チーム 10 人規模になったら、Skill 実行ログを軽量に集約すると失敗検知が早まります。
 
 ```markdown
-# skill-run-log の最小フィールド
+# skill-run-log の最小フィールド（第7〜11章 provenance と一致）
 
-- run_id            : UUID
-- skill_name        : 実行された Skill 名
-- skill_version     : Skill のバージョン
-- user              : 実行者（ORCID / GitHub username 推奨）
-- timestamp_utc     : 実行時刻 UTC
-- input_hash        : 入力データの SHA-256
-- output_hash       : 出力データの SHA-256
-- status            : ok / error / warning
-- error_message     : エラー時のみ
+- run_id                    : UUID
+- skill_name                : 実行された Skill 名
+- skill_version             : Skill のバージョン（provenance と一致）
+- user                      : 実行者（ORCID / GitHub username 推奨）
+- run_datetime_utc          : 実行時刻 UTC（provenance と一致）
+- provenance_input_sha256   : 入力データの SHA-256（provenance.input_sha256 と一致）
+- package_versions          : 主要パッケージバージョン（provenance と一致・辞書 or hash）
+- output_sha256             : 出力データの SHA-256
+- status                    : ok / error / warning
+- error_message             : エラー時のみ
+- modality_inputs_sha256    : マルチモーダル時のみ。各モダリティの input_sha256 を列挙（provenance.modality_inputs と一致）
 ```
 
 **実装**：Skill の最終ステップで append-only ファイル（`~/.arim/skill-run-log.jsonl`）に 1 行 JSON を書き足すだけ。集約は cron で organization の共有ストレージにコピー。
@@ -215,7 +221,7 @@ flowchart LR
 - [ ] ③再現性チェック済み（同一入力で bit-exact 一致）
 - [ ] ④既存手法との一致確認済み
 - [ ] ⑫MCP 応答の validate_output.py 通過（第10章利用時）
-- [ ] ⑭provenance.json に skill_version / package_versions / run_datetime_utc 完備
+- [ ] ⑭ provenance.json に `provenance.input_sha256` → `skill_version` → `run_datetime_utc` → `package_versions` の連鎖が完備（マルチモーダルは `provenance.modality_inputs` も）
 
 ### 第14章：失敗パターン（20 項目のうち関連するもの）
 - [ ] ①〜⑤循環設計（独立参照点 3 層のうち最低 1 層）
@@ -264,25 +270,44 @@ flowchart LR
 # common_forbidden.yaml
 version: 1
 rules:
+  # ===== locked forbidden operation set（第9〜11・14章共通） =====
+  # Skill 出力・Notebook・Markdown レポート・Agent チャット応答のいずれにも含めない
   - id: F001
-    pattern: "同定"
-    scope: chat_response          # AI エージェント応答本文で禁止
-    severity: fatal                # PR 落とし基準
-    allowed_context: []            # 例外なし
-    source_chapter: "9-11"
-    remediation: "「候補」「参考ピーク」等の語に置き換え。同定は分析者が行う"
-
-  - id: F002
-    pattern: "帰属"
-    scope: chat_response
+    pattern: "物質同定"
+    scope: chat_response_and_skill_output   # AI 応答 + Skill 構造化出力 の両方
     severity: fatal
     allowed_context: []
-    source_chapter: "9-11"
-    remediation: "「参考ピーク位置」等に置き換え。帰属判断は分析者"
+    source_chapter: "9-11, 14"
+    remediation: "「候補」「参考ピーク」等の中立語に置き換え。同定は分析者が行う"
+
+  - id: F002
+    pattern: "ピーク帰属"
+    scope: chat_response_and_skill_output
+    severity: fatal
+    allowed_context: []
+    source_chapter: "9-11, 14"
+    remediation: "「参考ピーク位置」「帰属候補（分析者確定）」等に置き換え"
 
   - id: F003
+    pattern: "相同定"
+    scope: chat_response_and_skill_output
+    severity: fatal
+    allowed_context: []
+    source_chapter: "13 §13.5, 14"
+    remediation: "回折型テンプレートは派生量 method 明示のみ。相同定は分析者"
+
+  - id: F004
+    pattern: "Rietveld auto|Rietveld 自動|自動 Rietveld|自動組成推定|自動相確定"
+    scope: chat_response_and_skill_output
+    severity: fatal
+    allowed_context: []
+    source_chapter: "13 §13.5, 14 §14.7 ⑮"
+    remediation: "Rietveld 解析は分析者が手動で実施。Skill は数値抽出まで"
+
+  # ===== 語彙レベル・応答本文限定の禁止 =====
+  - id: F010
     pattern: "妥当"
-    scope: chat_response           # 応答本文のみ禁止（PR レビュー文中は許容）
+    scope: chat_response
     severity: warn
     allowed_context:
       - "PR テンプレート内: 物理的妥当性チェック"
@@ -290,9 +315,10 @@ rules:
     source_chapter: "14"
     remediation: "「文献一致範囲内」「±X% 以内」等、定量化した語で書き換え"
 
+  # ===== 設計禁止（SKILL.md ⑤ に反映） =====
   - id: D001
     pattern: "AI パラメータ推論"
-    scope: skill_md_design         # SKILL.md ⑤ 設計禁止事項として参照
+    scope: skill_md_design
     severity: fatal
     allowed_context: []
     source_chapter: "14 §14.7 ⑲"
@@ -316,7 +342,7 @@ rules:
 
   - id: D004
     pattern: "generic RANGES 未定義"
-    scope: pr_review               # PR/CI での確認項目
+    scope: pr_review
     severity: warn
     allowed_context: []
     source_chapter: "14 §14.7 ⑬"
@@ -327,7 +353,8 @@ rules:
 
 | scope | 適用箇所 | 検査方法 |
 |---|---|---|
-| `chat_response` | AI エージェントの応答本文 | ランタイムフィルタ or 事後レビュー |
+| `chat_response_and_skill_output` | AI エージェント応答本文 **AND** Skill 構造化出力 | ランタイムフィルタ + 出力スキーマ enum / validate_output.py |
+| `chat_response` | AI エージェントの応答本文のみ | ランタイムフィルタ or 事後レビュー |
 | `skill_md_design` | SKILL.md ⑤「禁止事項」節 | PR 時に静的チェック |
 | `pr_review` | PR テンプレートの確認項目 | レビュアーが目視確認 |
 
@@ -350,7 +377,13 @@ rules:
 | コミュニティ公開 | MIT / Apache 2.0 | 商用利用可・特許明示（Apache） |
 
 > [!WARNING]
-> **AI ベンダー契約の学習除外条項**と**公開ライセンス**は別物です。学習除外契約下で作った Skill を公開する場合でも、**契約書上の "公開範囲" が制限されていないか**を必ず確認してください（詳細は所属機関の法務・産学連携部門へ）。
+> **AI ベンダー契約の学習除外条項**と**公開ライセンス**と**データ機密性**は**三者三様の別問題**です。
+>
+> - 学習除外契約：入力が **AI モデルの学習には使われない**という条件（例：Copilot Enterprise・Azure OpenAI の該当プラン）
+> - 公開ライセンス：Skill コードや成果物を**第三者が再利用できる法的枠組み**
+> - データ機密性：`private_provenance` を**外部送信・公開してよいかどうか**は別途判断が必要
+>
+> 学習除外契約下で作った Skill を公開する場合でも、**契約書上の "公開範囲" が制限されていないか**を必ず確認してください。**学習除外は「機密データを外部送信・公開してよい」という許可ではありません**。公開前に `agent_visible_metadata` と `private_provenance` の分離が徹底されているか、匿名化 `sample_id` のみが公開対象に含まれているかを確認してください（詳細は所属機関の法務・産学連携部門へ）。
 
 ---
 
@@ -420,10 +453,13 @@ rules:
 
 ## 参考資料
 
-- [脚注1] RACI マトリクスの起源と使い方：一般的なプロジェクトマネジメント文献に多数解説あり。本書では小規模研究室運用に合わせて簡略化。
-- [脚注2] NIST AI Risk Management Framework: https://www.nist.gov/itl/ai-risk-management-framework
-- [脚注3] ISO/IEC 42001:2023 - Information technology — Artificial intelligence — Management system（有償規格。概要は https://www.iso.org/standard/81230.html 参照）
-- [脚注4] MLOps Community: https://mlops.community/
-- [脚注5] ARIM データポータル（本書全体の主要参照先）: https://nanonet.go.jp/data_service/page/textbook.html
-- 本書 15 章分の到達到達点は、Skill プロジェクトの `README.md` に**35 項目セルフレビュー + 8 項目クイックゲート**を貼り、`common_forbidden.yaml` を運用することで、日常運用に落とし込める。
-- 深追いが必要になった場合は §15.8 の入り口テーブルを起点とし、本書ではこれ以上追跡しない。
+- [脚注1] [RACI matrix (Wikipedia)](https://en.wikipedia.org/wiki/Responsibility_assignment_matrix) - RACI マトリクスの起源と使い方の概説。本書では小規模研究室運用に合わせて簡略化
+- [脚注2] [NIST AI Risk Management Framework](https://www.nist.gov/itl/ai-risk-management-framework) - AI Risk Management Framework の一般的な考え方。組織レベル運用の入り口
+- [脚注3] [ISO/IEC 42001:2023 - Artificial intelligence management system](https://www.iso.org/standard/81230.html) - AI 管理システムの国際標準（2023 年発行、有償規格）
+- [脚注4] [MLOps Community](https://mlops.community/) - MLOps 全般の実践知の入り口
+- [脚注5] [ARIM データポータル](https://nanonet.go.jp/data_service/page/textbook.html) - 本書全体の主要参照先。装置カテゴリ・データ構造・共通ボキャブラリ
+
+### 関連章と運用への落とし込み
+
+- 本書 15 章分の到達点は、Skill プロジェクトの `README.md` に**35 項目セルフレビュー + 8 項目クイックゲート**を貼り、`common_forbidden.yaml` を運用することで、日常運用に落とし込める
+- 深追いが必要になった場合は §15.8 の入り口テーブルを起点とし、本書ではこれ以上追跡しない
