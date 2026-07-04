@@ -35,7 +35,7 @@ flowchart LR
     JMCP -->|ノートブックを操作| JL
 ```
 
-導入するものは4つ（＋補助ツール）です。**最初からすべてを完璧に理解する必要はありません**。まず動かすことを優先し、役割は第5章以降で体得していきましょう。
+導入するものは5つ（主要4要素＋補助ツール1つ）です。**最初からすべてを完璧に理解する必要はありません**。まず動かすことを優先し、役割は第5章以降で体得していきましょう。
 
 | # | 導入するもの | 役割 | 本章の節 |
 |---|---|---|---|
@@ -96,17 +96,30 @@ pip install pandas numpy scipy matplotlib
 python -m ipykernel install --user --name arim-analysis --display-name "Python (arim-analysis)"
 ```
 
-導入できたら、JupyterLab を起動します。**このターミナルは起動したまま**にしておきます（別のターミナルで以降の作業を続けます）。
+導入できたら、JupyterLab を起動します。**このターミナルは起動したまま**にしておきます（別のターミナルで以降の作業を続けます）。まず接続用トークン（合言葉）を Python で生成し、環境変数に入れておきます。
 
 ```bash
-jupyter lab --port 8888 --IdentityProvider.token MY_TOKEN
+# 推測されにくいトークンを生成（macOS / Linux）
+export JUPYTER_TOKEN=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+echo "$JUPYTER_TOKEN"    # 表示された値を控えておく（4.6 でも使う）
+
+# JupyterLab 起動
+jupyter lab --port 8888 --IdentityProvider.token "$JUPYTER_TOKEN"
+```
+
+Windows PowerShell では次のようにします。
+
+```powershell
+$env:JUPYTER_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:JUPYTER_TOKEN            # 表示された値を控えておく
+jupyter lab --port 8888 --IdentityProvider.token $env:JUPYTER_TOKEN
 ```
 
 - `--port 8888`：接続に使うポート番号。後のMCP設定と一致させます。
-- `--IdentityProvider.token MY_TOKEN`：接続用の合言葉（トークン）。ここでは仮に `MY_TOKEN` としています。
+- `--IdentityProvider.token`：接続用の合言葉（トークン）。上で生成した値を使います。
 
 > [!WARNING]
-> `MY_TOKEN` はあくまで例です。実運用では**推測されにくい文字列**に変えてください。トークンやデータの取り扱い（機密情報を外部に送らない等）の安全設計は第6章で体系的に扱います。
+> **トークンは他人と共有しない・公開リポジトリにコミットしない**。本書の後続章のコード例でも `MY_TOKEN` という**プレースホルダ**を使うことがありますが、実際には毎回**自分で生成した値**（上の `$JUPYTER_TOKEN`）に置き換えてください。トークンやデータの取り扱いは第6章で体系的に扱います。
 
 ブラウザで JupyterLab が開けば、ステップ1は成功です。
 
@@ -127,9 +140,13 @@ source .venv/bin/activate        # macOS / Linux
 
 この有効化済みのターミナルで、`uv` を導入します。以降の 4.5〜4.7 も、このターミナルで作業します。
 
+> [!IMPORTANT]
+> **`uv` はユーザーワイドに導入することを推奨**します。以下は venv 内 pip で導入する簡易手順ですが、この方法では **venv を有効化していないターミナル**から `uvx` が使えず、後日 Copilot CLI が MCP を起動できない事故が起きます。安定運用したい場合は公式のスタンドアロンインストーラで導入し、`~/.local/bin`（macOS/Linux）や `%USERPROFILE%\.local\bin`（Windows）を PATH に通してください[脚注3]。
+
 ```bash
-pip install uv
+pip install "uv>=0.6.14"
 uv --version   # 0.6.14 以上であることを確認
+uvx --version  # 新しいターミナルからも動くことを別途確認
 ```
 
 バージョンが 0.6.14 未満だった場合は、次で更新します。
@@ -140,7 +157,7 @@ uv --version
 ```
 
 > [!TIP]
-> `uvx <パッケージ名>` は、「そのツールを一時的に取得して実行する」コマンドです。MCPサーバをプロジェクトに常時インストールせずに使えるため、環境を汚さずに済みます。この後のMCP設定で `uvx` を使います。
+> `uvx <パッケージ名>` は、「そのツールを一時的に取得して実行する」コマンドです。MCPサーバをプロジェクトに常時インストールせずに使えるため、環境を汚さずに済みます。**再現性のためには、MCP 登録時に `--from 'パッケージ==バージョン'` の形でバージョンを固定**することを勧めます（4.6・4.7 の例で解説）。この後のMCP設定で `uvx` を使います。
 
 ---
 
@@ -199,19 +216,34 @@ copilot
 - `JUPYTER_TOKEN`：4.3で設定したトークン（`MY_TOKEN`）と**同じ値**にします。
 - `ALLOW_IMG_OUTPUT`：プロットなどの画像出力を受け取るかどうか（`true` 推奨）。
 
-Copilot CLI には、このMCPサーバを登録する `copilot mcp add` コマンドが用意されています。**4.4のターミナル**（Copilot CLIを一度終了した状態）で、次を実行します。
+Copilot CLI には、このMCPサーバを登録する `copilot mcp add` コマンドが用意されています。**4.4のターミナル**（Copilot CLIを一度終了した状態）で、次を実行します。生成した `$JUPYTER_TOKEN` を利用します。
+
+macOS / Linux（bash / zsh）:
 
 ```bash
 copilot mcp add jupyter \
   --env JUPYTER_URL=http://localhost:8888 \
-  --env JUPYTER_TOKEN=MY_TOKEN \
+  --env JUPYTER_TOKEN="$JUPYTER_TOKEN" \
   --env ALLOW_IMG_OUTPUT=true \
-  -- uvx jupyter-mcp-server@latest
+  -- uvx --from 'jupyter-mcp-server==0.14.4' jupyter-mcp-server
 ```
 
-- `--` の後ろが起動コマンド（`uvx jupyter-mcp-server@latest`）に対応します。
+Windows PowerShell:
+
+```powershell
+copilot mcp add jupyter `
+  --env JUPYTER_URL=http://localhost:8888 `
+  --env JUPYTER_TOKEN=$env:JUPYTER_TOKEN `
+  --env ALLOW_IMG_OUTPUT=true `
+  -- uvx --from 'jupyter-mcp-server==0.14.4' jupyter-mcp-server
+```
+
+- `--` の後ろが起動コマンド（`uvx --from 'jupyter-mcp-server==0.14.4' jupyter-mcp-server`）に対応します。**バージョンを固定**することで再現性を確保します。
 - `--env` で渡す `JUPYTER_URL` / `JUPYTER_TOKEN` は、**4.3の起動時のポート・トークンと一致**させます。
 - `ALLOW_IMG_OUTPUT=true` でプロットなどの画像出力を受け取れます。
+
+> [!NOTE]
+> 上記の `jupyter-mcp-server==0.14.4` は本書執筆時点で動作確認したバージョンです。将来のバージョンで動く可能性は高いですが、動作が不安定な場合はこの版に合わせてください。
 
 登録した内容は、ユーザー設定ファイル `~/.copilot/mcp-config.json` に、上記JSONと同じ `mcpServers` 形式で保存されます（次回以降も有効）。登録できたか確認しましょう。
 
@@ -247,16 +279,32 @@ copilot mcp list
 
 先ほどと同様に、`copilot mcp add` で `tooluniverse` を登録します。
 
+macOS / Linux（bash / zsh）:
+
 ```bash
 copilot mcp add tooluniverse \
   --env PYTHONIOENCODING=utf-8 \
-  -- uvx --refresh tooluniverse
+  -- uvx --from 'tooluniverse==1.4.4' tooluniverse
 ```
 
-`copilot mcp list` に `tooluniverse (local)` が加われば成功です。
+Windows PowerShell:
+
+```powershell
+copilot mcp add tooluniverse `
+  --env PYTHONIOENCODING=utf-8 `
+  -- uvx --from 'tooluniverse==1.4.4' tooluniverse
+```
+
+`copilot mcp list` に `tooluniverse (local)` が加われば登録は成功です。ただし、これは**登録の確認**であり、**サーバが実際に起動して応答するか**は別に検証する必要があります。次の対話プロンプトを Copilot CLI に投げて、応答内容を確かめてください。
+
+```text
+> ToolUniverse MCP に接続し、利用可能なツールを 5 つ列挙してください。
+```
+
+いくつかのツール名（例: 化学構造検索・文献検索・データベース照会 等）が列挙されれば、サーバ起動と機能疎通の両方が確認できたことになります。**初回は依存パッケージのダウンロードで数十秒〜1分ほどかかる**ことがあります。
 
 > [!NOTE]
-> ToolUniverse は1000種類以上のツール・データ・APIを束ねる大きなエコシステムです[脚注4]。本章では「つながること」だけを確認できれば十分です。実際の活用（文献照合や専門ツール呼び出し）は第10章・第11章で扱います。ToolUniverse は「AI Agent に設定を任せる」導入方法（公式セットアップ手順の読み込み）も提供しています。詳細は付録Bで整理します。
+> ToolUniverse は1000種類以上のツール・データ・APIを束ねる大きなエコシステムです[脚注4]。本章では「つながること」だけを確認できれば十分です。**個別ツールの API キー設定は本章では扱いません**（未設定の場合、外部API依存の一部ツールは呼び出し時にエラーとなります）。API キーが必要なツールの設定・使い方は付録B・第10章で扱います。実際の活用（文献照合や専門ツール呼び出し）は第10章・第11章です。ToolUniverse は「AI Agent に設定を任せる」導入方法（公式セットアップ手順の読み込み）も提供しています。詳細は付録Bで整理します。
 
 ---
 
