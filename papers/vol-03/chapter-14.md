@@ -62,18 +62,24 @@ flowchart LR
 | **AG-** | Agentic-Specific | 権限 / 承認 / 履歴 / 監査 の運用的失敗 |
 | **MX-** | Mixed | 深層 × Agentic の複合（章間で発生） |
 
-### 重大度
+### 重大度と blocking の関係（strict_mode に依らず一貫）
 
-| Severity | 意味 | 監査時の扱い |
+| Severity | 意味 | Blocking policy |
 |---|---|---|
-| **CRITICAL** | 監査根拠が失われる、Human bypass、silent data corruption | pipeline を halt、要 Human triage |
-| **HIGH** | 統計的 / 科学的に無効な結論を生む | pipeline を halt、rerun 推奨 |
-| **MEDIUM** | 結果は妥当だが再現性 / 説明可能性を毀損 | warning、承認付きで進行可 |
-| **LOW** | ベストプラクティス逸脱 | log 記録のみ |
+| **CRITICAL** | 監査根拠が失われる、Human bypass、silent data corruption | **常に block**（strict_mode に依らず）、Human triage 必須 |
+| **HIGH** | 統計的 / 科学的に無効な結論を生む | **常に block**、rerun または documented exception |
+| **MEDIUM** | 結果は妥当だが再現性 / 説明可能性を毀損 | strict_mode=true なら block、false なら warn |
+| **LOW** | ベストプラクティス逸脱 | 常に warn（log 記録のみ） |
+
+> [!IMPORTANT]
+> § 14.4-14.6 の各パターンの「Severity」は上表の意味で常に一貫し、`strict_mode` が変更してもよいのは MEDIUM 以下のみ。CRITICAL / HIGH の blocking は変更不可（`downgrade_high_or_critical_blocking_by_strict_mode: never_allowed`）。
 
 ---
 
 ## 14.4 Section 1 — 深層一般の失敗（DG-xx）
+
+> [!NOTE]
+> 以下の各パターン表の「検出シグナル」「対策契約」で参照するフィールド名は、**canonical name**（§ 14.7 `provenance_field_normalization` で解決される論理名）です。実際の実装は正規化辞書経由で Ch4-13 の実フィールド（例：`foundation_model_provenance.revision_commit_hash`, `layer_3.checkpoint_overwrite_policy: append_only`）を参照します。実行可能な JSONPath は § 14.7 の `failure_pattern_registry.fixtures.yaml` を参照。
 
 ### DG-01: GPU 非決定性による結果ずれ
 
@@ -195,8 +201,8 @@ flowchart LR
 |---|---|
 | **症状** | 発散した run を **公開レポート**からは削除、または best run のみを提示（cherry-picking） |
 | **原因** | Agent が report generation ステップで `runs_summary` を独自にフィルタ |
-| **検出シグナル** | 実行 registry の run 数と、レポート内の run 数が不一致 |
-| **対策契約** | Ch10 `report_must_include_all_registered_runs: true`, `agent_cherry_picking_runs_in_report: never_allowed`, `run_selection_criterion_provenance_required` |
+| **検出シグナル** | **外部の append-only scheduler ledger** の run_id 集合と、レポート内 `layer_report_provenance.runs_summary` の run_id 集合が不一致（agent が編集不能な独立ソースと突合） |
+| **対策契約** | Ch10 `report_must_include_all_registered_runs: true`, `agent_cherry_picking_runs_in_report: never_allowed`, `run_selection_criterion_provenance_required`, § 14.8 `external_ledgers.scheduler_run_ledger_uri` |
 | **Severity** | CRITICAL |
 
 ### AG-05: 未承認重みでの推論
@@ -307,23 +313,72 @@ registry_format:
     symptom: "str"
     root_cause: "str"
     signal_selectors:                                # provenance 上のシグナル
-      - path: "jsonpath expression"
-        expect: "presence | value_match | hash_match | set_relation"
-        fail_condition: "str"
+      - path: "jsonpath expression (RFC 9535)"
+        expect: "presence | value_match | hash_match | set_relation | numeric_bound"
+        fail_condition: "str (executable predicate)"
+        applies_to_chain_entry_key: "str (which chain_entries_ordered key)"
     contract_defenses:                               # 対策として引く never_allowed / required フィールド
       - "path.to.contract.field"
     linked_chapters: ["ch04", "ch05", ...]
+    related_patterns: []                             # 意図的な overlap（DG-06 と AG-07 のように）
+    aliases: []
     example_provenance_fixture_id: "sha256 (optional)"
 
-registry_entries_count:                              # 監査時にレジストリ完全性を確認
-  deep_general_min: 8
-  agentic_specific_min: 9
-  mixed_min: 4
+# MECE 強制：exact ID 集合を canonical order で列挙する
+required_pattern_ids_exact:
+  deep_general: ["DG-01","DG-02","DG-03","DG-04","DG-05","DG-06","DG-07","DG-08"]
+  agentic_specific: ["AG-01","AG-02","AG-03","AG-04","AG-05","AG-06","AG-07","AG-08","AG-09"]
+  mixed: ["MX-01","MX-02","MX-03","MX-04"]
+
+registry_integrity_rules:
+  no_duplicate_primary_failure_mode: true            # 同じ primary failure mode を持つエントリは 1 つのみ
+  overlaps_only_via_related_patterns_field: true     # DG-06 ↔ AG-07 のような重複はここに宣言
+  no_extra_patterns_without_pr: true                 # required_pattern_ids_exact の外側は PR 必須
+  severity_downgrade_requires_pr: true
+
+# Provenance フィールド名の正規化辞書
+# Ch4-13 の各章の実フィールド名を canonical name にマップし、レジストリの signal_selectors は
+# canonical name を使う。実装時にこの辞書で解決する。
+provenance_field_normalization:
+  ch04_checkpoint_overwrite_policy: "layer_3.checkpoint_overwrite_policy (append_only)"
+  ch04_training_job_approval: "layer_3.training_job_approval"
+  ch04_gpu_budget: "layer_3.gpu_budget"
+  ch04_gpu_environment: "layer_3.gpu_environment_provenance"
+  ch05_augmentation_policy_hash: "layer_2_augmentation.augmentation_policy_signed_hash"
+  ch07_domain_gap_gate_result: "domain_gap_gate_result (Ch7DomainGapResult)"
+  ch07_fine_tune_augmentation_ref: "fine_tune_provenance.augmentation_policy_hash"
+  ch08_ensemble_diversity: "uncertainty_provenance.ensemble_diversity_metrics"
+  ch08_calibration: "uncertainty_provenance.calibration"
+  ch09_bnn_convergence: "bayesian_inference_config.bnn_convergence_metrics"
+  ch10_layer_attribution: "layer_attribution_provenance.sanity_check_results"
+  ch10_runs_summary: "layer_report_provenance.runs_summary"
+  ch11_fm_commit_hash: "foundation_model_provenance.revision_commit_hash"    # 40-hex
+  ch11_manifest_id: "foundation_model_provenance.manifest_id"
+  ch11_fm_update_gate: "fm_update_gate_provenance"
+  ch11_inference_log_model_sha: "inference_service_log.model_revision_commit_hash"
+  ch11_rollback_contract: "foundation_model_provenance.rollback_contract"
+  ch12_ssl_pretrain: "ssl_pretrain_provenance"
+  ch12_ssl_base_model_sha: "ssl_pretrain_provenance.base_model_revision_commit_hash"
+  ch13_chain_entries_ordered: "capstone_integrated_provenance.canonical_manifest.entries"
+  ch13_gate_state: "capstone_three_gate_orchestrator_provenance.gate{1|2|3}_resolution"
+  ch13_bayes_known_high_source: "capstone_hierarchical_bayes_provenance.known_high_uncertainty_samples_source_ids_hash"
 
 acceptance:
   every_never_allowed_in_ch04_to_ch13_is_mapped_to_at_least_one_pattern: true
+  coverage_check_via_ci_generated_diff: true         # CI で章内 never_allowed を抽出し diff で検査
   every_pattern_has_at_least_one_signal_selector: true
   every_pattern_has_at_least_one_contract_defense: true
+  every_signal_selector_path_resolves_via_normalization_dictionary: true
+  required_pattern_ids_exact_present_no_extra: true
+
+# Trust bootstrap：レジストリ自体の署名検証
+trust_bootstrap:
+  maintainer_public_keys_source: "repository_governance/maintainers.keys"    # append-only pubkey list
+  maintainer_public_keys_pin: "sha256 (repo policy に固定)"
+  signatures_required_min: 2                                                 # quorum
+  transparency_log: "append_only_ledger (git-notes or Sigstore Rekor)"
+  registry_hash_must_be_recorded_in_transparency_log: true
+  runtime_override_of_maintainer_keys: "forbidden_all_levels"
 
 agent_authorization:
   L1: "read_registry"
@@ -331,18 +386,116 @@ agent_authorization:
   L3:
     can_add_or_edit_pattern_via_pr_only: true
     cannot_edit_registry_in_place_at_runtime: "forbidden_all_levels"
+    cannot_choose_registry_ref_outside_maintainer_signed_set: "forbidden_all_levels"
   never_allowed:
     - "delete_pattern_without_gate"
     - "downgrade_severity_without_gate"
     - "modify_registry_entries_during_audit_run"
+    - "point_registry_ref_at_unsigned_or_stale_transparency_log_entry"
 
 provenance:
   failure_pattern_registry_provenance:
     registry_hash: "sha256 of canonical_json"
     registry_version: "semver"
-    signed_by: "list of maintainer hashed IDs"
+    signed_by: "list of maintainer hashed IDs (>= signatures_required_min)"
+    signature_algo: "ed25519 or ecdsa-p256"
+    transparency_log_uri: "str"
+    transparency_log_inclusion_proof: "sha256 path"
     signed_at: "iso8601"
 ```
+
+### 21 パターンの signal_selectors 具体化（fixture 抜粋）
+
+各パターンについて JSONPath セレクタを与えます。以下は代表的な 6 件（残りは同じ形式で W14-1 のワークとして完成させる）。
+
+```yaml
+# failure_pattern_registry.fixtures.yaml
+- id: "DG-01"
+  severity: "MEDIUM"
+  signal_selectors:
+    - path: "$.chain_entries_ordered[?(@.key=='layer_3_split')].value.gpu_environment_provenance.cudnn_deterministic"
+      expect: "value_match"
+      fail_condition: "value != true"
+      applies_to_chain_entry_key: "layer_3_split"
+    - path: "$..gpu_environment_provenance.tf32_allowed"
+      expect: "presence"
+      fail_condition: "missing"
+  contract_defenses:
+    - "layer_3.gpu_environment_provenance_required"
+    - "layer_3.deterministic_config_signed"
+
+- id: "DG-03"
+  severity: "CRITICAL"
+  signal_selectors:
+    - path: "$..layer_3.split_hashes"
+      expect: "set_relation"
+      fail_condition: "intersection(train, val) != empty OR intersection(train, test) != empty OR intersection(val, test) != empty"
+  contract_defenses:
+    - "layer_3.split_hashes_pairwise_disjoint_verified"
+    - "layer_2_augmentation.no_augmentation_across_splits"
+
+- id: "AG-04"
+  severity: "CRITICAL"
+  signal_selectors:
+    - path: "$..layer_report_provenance.runs_summary[*].run_id"
+      expect: "set_relation"
+      fail_condition: "set(reported_runs) != set(scheduler_ledger.runs_for_project)"
+      applies_to_chain_entry_key: "layer_report"
+  cross_reference_source: "external_scheduler_ledger"    # § 14.8 参照
+  contract_defenses:
+    - "layer_report.report_must_include_all_registered_runs"
+    - "layer_report.run_selection_criterion_provenance_required"
+
+- id: "AG-06"
+  severity: "CRITICAL"
+  signal_selectors:
+    - path: "$..gate{1,2,3}_resolution.approvers[*].hashed_id"
+      expect: "set_relation"
+      fail_condition: "any(approver_hashed_id in agent_identity_hashes)"
+    - path: "$..gate{1,2,3}_resolution.state"
+      expect: "value_match"
+      fail_condition: "state == 'approved' AND approvers.count < gate.reviewers_min"
+    - path: "$..gate{1,2,3}.thresholds"
+      expect: "hash_match"
+      fail_condition: "runtime_threshold_hash != signed_threshold_hash"
+  contract_defenses:
+    - "capstone_three_gate_orchestrator.self_sign_by_agent_forbidden"
+    - "capstone_three_gate_orchestrator.approval_validation.duplicate_identity_forbidden"
+    - "capstone_three_gate_orchestrator.approval_validation.role_conjunction_enforced"
+
+- id: "AG-08"
+  severity: "CRITICAL"
+  signal_selectors:
+    - path: "$..foundation_model_provenance.revision_commit_hash"
+      expect: "value_match"
+      fail_condition: "not re.match('^[0-9a-f]{40}$', value)"
+    - path: "$..foundation_model_provenance.manifest_id"
+      expect: "presence"
+      fail_condition: "missing"
+    - path: "$..foundation_model_provenance.model_card_file_sha256"
+      expect: "hash_match"
+      fail_condition: "value != registry_pinned_model_card_sha256"
+  contract_defenses:
+    - "fm_fetch_and_verify._COMMIT_SHA_RE"
+    - "fm_fetch_and_verify.model_card_file_sha256_pinned_in_manifest"
+
+- id: "MX-02"
+  severity: "CRITICAL"
+  signal_selectors:
+    - path: "$..gate2_resolution.payload.high_uncertainty_sample_ids_hash"
+      expect: "hash_match"
+      fail_condition: "gate2_ids_hash != bayes_known_high_uncertainty_samples_source_ids_hash"
+  cross_reference:
+    source: "gate2_resolution.payload.high_uncertainty_sample_ids"
+    target: "capstone_hierarchical_bayes_provenance.known_high_uncertainty_samples_source_ids"
+    relation: "exact_set_equality_by_sha256_of_sorted_ids"
+  contract_defenses:
+    - "capstone_hierarchical_bayes.known_high_uncertainty_samples_source: gate2_approved_list_only"
+    - "capstone_hierarchical_bayes.known_high_uncertainty_samples_never_excluded"
+```
+
+> [!IMPORTANT]
+> **W14-1 で残り 15 パターンの signal_selectors を同じ形式で埋める。** レジストリが完成するまで `agentic_deep_failure_audit` は `acceptance.every_pattern_has_at_least_one_signal_selector: true` を満たせず、CI が block する。
 
 ## 14.8 監査 Skill `agentic_deep_failure_audit`
 
@@ -351,37 +504,93 @@ provenance:
 skill: "agentic_deep_failure_audit"
 version: "1.0.0"
 
-purpose: "実行後の provenance chain を舐めて failure_pattern_registry の全パターンを照合する静的監査"
+purpose: "実行後の provenance chain を舐めて failure_pattern_registry の全パターンを照合する静的監査 + 外部 ledger との突合"
 
 inputs:
   target_provenance_chain: "capstone_integrated_provenance or equivalent chain"
-  registry_ref: "failure_pattern_registry provenance ref"
+  registry_ref: "failure_pattern_registry provenance ref (trust_bootstrap 経由で検証)"
+  external_ledgers:                                  # AG-04 循環性の解消
+    scheduler_run_ledger_uri: "append_only ledger URI (GPU scheduler / MLOps)"
+    inference_service_log_uri: "append_only ledger URI (production inference)"
+    model_registry_history_uri: "append_only ledger URI (model registry versions)"
+    signed_by_infra_maintainer: true
+  effective_registry_version:                        # 実行時点でのバージョン記録
+    registry_version_at_run_start: "semver"
+    registry_hash_at_run_start: "sha256"
+    recorded_in_capstone_provenance_at_run_start: true
   audit_scope:
-    include_severities: ["CRITICAL", "HIGH", "MEDIUM"]
+    include_severities: ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
     exclude_categories: []
-    strict_mode: true                                # LOW も blocking
+    strict_mode: true
+
+trust_bootstrap:
+  registry_signature_verified_against_maintainer_pubkeys: true
+  registry_hash_matches_transparency_log_entry: true
+  agent_choice_of_registry_ref_restricted_to_signed_and_logged_set: true
 
 execution:
+  step_0_trust:
+    - "resolve registry_ref via trust_bootstrap"
+    - "verify signatures, transparency log inclusion, quorum"
+    - "abort audit with CRITICAL finding if trust bootstrap fails"
   for_each_pattern_in_registry:
-    step_1: "resolve signal_selectors against target chain"
+    step_1: "resolve signal_selectors via provenance_field_normalization"
     step_2: "evaluate fail_condition"
     step_3: "record finding: pass | fail | not_applicable"
-    step_4: "if fail: attach evidence pointers (jsonpath + observed value)"
+    step_4: "if fail: attach evidence pointers (jsonpath + observed value + expected)"
   cross_reference_checks:
-    - "SHA cross-refs between Ch11 and Ch12 base_model_sha"
-    - "set relations: gate approval list ⊆ known_high_uncertainty_mask source"
-    - "hash chain canonical_manifest root re-computation"
+    ch11_ch12_sha_link:
+      description: "Ch11 revision_commit_hash と Ch12 ssl_pretrain_provenance.base_model_revision_commit_hash が一致"
+      severity_if_fail: "HIGH (MX-01)"
+    gate_set_vs_bayes_input_set:
+      description: "Ch13 Gate2 approved high_uncertainty_sample_ids と Bayes known_high_uncertainty_samples_source_ids が完全一致（sha256 of sorted）"
+      severity_if_fail: "CRITICAL (MX-02)"
+    ch05_ch07_augmentation_hash:
+      description: "Ch5 signed augmentation_policy_hash と Ch7 fine_tune_provenance.augmentation_policy_hash が一致"
+      severity_if_fail: "HIGH (MX-03)"
+    null_sentinel_reason_validity:
+      description: "null_sentinel を持つ chain entry の reason が該当 pattern と矛盾しないか"
+      severity_if_fail: "HIGH (MX-04)"
+    ch11_manifest_all_hashes:
+      description: "config.json / tokenizer / model_card / weights の各 sha256 が manifest と一致"
+      severity_if_fail: "CRITICAL (AG-08 関連)"
+    ch07_domain_gap_vs_gate1:
+      description: "Ch7 domain_gap_gate_result.action と Ch13 Gate1 の trigger 記録が整合"
+      severity_if_fail: "HIGH"
+    ch08_ch09_uncertainty_vs_gate2:
+      description: "Ch8/9 uncertainty monitor と Ch13 Gate2 payload の triggered_metrics_histogram が整合"
+      severity_if_fail: "HIGH"
+    ch10_required_sections_present:
+      description: "ch10_section_input_mapping で omit_any_section: fatal のすべてが出力に存在"
+      severity_if_fail: "HIGH"
+    ch12_ssl_augmentation_vs_ch05:
+      description: "SSL の augmentation 使用が Ch5 signed set の範囲内"
+      severity_if_fail: "HIGH"
+    merkle_root_recomputation:
+      description: "capstone_integrated_provenance.hash_chain.chain_root を canonical_manifest から再計算し一致"
+      severity_if_fail: "CRITICAL"
+    ag04_report_vs_scheduler_ledger:
+      description: "layer_report.runs_summary の run_id 集合 = external scheduler_run_ledger の同プロジェクト run 集合"
+      severity_if_fail: "CRITICAL (AG-04)"
+    ag05_inference_sha_vs_default:
+      description: "inference_service_log.model_revision_commit_hash が model_registry_history_uri の current default と一致"
+      severity_if_fail: "CRITICAL (AG-05)"
+    ag09_version_bump_vs_gate:
+      description: "model_registry_history_uri の version bump ごとに fm_update_gate_provenance の approval が対応"
+      severity_if_fail: "CRITICAL (AG-09)"
 
 reporting:
   findings_format:
-    - id: "str (pattern ID)"
+    - id: "str (pattern ID or cross_ref ID)"
       status: "pass | fail | not_applicable"
-      severity: "same as registry entry"
+      severity: "CRITICAL | HIGH | MEDIUM | LOW"
       evidence:
         signal_path: "jsonpath"
         observed_value: "any"
         expected: "str"
+        chain_entry_key: "str"
       remediation_suggestion: "str (from registry)"
+      linked_pattern_ids: "list"
   summary:
     critical_fail_count: "int"
     high_fail_count: "int"
@@ -389,20 +598,78 @@ reporting:
     low_fail_count: "int"
     pass_count: "int"
     not_applicable_count: "int"
+    cross_reference_fail_count: "int"
 
-blocking_policy:
-  block_report_publication_if:
+blocking_policy:                                     # § 14.3 の severity 定義と一致
+  block_report_publication_if_any_of:
     - "critical_fail_count > 0"
-    - "high_fail_count > 0 AND strict_mode == true"
+    - "high_fail_count > 0"                          # HIGH は常に block（strict_mode に依らず）
+    - "cross_reference_fail_count > 0 AND that cross-ref severity in [CRITICAL, HIGH]"
+    - "trust_bootstrap_failed == true"
+    - "medium_fail_count > 0 AND strict_mode == true"
   warn_only_if:
-    - "medium_fail_count > 0"
-    - "low_fail_count > 0 AND strict_mode == false"
-  agent_cannot_override_blocking: "forbidden_all_levels"
+    - "medium_fail_count > 0 AND strict_mode == false"
+    - "low_fail_count > 0"
+  downgrade_high_or_critical_blocking_by_strict_mode: "never_allowed"
+
+publishing_enforcement:                              # 「override 不可」を宣言でなく機構で担保
+  report_publisher_service:
+    publisher_service_verifies_signed_blocking_decision: true
+    publisher_service_refuses_publish_if_blocking_decision_missing_or_block: true
+    publisher_service_authenticates_audit_signature_against_maintainer_keys: true
+  agent_capability:
+    agent_has_no_direct_publish_capability: true     # agent は publisher を叩けない
+    agent_can_only_request_publish_via_orchestrator: true
+
+blocking_exception_policy:
+  who_can_grant: "human quorum (>= 2 unique non-agent identities)"
+  required_roles: { any_of: ["pi", "compliance_officer", "ml_lead+statistician"] }
+  fields:
+    exception_id: "sha256"
+    linked_finding_ids: "list"
+    reason: "str"
+    remediation_plan: "str"
+    expires_at: "iso8601"
+    new_audit_run_required_after_fix: true
+    valid_only_for_this_audit_id: true               # 別 audit に流用不可
+  effect:
+    blocking_decision_field_never_rewritten: true    # 記録は block のまま
+    exception_recorded_as_separate_provenance_entry: true
+  never_allowed:
+    - "self_grant_by_agent"
+    - "reuse_exception_across_audit_runs"
+    - "grant_exception_without_remediation_plan"
+
+runtime_and_periodic_audit_guards:                   # 静的監査の時間的死角を補う
+  inference_time:
+    verify_model_sha_on_each_inference_batch_boundary: true
+    trigger_full_audit_on_default_version_change: true
+  drift_window:
+    periodic_re_audit_interval: "daily"
+    trigger_re_audit_on_ppc_calibration_drift: true
+  rollback_events:
+    trigger_immediate_full_audit_on_rollback: true
+  continual_learning_events:
+    trigger_immediate_full_audit_on_any_weight_update: true
+    notify_human_before_activating_updated_weights: true
+
+registry_versioning:
+  chain_effective_registry_hash_recorded_at_run_start: true
+  audit_uses_effective_registry_hash_from_chain: true       # 実行時 vs 監査時のバージョン整合
+  security_critical_registry_updates:
+    trigger_retroactive_re_audit_of_recent_runs: true
+    lookback_window: "30 days (configurable)"
+  non_security_registry_updates:
+    retroactive_re_audit_optional: true
 
 acceptance:
   every_registry_pattern_evaluated: true
-  cross_reference_checks_all_run: true
-  audit_report_generated_and_signed: true
+  every_cross_reference_check_run: true
+  external_ledgers_verified_signed: true
+  merkle_root_recomputation_matches: true
+  trust_bootstrap_passed: true
+  audit_report_generated_and_signed_by_verifier_and_agent: true
+  audit_id_immutable_after_signing: true
 
 agent_authorization:
   L1: "read_audit_report"
@@ -411,26 +678,41 @@ agent_authorization:
     can_propose_registry_extension_via_pr: true
     cannot_skip_patterns_at_audit_time: "forbidden_all_levels"
     cannot_edit_registry_during_audit: "forbidden_all_levels"
-    cannot_publish_report_if_critical_fail: "forbidden_all_levels"
+    cannot_publish_report_if_critical_or_high_fail: "forbidden_all_levels"
+    cannot_direct_publish_bypassing_publisher_service: "forbidden_all_levels"
+    cannot_grant_blocking_exception: "forbidden_all_levels"
   never_allowed:
     - "silent_skip_of_registry_patterns"
     - "audit_report_edited_after_signing"
     - "block_override_by_agent"
     - "reuse_stale_registry_hash"
+    - "sign_audit_report_alone_without_non_agent_verifier"     # 全 audit で verifier 必須
 
 provenance:
   agentic_deep_failure_audit_provenance:
-    audit_id: "sha256"
+    audit_id: "sha256(target_chain_root || registry_hash || findings_canonical_json || blocking_decision)"
     target_chain_root: "sha256 (from capstone_integrated_provenance)"
     registry_hash: "sha256"
     registry_version: "semver"
-    findings: "list (see reporting.findings_format)"
+    effective_registry_hash_from_chain: "sha256"     # 実行時に固定された hash
+    external_ledgers_snapshot:
+      scheduler_run_ledger_hash: "sha256"
+      inference_service_log_hash: "sha256"
+      model_registry_history_hash: "sha256"
+    findings: "list"
+    cross_reference_findings: "list"
     summary_counts: "dict"
     blocking_decision: "block | warn | pass"
-    signed_by: "list of hashed IDs (agent + reviewer if HIGH+)"
+    blocking_decision_signed_by_publisher_service: "bool"
+    trust_bootstrap_report: "dict"
+    signed_by:                                       # 常に non-agent verifier を含む
+      agent_hashed_id: "str"
+      verifier_hashed_ids: "list (>=1 non-agent identity)"
+    signature_algo: "ed25519 or ecdsa-p256"
     signed_at: "iso8601"
     audit_report_uri: "str"
     audit_report_sha256: "str"
+    audit_report_immutable_after_signing: true
 ```
 
 ### 監査呼び出しタイミング
@@ -440,25 +722,35 @@ sequenceDiagram
   participant A as Agent
   participant O as Orchestrator
   participant AU as agentic_deep_failure_audit
+  participant PB as Publisher Service
   participant H as Human
 
   A->>O: complete hierarchical_deep_bayes
-  O->>AU: run audit(target_chain, registry_ref)
-  AU->>AU: iterate patterns, cross-refs
-  AU-->>O: findings + summary + blocking decision
+  O->>AU: run audit(target_chain, registry_ref, external_ledgers)
+  AU->>AU: trust_bootstrap + iterate patterns + cross-refs + merkle recomp
+  AU-->>O: findings + summary + blocking decision (signed by agent + verifier)
   alt blocking_decision == block
     O->>H: request triage on CRITICAL/HIGH findings
-    H-->>O: fix / rerun / documented exception
+    H-->>O: fix (new run) or documented exception (quorum ≥2)
+    Note over O,PB: publisher service refuses publish while blocking_decision=block
   else warn
-    O->>H: notify, agent can proceed with note
+    O->>H: notify, may publish with note
+    O->>PB: publish with signed audit ref
   else pass
-    O->>A: publish final report
+    O->>PB: publish with signed audit ref
+    PB->>PB: verify signature + blocking_decision != block
+    PB-->>A: publish OK
   end
 ```
 
 ## 14.9 Ch4-13 の `never_allowed` をレジストリに正規化
 
-vol-03 の各章で `never_allowed` / `forbidden_all_levels` として書かれてきたフィールドを、失敗パターン ID に対応付けます（抜粋）：
+vol-03 の各章で `never_allowed` / `forbidden_all_levels` として書かれてきたフィールドを、失敗パターン ID に対応付けます。
+
+> [!IMPORTANT]
+> **以下は代表例の抜粋であり、完全マッピングは CI で自動生成する。** `failure_pattern_registry.acceptance.coverage_check_via_ci_generated_diff` で、Ch4-13 の `.md` から `never_allowed:` / `forbidden_all_levels` を抽出し、レジストリの `contract_defenses` に**すべて**登場することを diff で検査。不足がある PR は CI が block する。
+
+代表例（部分抜粋）：
 
 | 章 | never_allowed フィールド | 対応する pattern ID |
 |---|---|---|
@@ -509,13 +801,29 @@ version: "1.0.0"
 
 integration_role: "complementary_not_substitutive"
 
+# Ch13 の integrated_provenance_chain に組み込まれる optional slot として動作
+ch13_chain_slot:
+  chain_entry_key: "experiment_tracking_provenance"
+  required_in_chain_entries_ordered: false
+  present_only_if_used: true
+  when_absent_sentinel_reason: "experiment_tracking_not_enabled"
+  never_replaces_required_entries: true              # foundation_model_provenance 等を代替不可
+
 requires:
   provenance_chain_present: true                     # tracking だけで運用禁止
   tracking_run_id_recorded_in_capstone_provenance: true
+  tracking_run_metrics_periodically_hashed_and_signed: true
 
 acceptance:
   tracking_can_be_disabled_without_breaking_audit: true    # 依存禁止
   tracking_run_metrics_hash_matches_provenance: true       # 改ざん検知
+  audit_pass_without_tracking_slot: true                   # tracking 不使用時も audit は通る
+
+# 監査 (§ 14.8) 側で強制する追加チェック
+enforced_by_agentic_deep_failure_audit:
+  - "if experiment_tracking_provenance present: verify tracking_run_metrics_hash matches signed record"
+  - "if any required chain entry absent AND experiment_tracking_provenance present: raise CRITICAL"
+  - "verify tracking is not used in place of any required entry"
 
 never_allowed:
   - "replace_capstone_provenance_with_tracking_ui_only"
