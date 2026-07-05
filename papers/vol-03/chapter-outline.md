@@ -65,7 +65,7 @@
   - Captum: https://captum.ai/
   - MLflow: https://mlflow.org/ / W&B: https://wandb.ai/
   - MCP Python SDK: https://github.com/modelcontextprotocol/python-sdk
-  - 参考ベンチマーク: NFFA-EUROPE SEM https://b2share.eudat.eu/records/80df8606fcdb4b2bae1656f0dc6db8ba / UHCS https://materialsdata.nist.gov/handle/11256/964
+  - 参考ベンチマーク: NFFA-EUROPE SEM https://b2share.eudat.eu/records/80df8606fcdb4b2bae1656f0dc6db8ba / UHCS https://hdl.handle.net/11256/940
   - vol-01 / vol-02 リポジトリ（本書の前提）
 
 ## 本書で扱わないこと（明示）
