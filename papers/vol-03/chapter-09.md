@@ -30,7 +30,7 @@
 | **`bnn_uncertainty`**（Bayes by Backprop 最小実装） | 重みを分布として学習し posterior サンプリング | 入力: model factory + prior + data → 出力: posterior sample の平均予測 / 分解 |
 | **`uncertainty_method_selection_table`**（判断表） | 手法選択の Skill レベル決定支援 | 入力: 対象データ / GPU 予算 / Human 解釈要求 → 出力: 推奨手法 + 理由 |
 
-前提として、第4章 provenance 4 レイヤ、第5-7 章の契約群、第8章の `uncertainty_stop_gate` を継承します。**本章で作る Skill の出力はすべて第8章 gate に流し込める形式に揃えます**（`mean_probs`, `predictive_entropy_normalized`, `mutual_information`）。
+前提として、第4章 provenance 3 レイヤ（GPU / 事前学習重み / 学習・推論設定）+ 第7章 Layer 4（転移学習拡張）、第5-8 章の契約群、第8章の `uncertainty_stop_gate` を継承します。**本章では BNN 用の拡張ブロック `bayesian_inference_config` を第4章スキーマに追加します（Ch07 が Layer 4 を追加したのと同じ拡張パターン）**。本章で作る Skill の出力はすべて第8章 gate に流し込める形式に揃えます（`mean_probs`, `predictive_entropy_normalized`, `mutual_information`）。ただし Conformal Prediction は予測集合を返すため別 monitor 扱いにします（§9.9 / §9.10）。
 
 ---
 
@@ -106,15 +106,37 @@ import torch
 import torch.nn as nn
 
 
-def _enable_dropout_only(model: nn.Module) -> None:
+def _enable_dropout_only(model: nn.Module) -> dict[str, bool]:
     """
     model.eval() 後に、dropout 層のみを train モードに戻す。
     BatchNorm 等は eval のまま（train モードだと推論が壊れる）。
+    返り値：呼び出し前の各モジュールの `.training` 状態（`_restore_module_modes` で復元）。
     """
+    prev_states: dict[str, bool] = {name: m.training for name, m in model.named_modules()}
     model.eval()
     for m in model.modules():
         if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d)):
             m.train()
+    return prev_states
+
+
+def _restore_module_modes(model: nn.Module, prev_states: dict[str, bool]) -> None:
+    """`_enable_dropout_only` 呼び出し前の training/eval 状態に復元。finally で必ず呼ぶ。"""
+    for name, m in model.named_modules():
+        if name in prev_states:
+            m.train(prev_states[name])
+
+
+def _assert_mc_dropout_prerequisites(model: nn.Module, T: int) -> None:
+    """契約 YAML の requires を code 側でも fatal assert。"""
+    assert 10 <= T <= 100, f"T must be in [10, 100], got {T}"
+    dropout_layers = [
+        m for m in model.modules()
+        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d))
+    ]
+    assert len(dropout_layers) > 0, "MC-Dropout requires at least one dropout layer"
+    assert any(getattr(m, "p", 0.0) > 0.0 for m in dropout_layers), \
+        "MC-Dropout requires at least one dropout layer with p > 0"
 
 
 @torch.no_grad()
@@ -134,17 +156,24 @@ def mc_dropout_predict(
       mutual_information: (batch,)
       max_softmax_uncertainty: (batch,)   # 1 - max(mean_probs)
     """
-    _enable_dropout_only(model)
+    _assert_mc_dropout_prerequisites(model, T)
+    prev_states = _enable_dropout_only(model)
+    try:
+        # dropout mask のランダム性を制御。torch.manual_seed は global RNG を変更するため、
+        # 呼び出し外への副作用を避けたい場合は torch.random.fork_rng() を使うこと。
+        with torch.random.fork_rng(devices=[x.device] if x.is_cuda else []):
+            if seed is not None:
+                torch.manual_seed(seed)
+                if x.is_cuda:
+                    torch.cuda.manual_seed_all(seed)
 
-    # dropout mask のランダム性を再現するため、generator を明示
-    if seed is not None:
-        torch.manual_seed(seed)
-
-    sample_probs = []
-    for _ in range(T):
-        logits = model(x)
-        sample_probs.append(logits.softmax(-1))
-    sample_probs = torch.stack(sample_probs, dim=0)  # (T, batch, K)
+            sample_probs = []
+            for _ in range(T):
+                logits = model(x)
+                sample_probs.append(logits.softmax(-1))
+        sample_probs = torch.stack(sample_probs, dim=0)  # (T, batch, K)
+    finally:
+        _restore_module_modes(model, prev_states)
 
     mean_probs = sample_probs.mean(0)                # (batch, K)
     K = mean_probs.shape[-1]
@@ -221,13 +250,15 @@ provenance:
 
 | 失敗 | 症状 | 対策 |
 |---|---|---|
-| **dropout 層がないモデルに適用** | すべてのサンプルで entropy = 0 | `requires.model_must_contain_dropout_layers` fatal assert |
-| **BatchNorm も train モード** | running mean/var が汚染、次回 eval で予測が壊れる | `_enable_dropout_only` で dropout 層のみ選択 |
-| **dropout rate が全層 0** | dropout mask のばらつきなし → entropy 0 | fatal assert + provenance に per-layer rate 記録 |
-| **T が小さい（<10）** | 分散推定が不安定 | `T.min: 10`、agent は L2 でも下限を下げられない |
+| **dropout 層がないモデルに適用** | `_assert_mc_dropout_prerequisites` で即 fatal | `requires.model_must_contain_dropout_layers` fatal assert（YAML + code 両方） |
+| **BatchNorm も train モード** | running mean/var が汚染、次回 eval で予測が壊れる | `_enable_dropout_only` で dropout 層のみ選択 + `try/finally` で状態復元 |
+| **推論後にモデルが train mode に残る** | 続く normal 推論で dropout が有効化されたまま | `_restore_module_modes` を必ず finally で呼ぶ |
+| **dropout rate が全層 0** | dropout mask のばらつきなし → **`mutual_information ≈ 0`**（予測 entropy 自体は非ゼロたりうる） | fatal assert + provenance に per-layer rate 記録 |
+| **T が小さい（<10）** | 分散推定が不安定 | `T.min: 10`、agent は L2 でも下限を下げられない、code で fatal assert |
 | **T が過大（>100）** | GPU 時間浪費、性能向上飽和 | `T.max: 100`、L3 でも事前承認 |
 | **MC-Dropout の epistemic を "真の epistemic" と主張** | Human が過信 | Skill ドキュメントと provenance に "proxy" と明記 |
-| **推論のたびに `_set_seeds()` 呼ばず結果が非再現** | Human と agent で異なる結果 | seed 記録を契約で必須化 |
+| **`torch.manual_seed()` が global RNG を汚染** | 後続の学習/推論で乱数系列が想定外に | `torch.random.fork_rng()` で subprocess 的に隔離 |
+| **推論のたびに seed 記録なし** | Human と agent で異なる結果 | seed 記録を契約で必須化 |
 
 ---
 
@@ -320,13 +351,23 @@ class BayesianLinear(nn.Module):
 
 
 def elbo_loss(
-    log_likelihood: torch.Tensor,
+    mean_log_likelihood_per_sample: torch.Tensor,
     kl: torch.Tensor,
     n_data: int,
     kl_weight: float = 1.0,
 ) -> torch.Tensor:
-    """負の ELBO を最小化する形式で返す。KL は N でスケールして mini-batch と整合させる。"""
-    return -log_likelihood + kl_weight * kl / n_data
+    """
+    負の ELBO を最小化する形式で返す。
+
+    重要：`mean_log_likelihood_per_sample` は **サンプル 1 個あたりの log-likelihood の平均**
+    （たとえば `F.log_softmax(logits, -1).gather(...).mean()`）。
+    「mini-batch 上の合計」を渡すと likelihood 項が batch size でスケールし、
+    KL は `n_data` で割られるため、ELBO のバランスが崩壊する。
+
+    合計形式で渡したい場合はこう：
+        loss = -(n_data / batch_size) * batch_log_likelihood_sum + kl_weight * kl
+    """
+    return -mean_log_likelihood_per_sample + kl_weight * kl / n_data
 ```
 
 ### 推論時のサンプリング
@@ -337,12 +378,23 @@ def bnn_predict(model: nn.Module, x: torch.Tensor, S: int = 30) -> dict:
     """
     S 回 posterior サンプリングして予測分布を得る。
     出力形式は MC-Dropout と同一（uncertainty_stop_gate 互換）。
+
+    重要：確率性は **`BayesianLinear` の再パラメータ化のみ** に限定する。
+    BatchNorm や Dropout が混在する場合、eval モードにしてそれらの寄与を止めないと、
+    MI が「重み posterior 由来」なのか「他の確率層由来」なのか解釈不能になる。
     """
-    sample_probs = []
-    for _ in range(S):
-        logits = model(x)                            # BayesianLinear 内部で自動的に w をサンプル
-        sample_probs.append(logits.softmax(-1))
-    sample_probs = torch.stack(sample_probs, dim=0)  # (S, batch, K)
+    prev_states = {name: m.training for name, m in model.named_modules()}
+    model.eval()                                     # BN 統計凍結、Dropout 停止
+    try:
+        sample_probs = []
+        for _ in range(S):
+            logits = model(x)                        # BayesianLinear 内部で自動的に w をサンプル
+            sample_probs.append(logits.softmax(-1))
+        sample_probs = torch.stack(sample_probs, dim=0)  # (S, batch, K)
+    finally:
+        for name, m in model.named_modules():
+            if name in prev_states:
+                m.train(prev_states[name])
 
     mean_probs = sample_probs.mean(0)
     K = mean_probs.shape[-1]
@@ -391,11 +443,13 @@ training:
 
 acceptance:
   elbo_stable_last_10_epochs: true
-  kl_not_collapsing_to_zero: true                   # posterior collapse 対策
+  kl_not_collapsing_to_zero: true                   # posterior が prior に張り付く「prior 型 collapse」検知
+  kl_not_exploding: true                            # σ→0 の「決定論型 collapse」で KL が爆発するのを検知
   posterior_std_range:
     min: 1e-4
     max: 5.0
   reject_if_all_sigma_approach_zero: true           # 決定論的 NN に退化していないか
+  reject_if_predictions_are_sample_invariant: true  # posterior sample S 個の予測が同一 → 実質決定論
 
 agent_authorization:
   L1: "inference_only_with_frozen_posterior"
@@ -409,7 +463,8 @@ agent_authorization:
     can_change_posterior_family: "forbidden_all_levels"  # VI → SG-MCMC 切替は Human のみ
 
 provenance:
-  layer_5_bnn:                                      # 第4章 4 レイヤ + BNN 拡張レイヤ
+  bayesian_inference_config:                        # 第4章スキーマの BNN 拡張ブロック
+                                                    # （Ch07 Layer 4 と同様の追加パターン）
     posterior_family: "mean_field_gaussian"
     prior_family: "isotropic_gaussian"
     prior_sigma: 1.0
@@ -453,6 +508,7 @@ provenance:
 ### CP の落とし穴
 
 - **exchangeability 崩壊で保証消失**（分布シフト時に無効化）→ 第7章 `domain_gap_gate` を通過したサンプルにのみ CP を適用する運用が現実的
+- **`domain_gap_gate` は exchangeability 集合を変える**：CP を gate 通過後に運用するなら、**calibration set も同じ gate を通したサンプルで再校正**すること。得られる保証は "gate を通ったサンプル母集団の operational coverage" であり、gate 前の元母集団の保証ではないと Human 資料に明記する
 - **予測集合が大きすぎて実用性なし**（class 数が多い場合）→ adaptive CP / class-conditional CP を検討
 - **calibration set の汚染**（第5章 anti-leakage 違反）→ 契約で必ず分離
 
@@ -496,10 +552,18 @@ inputs:
 decision_rules:
   - if:
       regulatory_coverage_guarantee_required: true
+      distribution_shift_expected: true
+    then:
+      primary: "route_to_human_no_valid_automatic_method"
+      reason: "shift 下で CP の marginal coverage 保証は消失、他手法も保証を提供しない。Human が再校正/停止を決定"
+
+  - if:
+      regulatory_coverage_guarantee_required: true
       distribution_shift_expected: false
     then:
       primary: "conformal_prediction"
       secondary: "deep_ensemble_or_mc_dropout_for_internal_uncertainty"
+      caveat: "calibration set と本番の exchangeability を運用で担保"
 
   - if:
       gpu_budget_multiplier_available: ">= 3.0"
@@ -523,8 +587,13 @@ decision_rules:
       caveat: "prior 設定を Human 説明資料に必ず含める"
 
   - fallback:
+      when: "existing_model_has_dropout: true"
       primary: "mc_dropout"
       reason: "実装コスト最小の baseline"
+  - fallback_final:
+      when: "no other rule matched"
+      primary: "single_model_max_softmax_uncertainty_with_domain_gap_gate"
+      reason: "MC-Dropout 不可・BNN 化不可の場合の最小構成。第7章 domain_gap_gate と第8章 max_softmax_uncertainty のみで運用し、Human 監視頻度を上げる"
 
 agent_authorization:
   L1: "propose_method_only, no_execution"
@@ -568,8 +637,9 @@ flowchart LR
 | 失敗 | 症状 / 兆候 | 対策 |
 |---|---|---|
 | MC-Dropout で BatchNorm も train モード | eval 時の予測が非決定的に壊れる | `_enable_dropout_only` で dropout 層のみ切替、per-layer state を provenance に記録 |
-| BNN の posterior collapse | 全 σ が 0 に近づき決定論的 NN と同じ挙動 | `reject_if_all_sigma_approach_zero`、KL weight schedule 見直し |
-| BNN の prior が結果を支配 | prior sigma を変えると予測分布が大きく変わる | Human 説明資料に prior 設定を必須記載、prior 変更は L3 でも要承認 |
+| BNN の **決定論型 posterior collapse** | 全 σ が 0 に近づき決定論的 NN と同じ挙動、posterior sample S 個の予測が同一 | `reject_if_all_sigma_approach_zero` + `reject_if_predictions_are_sample_invariant`、KL weight schedule 見直し |
+| BNN の **prior 型 posterior collapse** | KL が 0 に近づき q(w) ≈ p(w)、posterior が学習に失敗 | `kl_not_collapsing_to_zero` acceptance、prior sigma と KL warmup を再設計 |
+| BNN の **prior 支配**（prior domination） | prior sigma を変えると予測分布が大きく変わる | Human 説明資料に prior 設定を必須記載、prior 変更は L3 でも要承認 |
 | Conformal set が全 class を含む | 予測集合の実用性ゼロ | α, calibration set size, model quality を再検討 |
 | Conformal の exchangeability 崩壊 | shift 下で coverage が保証値を下回る | `domain_gap_gate` 通過後のみ CP を有効化 |
 | MC-Dropout の T が過小で分散不安定 | 再実行で結果がぶれる | `T.min` 契約強制、seed 記録 |
@@ -598,7 +668,7 @@ flowchart LR
 - [ ] Conformal Prediction を使う場合、`domain_gap_gate` 通過後に限定されているか
 - [ ] 4 手法選択の decision rule が provenance に記録されているか
 - [ ] エージェント権限（L1-L3）と `agent_authorization` YAML が一致しているか
-- [ ] 手法出力はすべて第8章 `uncertainty_stop_gate` 互換の schema か（`mean_probs`, `predictive_entropy_normalized`, `mutual_information`）
+- [ ] 手法出力はすべて第8章 `uncertainty_stop_gate` 互換の schema か（`mean_probs`, `predictive_entropy_normalized`, `mutual_information`）。**ただし Conformal Prediction のみ例外**で、`prediction_set_size` / `interval_width` / `coverage_alpha` を別 monitor として gate に追加すること
 - [ ] 手法を混ぜず、各 monitor 独立で gate に流しているか
 
 ## 9.15 ワーク
