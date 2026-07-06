@@ -50,18 +50,22 @@ GP は次の 3 要素で完全に規定されます：
 - **Covariance kernel** $k(x, x'; \theta)$：関数空間の「滑らかさ」と「相関構造」を決める
 - **Likelihood**：観測ノイズ $\sigma_n^2$ を含む GaussianLikelihood（通常 homoscedastic、装置差があれば §6.6 で拡張検討）
 
-これを第5章の `kernel_spec` と組み合わせると、Skill 契約はこう書けます：
+これを第5章の `kernel_spec` と組み合わせると、Skill 契約はこう書けます。**トップレベルの provenance フィールドは第5章 §5.2 の 21 フィールドで確定**——本章は既存フィールド `surrogate_model_family` と `kernel_spec` の **内部構造を詳しく規定する** だけで、新規トップレベルフィールドは追加しません：
 
 ```yaml
-surrogate_model_family: "single_task_gp"  # または fixed_noise_gp / heteroskedastic_gp
-mean_function:
-  type: "constant"
-  initial: 0.0
-  learnable: true
+# --- 既存フィールド: surrogate_model_family（第5章 §5.2 Group A）---
+surrogate_model_family: "single_task_gp"  # enum: single_task_gp | fixed_noise_gp | heteroskedastic_gp
+
+# --- 既存フィールド: kernel_spec（第5章 §5.2 Group A）の詳細内部構造 ---
 kernel_spec:
+  # GP 内部の構成要素は kernel_spec のサブフィールドとして扱う
+  mean_function:
+    type: "constant"          # constant | zero | linear
+    initial: 0.0
+    learnable: true
   continuous:
-    type: "matern52"      # RBF | matern32 | matern52 | linear | rq
-    ard: true             # per-dimension length scale
+    type: "matern52"          # rbf | matern32 | matern52 | linear | rq（linear と rq は canonical enum に残すが本章の材料 BO 既定ではない）
+    ard: true                 # per-dimension length scale
     length_scale_prior:
       distribution: "gamma"
       params: { concentration: 3.0, rate: 6.0 }  # 材料 BO 既定
@@ -69,18 +73,18 @@ kernel_spec:
       distribution: "gamma"
       params: { concentration: 2.0, rate: 0.15 }
   categorical:
-    type: "hamming"       # または one_hot + RBF
+    type: "hamming"           # または one_hot + RBF
     variables: ["atmosphere", "facility_id"]
-  composite: "product"    # continuous × categorical
-likelihood:
-  type: "gaussian"
-  noise_prior:
-    distribution: "gamma"
-    params: { concentration: 1.1, rate: 0.05 }
-  noise_lower_bound: 1e-4
+  composite: "product"        # product | additive | mixed_additive_product
+  likelihood:
+    type: "gaussian"          # gaussian | fixed_noise | heteroskedastic
+    noise_prior:
+      distribution: "gamma"
+      params: { concentration: 1.1, rate: 0.05 }
+    noise_lower_bound: 1.0e-4
 ```
 
-このブロックが Group A（immutable during Skill run）です。**iteration の途中で kernel を切り替えるのは第3章 §3.5 逸脱 2（acquisition/surrogate drift）**——Skill fatal で止めます。kernel 変更は Human 判断で新 run として扱います。
+このブロックは Group A（第5章 §5.2 immutable during Skill run）の一部です。**iteration の途中で kernel を切り替えるのは第3章 §3.5 逸脱 2（acquisition/surrogate drift）**——Skill fatal で止めます。kernel 変更は Human 判断で新 run として扱います。
 
 ---
 
@@ -99,17 +103,18 @@ $$
 ### 6.3.2 Matérn 3/2
 
 $$
-k_{3/2}(r) = \sigma_f^2 \left(1 + \sqrt{3}\,\tfrac{r}{\ell}\right) \exp\!\left(-\sqrt{3}\,\tfrac{r}{\ell}\right), \quad r = \|x - x'\|
+k_{3/2}(x, x') = \sigma_f^2 \left(1 + \sqrt{3}\, r_{\text{ARD}}\right) \exp\!\left(-\sqrt{3}\, r_{\text{ARD}}\right),\quad r_{\text{ARD}} = \sqrt{\sum_{i=1}^d \frac{(x_i - x'_i)^2}{\ell_i^2}}
 $$
 
 - **滑らかさ**：1 階微分可能
 - **推奨場面**：目的関数が比較的粗い、閾値挙動を持つ、相転移的な変化がある
 - **材料 BO での使い所**：反応速度、収率など、局所的な非滑らかさが疑われる場合
+- **相転移の注意**：本当に不連続な相転移がある場合、Matérn 3/2 でも表現できない——第8章の Deep Kernel か、相領域ごとに独立 GP を張る（第11章 blocked_out）ことを検討
 
 ### 6.3.3 Matérn 5/2（**本書の第一選択**）
 
 $$
-k_{5/2}(r) = \sigma_f^2 \left(1 + \sqrt{5}\,\tfrac{r}{\ell} + \tfrac{5 r^2}{3 \ell^2}\right) \exp\!\left(-\sqrt{5}\,\tfrac{r}{\ell}\right)
+k_{5/2}(x, x') = \sigma_f^2 \left(1 + \sqrt{5}\, r_{\text{ARD}} + \tfrac{5}{3} r_{\text{ARD}}^2\right) \exp\!\left(-\sqrt{5}\, r_{\text{ARD}}\right)
 $$
 
 - **滑らかさ**：2 階微分可能
@@ -166,7 +171,7 @@ Skill 契約に貼るための「既定値表」。**この表がある章の存
 |---|---|---|---|
 | 温度・圧力・時間など標準的な連続変数 | Matérn 5/2 + ARD | Gamma(3.0, 6.0) | 入力は Normalize([0, 1]) |
 | 化学組成比（連続、和が 1 の制約あり）| Matérn 5/2 + ARD | Gamma(3.0, 6.0) | simplex 制約は第10章で reparameterize |
-| 相転移が疑われる制御変数 | Matérn 3/2 + ARD | Gamma(2.0, 4.0)（やや長めを許容）| 局所非滑らかを許容 |
+| 相転移が疑われる制御変数 | Matérn 3/2 + ARD | Gamma(2.0, 4.0)（分散を広げて長め・短めどちらも許容）| 局所非滑らかを許容 |
 | 反応速度・収率（対数変換したい）| Matérn 5/2 + ARD | Gamma(3.0, 6.0) | outcome_transform で log 変換 |
 
 ### 6.5.2 離散/カテゴリ変数の既定
@@ -191,7 +196,7 @@ Skill 契約に貼るための「既定値表」。**この表がある章の存
 | 状況 | likelihood | noise prior | 備考 |
 |---|---|---|---|
 | 観測ノイズが一定と仮定できる | GaussianLikelihood（homoscedastic）| Gamma(1.1, 0.05) | 本章の既定 |
-| 観測ノイズが入力依存で変わる | `HeteroskedasticSingleTaskGP` | データ依存 | 第8章で言及、実装は付録 B |
+| 観測ノイズが入力依存で変わる | heteroskedastic_gp（概念族）| データ依存 | current BoTorch では `train_Yvar` を渡す `FixedNoiseGaussianLikelihood` / custom likelihood / 付録 B 実装、または独立の noise model と組み合わせ |
 | 装置ごとにノイズが違う | 装置別 likelihood | 装置別 prior | 第11章の階層 GP と組み合わせ |
 
 ---
@@ -209,24 +214,26 @@ k((x_{\text{cont}}, f), (x'_{\text{cont}}, f'))
  = k_{\text{Matern52}}(x_{\text{cont}}, x'_{\text{cont}}; \ell)\ \cdot\ k_{\text{Hamming}}(f, f')
 $$
 
-Hamming kernel は：
+Hamming kernel を正規化された相関形で書くと：
 
 $$
-k_{\text{Hamming}}(f, f') = \sigma_c^2 \cdot \mathbb{1}[f = f']  + \rho \cdot \mathbb{1}[f \neq f']
+k_{\text{Hamming}}(f, f') = \sigma_c^2 \cdot \bigl(\mathbb{1}[f = f'] + \rho \cdot \mathbb{1}[f \neq f']\bigr)
 $$
 
-- $\rho \in [0, 1]$：装置間の相関を表す hyperparameter
+- $\sigma_c^2$：全体スケール、$\rho \in [0, 1]$：装置間の相関
 - $\rho = 1$：装置差なし（=装置を無視）
 - $\rho = 0$：装置ごとに完全独立（=`blocked_out` に近い）
 
-### 6.6.2 categorical_input の限界
+BoTorch の `CategoricalKernel` は等価な指数形 $k = \exp(-\delta(c, c') / \ell_{\text{cat}})$ を使い（$\delta$ は Hamming 距離、$\ell_{\text{cat}}$ が length scale）、$\ell_{\text{cat}} \to \infty$ が装置差なし、$\ell_{\text{cat}} \to 0$ が完全独立に対応。**表現上は等価**、Skill 契約でも `type: "hamming"` として吸収できます。
 
-- 装置が 2-5 台程度なら OK。10 台以上になると相関パラメータの推定が不安定
+### 6.6.2 categorical_input の限界と切替え兆候
+
 - 装置ごとの目的関数の**形が違う**（optimum の位置が違う）と、product kernel では表現しきれない
+- 装置ごとの観測が偏っており、`blocked_out` にすると各 GP のデータ不足で信頼できない → partial pooling が欲しい場面
 - どちらかで詰まったら **第11章の hierarchical GP** に切り替える
 
 > [!TIP]
-> **判断の目安**：装置 3 台までは categorical_input、4 台以上または「明らかに装置ごとに optimum が違う」なら hierarchical GP を検討。
+> **判断の目安（Ch3 §3.3 と整合）**：`categorical_input` は「装置差はあるが最適点の場所は近い」と信じられ、装置ごとに独立提案が要らない場合。装置ごとに optimum が明確に違う、または partial pooling で装置間の情報を借りたい場合は **`hierarchical_shrinkage`（第11章）**。装置ごとに完全独立で構わない（データも十分ある）なら **`blocked_out`**。数だけでなく「optimum の場所が装置間で似ているか」「pooling がほしいか」で判断してください。
 
 ---
 
@@ -240,18 +247,36 @@ from botorch.models import SingleTaskGP
 from botorch.models.transforms.input import Normalize
 from botorch.models.transforms.outcome import Standardize
 from gpytorch.kernels import MaternKernel, ScaleKernel
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.priors import GammaPrior
+from gpytorch.constraints import GreaterThan
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.fit import fit_gpytorch_mll
 
 # X: (N, d) tensor、Y: (N, 1) tensor
 d = X.shape[-1]
+
+# 6.2 の kernel_spec に対応する prior 付き kernel
 covar_module = ScaleKernel(
-    MaternKernel(nu=2.5, ard_num_dims=d)  # Matérn 5/2 + ARD
+    MaternKernel(
+        nu=2.5,
+        ard_num_dims=d,
+        lengthscale_prior=GammaPrior(3.0, 6.0),   # 6.4.2 材料 BO 既定
+    ),
+    outputscale_prior=GammaPrior(2.0, 0.15),        # 6.2 output_scale_prior
 )
+
+# noise prior + lower bound（6.5.4 の likelihood 既定に対応）
+likelihood = GaussianLikelihood(
+    noise_prior=GammaPrior(1.1, 0.05),
+    noise_constraint=GreaterThan(1e-4),
+)
+
 model = SingleTaskGP(
     train_X=X,
     train_Y=Y,
     covar_module=covar_module,
+    likelihood=likelihood,
     input_transform=Normalize(d=d),
     outcome_transform=Standardize(m=1),
 )
@@ -293,7 +318,12 @@ model = MixedSingleTaskGP(
 )
 ```
 
-`MixedSingleTaskGP` は内部で continuous 部分に Matérn、categorical 部分に categorical kernel を組んで product を取ります。
+`MixedSingleTaskGP` の内部 kernel は current BoTorch で **`k_cont_1 + k_cat_1 + k_cont_2 * k_cat_2`** の形（additive + product の合成）を採ります。したがって Skill 契約で純粋な product を宣言している場合、実装との drift が起きます。以下のいずれかで対処：
+
+- 契約側を BoTorch 実装に合わせる：`kernel_spec.composite: "mixed_additive_product"` に変更
+- 実装側を契約に合わせる：`SingleTaskGP` に自作の product kernel（`ProductKernel(MaternKernel(...), CategoricalKernel(...))`）を渡す
+
+材料 BO で装置差を「連続変数と product で相互作用させる」ことが本質的な場合は自作 product、装置差の効果が主効果として分離しやすい場合は `MixedSingleTaskGP` の additive + product が実務的に扱いやすい。
 
 ---
 
@@ -324,7 +354,7 @@ Skill 契約に貼る kernel 選定フロー：
 
 [Q5] 観測ノイズは？
   ├─ 一定と仮定できる → GaussianLikelihood（homoscedastic）
-  └─ 入力依存 → HeteroskedasticSingleTaskGP（第8章で言及、実装は付録 B）
+  └─ 入力依存 → heteroskedastic_gp（`FixedNoiseGaussianLikelihood` に既知分散を与える、または付録 B の custom likelihood 実装）
 ```
 
 ---
@@ -363,7 +393,7 @@ Skill 契約に貼る kernel 選定フロー：
 - [第3章](./chapter-03.md) §3.3：装置差の 3 選択肢の初出（本章 §6.6 と §6.5.3）
 - [第4章](./chapter-04.md) §4.6：BoTorch API（`fit_gpytorch_mll`, `Normalize`, `Standardize`）
 - [第5章](./chapter-05.md) §5.2：`kernel_spec` フィールドの Skill 契約における位置（Group A immutable）
-- [第7章](./chapter-07.md)（次章）：acquisition function と外挿検知の operational 定義
+- [第7章](./chapter-07.md)（planned）：acquisition function と外挿検知の operational 定義
 - [第8章](./chapter-08.md)（planned）：GP の限界と代替 surrogate
 - [第11章](./chapter-11.md)（planned）：hierarchical GP のフル展開
 
@@ -375,7 +405,7 @@ Skill 契約に貼る kernel 選定フロー：
 ### 外部参考
 
 - Rasmussen & Williams, *Gaussian Processes for Machine Learning*, MIT Press, 2006 — GP の標準教科書。第4章の Matérn 族、第5章の hyperparameter 最適化を参照
-- BoTorch Documentation — `SingleTaskGP`, `MixedSingleTaskGP`, `HeteroskedasticSingleTaskGP` の API
+- BoTorch Documentation — `SingleTaskGP`, `MixedSingleTaskGP`, `FixedNoiseGaussianLikelihood` の API
 - GPyTorch Documentation — kernel の合成、prior の設定
 - Frazier, P. I., *A Tutorial on Bayesian Optimization*, arXiv:1807.02811, 2018 — 材料 BO の kernel 選定に関する実務的議論
 
