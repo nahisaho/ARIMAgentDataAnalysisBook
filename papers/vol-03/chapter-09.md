@@ -1,695 +1,670 @@
-# 第9章 MC-Dropout と Bayesian Neural Net を Skill 化する — 手法選択の判断表
+# 第9章 深層モデルの不確かさ入門 — Agentic 停止条件つき
 
 > [!NOTE]
 > **本章の到達目標**
-> - **MC-Dropout** の理論的位置づけ（近似ベイズ推論としての解釈）と実務上の限界を説明できる
-> - **MC-Dropout Skill** を実装し、第8章の `uncertainty_stop_gate` に流し込める
-> - **BNN**（Bayes by Backprop / Variational Inference / SG-MCMC）の 3 系統を区別し、選ぶ理由を書き分けられる
-> - **`bnn_uncertainty` Skill**（Bayes by Backprop の最小実装）を、承認ゲート付きで書ける
-> - **vol-02 第10-12章 PyMC/NumPyro**（本格ベイズ）と本章 BNN（近似ベイズ）の**接続と使い分け**を説明できる
-> - **conformal prediction** の位置づけ（分布仮定に頼らない校正法）を把握し、比較表に組み込める
-> - **「BNN vs Deep Ensemble vs MC-Dropout vs Conformal」**の 4 手法使い分け表を Skill 選択に使える
-> - エージェントが **不確かさ推定手法を提案するときの判断基準**（コスト × 精度 × Human 解釈しやすさ × 停止ゲートとの相性）を YAML 契約に落とせる
+> - **calibrated softmax の限界**（confidence ≠ probability）を数値例で説明できる
+> - **calibration 指標**（Brier / ECE / reliability diagram）を実装し、Skill の受け入れ基準に組み込める
+> - **temperature scaling** による post-hoc calibration を Skill 化できる
+> - **Deep Ensemble Skill** を M モデルで実装し、`predictive_entropy_normalized` / `mutual_information`（epistemic）/ `expected_entropy`（aleatoric）を計算できる
+> - **`uncertainty_stop_gate` 契約**を書き、エージェントが不確かさ閾値超過時に自律停止して Human に投げるゲートを設計できる
+> - 第7章 §7.3 の `val_ood_score` の forward reference を、この章で **具体実装として回収**する
+> - 第8章の `domain_gap_gate`（feature-level OOD）と、この章の `uncertainty_stop_gate`（output-level uncertainty）の**役割分担**を書き分けられる
 >
 > **本章で扱わないこと**
-> - **PyMC / NumPyro の本格 MCMC** → **vol-02 第10-12章**（本章では接続点のみ）
-> - **Deep Ensemble の詳細** → **第8章**
-> - **conformal prediction の完全実装** → 位置づけと比較表のみ、詳細は付録・第10章 reliability diagram で補足
-> - **Foundation Model の不確かさ** → **第11章**（LLM/FM 特有の hallucination 対策）
-> - **Grad-CAM / attribution** → **第10章**
+> - **MC-Dropout / BNN**（Bayes by Backprop / VI / SG-MCMC）→ **第10章**（Deep Ensemble との使い分け表を含む）
+> - **PyMC / NumPyro による本格ベイズ推論** → **第10-12章**（vol-02 継承 + 深層特徴の接続）
+> - **conformal prediction の詳細** → **第10章末で使い分け表のみ触れる**
+> - **Grad-CAM / SHAP / attribution** → **第11章**（解釈と誤判定流し戻し UX）
 
 ---
 
 ## 9.1 この章で作る Skill
 
-2 つの **不確かさ Agentic Skill** と 1 つの **判断表** を作ります。
+3 つの **不確かさ Agentic Skill** と 1 つの **停止ゲート契約**を作ります。
 
 | Skill / 成果物 | 役割 | 入出力 |
 |---|---|---|
-| **`mc_dropout_predict`** | 学習済みモデルに dropout を推論時にも有効化し T 回サンプリングで不確かさを推定 | 入力: model with dropout + T + data → 出力: mean_probs / predictive_entropy / mutual_information |
-| **`bnn_uncertainty`**（Bayes by Backprop 最小実装） | 重みを分布として学習し posterior サンプリング | 入力: model factory + prior + data → 出力: posterior sample の平均予測 / 分解 |
-| **`uncertainty_method_selection_table`**（判断表） | 手法選択の Skill レベル決定支援 | 入力: 対象データ / GPU 予算 / Human 解釈要求 → 出力: 推奨手法 + 理由 |
+| **`calibration_check`** | 学習済みモデルの calibration 品質を測る | 入力: model + val set → 出力: ECE / Brier / reliability diagram |
+| **`temperature_scaling`** | post-hoc temperature scaling で calibration を改善 | 入力: model + calibration set → 出力: 温度パラメータ T + wrapped model |
+| **`deep_ensemble`** | M モデルの Deep Ensemble を訓練・推論・不確かさ分解 | 入力: model factory + M + data → 出力: 平均予測 / 分散 / 分解 |
+| **`uncertainty_stop_gate`**（契約） | 推論時に不確かさ閾値超過で自律停止 → Human 送り | 入力: predictive distributions → 出力: action (continue / route_to_human / block) |
 
-前提として、第4章 provenance 3 レイヤ（GPU / 事前学習重み / 学習・推論設定）+ 第7章 Layer 4（転移学習拡張）、第5-8 章の契約群、第8章の `uncertainty_stop_gate` を継承します。**本章では BNN 用の拡張ブロック `bayesian_inference_config` を第4章スキーマに追加します（Ch07 が Layer 4 を追加したのと同じ拡張パターン）**。本章で作る Skill の出力はすべて第8章 gate に流し込める形式に揃えます（`mean_probs`, `predictive_entropy_normalized`, `mutual_information`）。ただし Conformal Prediction は予測集合を返すため別 monitor 扱いにします（§9.9 / §9.10）。
+前提として、第5章 provenance 3 レイヤ、第5-6 章の契約群、第8章の `domain_gap_gate` を継承します。
 
 ---
 
-## 9.2 なぜこの章が必要か — Deep Ensemble だけでは足りない理由
+## 9.2 なぜこの章が必要か — vol-02 第9-10 章との対比
 
-第8章で Deep Ensemble を推奨しましたが、実務では以下の制約に直面します：
+vol-02 では PyMC による本格ベイズ推論（第10-12章）で不確かさを扱いました。しかし深層モデルでは：
 
-- **GPU 予算**：M=5 の Deep Ensemble は学習コスト × 5、推論コスト × 5。**ARIM 施設の共有 GPU では現実的でないケース**が多い
-- **単一 checkpoint のみ許可**：組織の運用ポリシー・監査対応上、モデル配布は 1 個に絞りたい
-- **posterior の解釈が欲しい**：Human に「重みそのものの分布」を提示したい（BNN）
-- **分布仮定を置きたくない**：どんなモデルでも valid な予測区間が欲しい（conformal prediction）
+- **PyMC でネットワーク重みを直接推論するのは計算コストが非現実的**（数百万〜数十億パラメータ）
+- **深層モデルの softmax 出力は "確率" ではなく "confidence"** — calibration を測らないと数字が意味を持たない
+- **単一 checkpoint の点推定では、認識できていないことを認識できない**（epistemic uncertainty が消える）
 
-これらの制約に対して、選択肢は 4 つあります：
+一方で Agentic 環境では：
+
+- エージェントが `predict()` の 1 スカラー確信度を鵜呑みにして自律判断すると **危険**
+- Human に投げる基準を「confidence < 0.7 なら」で決めると overconfidence 問題で **不発**（本当は 0.9 でも間違っている）
+- **不確かさ閾値超過で停止するゲート**を Skill に組み込まないと、暴走する
 
 ```mermaid
 flowchart TB
-    A["不確かさが欲しい"] --> B{"GPU 予算 M 倍<br/>確保できる？"}
-    B -->|"Yes"| C["Deep Ensemble<br/>（第8章）"]
-    B -->|"No"| D{"再学習コスト<br/>払える？"}
-    D -->|"No"| E["MC-Dropout<br/>（本章 §9.3-9.5）"]
-    D -->|"Yes, 重みの分布が<br/>欲しい"| F["BNN<br/>（本章 §9.6-9.8）"]
-    D -->|"No, とにかく valid な<br/>予測区間"| G["Conformal Prediction<br/>（本章 §9.9）"]
-    C --> H["uncertainty_stop_gate"]
-    E --> H
-    F --> H
-    G --> H
+    A["新規サンプル"] --> B["深層モデル推論"]
+    B --> C{"出力 softmax 信頼度"}
+    C -->|"生 softmax"| D["⚠️ Overconfident<br/>信用できない"]
+    B --> E["Deep Ensemble<br/>M モデル平均 + 分散"]
+    E --> F["predictive_entropy_normalized<br/>+ mutual_information"]
+    F --> G{"uncertainty_stop_gate"}
+    G -->|"entropy 小"| H["エージェント自律決定 OK"]
+    G -->|"entropy 中"| I["Human に flag + continue"]
+    G -->|"entropy 大"| J["自律停止<br/>Human 送り"]
 ```
+
+---
+
+## 9.3 Calibrated softmax の限界 — 「confidence 0.95」は 95% ではない
+
+深層モデルの softmax 出力は「学習時の cross-entropy を最小化した結果の確率らしき数値」であり、**真の予測確率とは一致しません**。
+
+### §9.3 confidence bin の「予測との差」
+
+**注**：下表の「予測との差」は各 bin の accuracy と bin **中央値** confidence（例：bin `0.9-1.0` は中央 0.95）の差です。
+
+学習済み ResNet を CIFAR-10 で評価すると（Guo et al., 2017 系の典型結果パターン）：
+
+| 予測 confidence | サンプル数 | 実際の正解率 | 予測との差 |
+|---|---|---|---|
+| 0.5-0.6 | 500 | 0.55 | +0.00 |
+| 0.6-0.7 | 800 | 0.58 | -0.07 |
+| 0.7-0.8 | 1200 | 0.68 | -0.07 |
+| 0.8-0.9 | 2500 | 0.79 | -0.06 |
+| 0.9-1.0 | 5000 | 0.88 | **-0.07** |
+
+**「confidence 0.9-1.0 のうち、実際に正解なのは 88%」**——つまり深層モデルは自信過剰（overconfident）です。
 
 > [!IMPORTANT]
-> **本章の位置づけ**：4 手法は**排他ではなく組み合わせ可能**です。実務では「MC-Dropout で日次監視 + 月次で Deep Ensemble 再校正 + 予測区間は Conformal で保証」のような多層構成が現実的。**エージェントには "どの層を今回使うか" を判断させる**ための表を §9.10 で作ります。
+> **上表は教材上の典型パターン**であり、実測ではモデル・データセット・学習設定で大きく変わります。**必ず自データで reliability diagram を描いてから閾値を決めてください**。
 
----
+### なぜ overconfident になるのか
 
-## 9.3 MC-Dropout の理論的位置づけ
+1. **Cross-entropy loss は confidence を 1 に押し上げる圧力を持つ**（間違っていても押し上げる）
+2. **BatchNorm / dropout / weight decay が寄与するが、根本原因は capacity 過剰**
+3. **augmentation を除いた「素の train」で最終 epoch を回すと悪化**
 
-**MC-Dropout**（Gal & Ghahramani, 2016）は、dropout を**推論時にも有効化**し、$T$ 回サンプリングして予測分布を得る手法です。
-
-### 3 行で書くとこう
-
-1. 学習時と同じく dropout を **推論時にも on** にする（`model.train()` ではなく、dropout 層のみ選択的に on）
-2. 同じ入力 $x$ に対して $T$ 回 forward し、$T$ 個の予測 $\{p^{(t)}(y|x)\}_{t=1}^T$ を得る
-3. 平均・分散・エントロピー分解を計算（式は第8章 §8.6 の Deep Ensemble と同一）
-
-### 理論的裏付け（近似ベイズ）
-
-Gal & Ghahramani は、dropout つき NN の学習は**特定の事前分布を置いた Bayesian NN の変分推論と数学的に等価**であることを示しました。ゆえに MC-Dropout の $T$ 回サンプルは近似的な posterior sample と解釈できます。
-
-> [!WARNING]
-> **この "等価" は仮定込みです**：dropout rate が特定の precision parameter に対応する、prior が Gaussian、活性化関数が特定の条件を満たす、などの前提があります。**「MC-Dropout = 完全なベイズ」とは主張しない**でください。実務上は「安価な epistemic uncertainty の proxy」と扱うのが健全です。
-
-### Deep Ensemble との違い
-
-| 観点 | MC-Dropout | Deep Ensemble |
-|---|---|---|
-| **多様性の源** | 同一重みからの dropout mask のランダム性 | 初期化・data order・augmentation の違いによる異なる収束点 |
-| **学習コスト** | × 1（1 モデルのみ学習） | × M |
-| **推論コスト** | × T（同一モデルで T 回 forward） | × M |
-| **メモリ** | × 1 | × M |
-| **epistemic 表現力** | 弱い（1 つの mode 周辺のみ） | 強い（複数 mode を捉えうる） |
-| **実装難度** | 極低（既存モデルにフラグ 1 つ） | 中（M 個の学習パイプライン） |
-
----
-
-## 9.4 MC-Dropout Skill の実装
-
-### モデル前提
-
-対象モデルが **dropout 層を含んでいる**必要があります。含まないモデルには MC-Dropout は適用できません（強制的に dropout 層を挿入するのは第6-7章の契約違反）。
+### 結果：エージェントが softmax を鵜呑みにするとどうなるか
 
 ```python
-# mc_dropout_predict.py
-import torch
-import torch.nn as nn
-
-
-def _enable_dropout_only(model: nn.Module) -> dict[str, bool]:
-    """
-    model.eval() 後に、dropout 層のみを train モードに戻す。
-    BatchNorm 等は eval のまま（train モードだと推論が壊れる）。
-    返り値：呼び出し前の各モジュールの `.training` 状態（`_restore_module_modes` で復元）。
-    """
-    prev_states: dict[str, bool] = {name: m.training for name, m in model.named_modules()}
-    model.eval()
-    for m in model.modules():
-        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d)):
-            m.train()
-    return prev_states
-
-
-def _restore_module_modes(model: nn.Module, prev_states: dict[str, bool]) -> None:
-    """`_enable_dropout_only` 呼び出し前の training/eval 状態に復元。finally で必ず呼ぶ。"""
-    for name, m in model.named_modules():
-        if name in prev_states:
-            m.train(prev_states[name])
-
-
-def _assert_mc_dropout_prerequisites(model: nn.Module, T: int) -> None:
-    """契約 YAML の requires を code 側でも fatal assert。"""
-    assert 10 <= T <= 100, f"T must be in [10, 100], got {T}"
-    dropout_layers = [
-        m for m in model.modules()
-        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d))
-    ]
-    assert len(dropout_layers) > 0, "MC-Dropout requires at least one dropout layer"
-    assert any(getattr(m, "p", 0.0) > 0.0 for m in dropout_layers), \
-        "MC-Dropout requires at least one dropout layer with p > 0"
-
-
-@torch.no_grad()
-def mc_dropout_predict(
-    model: nn.Module,
-    x: torch.Tensor,
-    T: int = 30,
-    seed: int | None = None,
-) -> dict:
-    """
-    x: (batch, ...) 入力
-    T: サンプリング回数
-    return:
-      mean_probs: (batch, K)
-      predictive_entropy: (batch,)
-      expected_entropy: (batch,)
-      mutual_information: (batch,)
-      max_softmax_uncertainty: (batch,)   # 1 - max(mean_probs)
-    """
-    _assert_mc_dropout_prerequisites(model, T)
-    prev_states = _enable_dropout_only(model)
-    try:
-        # dropout mask のランダム性を制御。torch.manual_seed は global RNG を変更するため、
-        # 呼び出し外への副作用を避けたい場合は torch.random.fork_rng() を使うこと。
-        with torch.random.fork_rng(devices=[x.device] if x.is_cuda else []):
-            if seed is not None:
-                torch.manual_seed(seed)
-                if x.is_cuda:
-                    torch.cuda.manual_seed_all(seed)
-
-            sample_probs = []
-            for _ in range(T):
-                logits = model(x)
-                sample_probs.append(logits.softmax(-1))
-        sample_probs = torch.stack(sample_probs, dim=0)  # (T, batch, K)
-    finally:
-        _restore_module_modes(model, prev_states)
-
-    mean_probs = sample_probs.mean(0)                # (batch, K)
-    K = mean_probs.shape[-1]
-    assert K > 1, "MC-Dropout requires K > 1"
-    eps = 1e-12
-
-    predictive_entropy = -(mean_probs * (mean_probs + eps).log()).sum(-1)          # (batch,)
-    member_entropy = -(sample_probs * (sample_probs + eps).log()).sum(-1)          # (T, batch)
-    expected_entropy = member_entropy.mean(0)                                      # (batch,)
-    mutual_information = predictive_entropy - expected_entropy                     # (batch,)
-    max_softmax_uncertainty = 1.0 - mean_probs.max(-1).values                      # (batch,)
-
-    log_k = torch.log(torch.tensor(K, dtype=predictive_entropy.dtype, device=predictive_entropy.device))
-    predictive_entropy_normalized = predictive_entropy / log_k
-
-    return {
-        "mean_probs": mean_probs,
-        "predictive_entropy": predictive_entropy,
-        "predictive_entropy_normalized": predictive_entropy_normalized,
-        "expected_entropy": expected_entropy,
-        "mutual_information": mutual_information,
-        "max_softmax_uncertainty": max_softmax_uncertainty,
-    }
+# ❌ 危険なパターン
+prediction = model(x)                     # (batch, n_classes)
+confidence = prediction.softmax(-1).max()
+if confidence > 0.7:
+    agent_autonomous_action()             # ⚠️ 実際は正解率 65% でも走る
+else:
+    route_to_human()
 ```
 
-### 契約 YAML
+正しくは、**calibration を測定してから閾値を決める**（§9.4）、**temperature scaling で補正**（§9.5）、**Deep Ensemble で分散を測る**（§9.6）、そして **`uncertainty_stop_gate` 契約で停止条件を明文化**（§9.8）します。
+
+---
+
+## 9.4 Calibration 指標 — Brier / ECE / reliability diagram
+
+### Brier score
+
+$$
+\mathrm{Brier} = \frac{1}{N} \sum_{i=1}^{N} \sum_{k=1}^{K} (p_{ik} - y_{ik})^2
+$$
+
+- $p_{ik}$: サンプル $i$ のクラス $k$ の予測確率
+- $y_{ik}$: one-hot 正解（0 or 1）
+- **範囲**: 0（完璧）〜 2。**K-class one-hot 定義では K=2 でも 0〜2**（各サンプル最大寄与 $2$：予測 $[1,0]$ vs 正解 $[0,1]$）。二値分類で scalar $p \in [0,1]$ に対して $(p-y)^2$ を使う慣例では 0〜1。契約では**どちらの定義を使うか必ず明記**すること
+- 予測が正確でも overconfident なら悪化する
+
+### Expected Calibration Error (ECE)
+
+confidence を M bin に区切り、各 bin での |accuracy − confidence| の加重平均：
+
+$$
+\mathrm{ECE} = \sum_{m=1}^{M} \frac{|B_m|}{N} \, \bigl| \, \mathrm{acc}(B_m) - \mathrm{conf}(B_m) \, \bigr|
+$$
+
+ここでは $B_m = \{ i \mid c_i \in ((m-1)/M, m/M] \}$（左端除外の半開区間）とします。softmax の max confidence は通常 $1/K$ 以上なので左端除外の影響は無視できます。$M$（bin 数）は **各 bin に十分なサンプルがある場合のみ 10-15 を採用**し、クラス不均衡・少データではサンプル数を bin ごとに報告するか、等頻度 bin に切り替えてください。
+
+- **範囲**: 0（完璧）〜 1
+- **典型的な採用基準**：ECE < 0.05 なら calibration OK（**例示；タスク・重要度で変わる**）
+- Bin 数 M は 10〜15 が慣例（少なすぎると鈍感、多すぎると個別 bin が空）
+
+### Reliability diagram
+
+x 軸 = confidence bin、y 軸 = accuracy を描画。**対角線に近い**ほど calibration が良好。
+
+```python
+# calibration_metrics.py
+import numpy as np
+
+def expected_calibration_error(probs: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> float:
+    """
+    probs: (N, K) 予測確率、labels: (N,) 正解クラス
+    """
+    confidences = probs.max(axis=1)
+    predictions = probs.argmax(axis=1)
+    accuracies = (predictions == labels).astype(float)
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        in_bin = (confidences > lo) & (confidences <= hi)
+        if in_bin.sum() == 0:
+            continue
+        acc_bin = accuracies[in_bin].mean()
+        conf_bin = confidences[in_bin].mean()
+        ece += (in_bin.sum() / len(probs)) * abs(acc_bin - conf_bin)
+    return float(ece)
+
+
+def brier_score(probs: np.ndarray, labels: np.ndarray) -> float:
+    """
+    probs: (N, K), labels: (N,)
+    """
+    n_classes = probs.shape[1]
+    one_hot = np.eye(n_classes)[labels]
+    return float(((probs - one_hot) ** 2).sum(axis=1).mean())
+```
+
+### Skill 契約への組み込み
 
 ```yaml
-# mc_dropout_predict.yaml
-skill: "mc_dropout_predict"
-version: "1.0.0"
+# calibration_acceptance.yaml
+calibration_acceptance:
+  ece_threshold: 0.05                     # example; タスクで再校正
+  brier_threshold: 0.15                   # example; K=5 分類の目安
+  reliability_diagram_output: "reports/reliability_YYYY-MM-DD.png"
+  n_bins: 15
+  compute_on: "val_set"                   # test への計算は禁止（第6章 anti-leakage）
+  action_on_fail:
+    - "run_temperature_scaling"           # §9.5 で自動実行
+    - "if_still_fail_route_to_human"
+```
 
-requires:
-  model_must_contain_dropout_layers: true          # fatal if false
-  base_model_frozen_during_inference: true
-  reject_if_dropout_rate_zero_in_all_layers: true
+---
 
-parameters:
-  T:
-    default: 30
-    min: 10
-    max: 100
-    agent_authorization:
-      L1: "read_only"
-      L2: "modify_within_range"
-      L3: "modify_with_prior_approval"
+## 9.5 Temperature Scaling — Post-hoc calibration の最小実装
 
-outputs:
-  contract: "matches_uncertainty_stop_gate_input_schema"
-  fields:
-    - "mean_probs"
+学習済みモデルをそのままに、**softmax 前のロジットをスカラー T で割る**だけの後処理で ECE を大きく改善できます（Guo et al., 2017）。
+
+$$
+p_i = \mathrm{softmax}(z_i / T)
+$$
+
+- $T > 1$: 出力を「なだらか」に（overconfident を緩和）
+- $T < 1$: 出力を「尖らせる」（underconfident を補正）
+- **重みは変更しない**ため、accuracy に影響を与えない（argmax は不変）
+
+```python
+# temperature_scaling.py
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+class TemperatureScaledModel(nn.Module):
+    """
+    Post-hoc temperature scaling。
+    重要：
+      - base_model の重みは frozen（`requires_grad_(False)`）。
+      - fit_temperature には eval モード・no_grad で抽出した logits を渡す。
+      - temperature を log 空間で持ち、常に正を保証（argmax 不変を保つ）。
+    """
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.base_model = base_model
+        for p in self.base_model.parameters():
+            p.requires_grad_(False)                   # base 重み frozen
+        # log_temperature を parameter にすることで T = exp(log_T) > 0 を保証
+        self.log_temperature = nn.Parameter(torch.zeros(1))
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        return self.log_temperature.exp()
+
+    def forward(self, x):
+        self.base_model.eval()                        # 推論時常に eval
+        with torch.no_grad():
+            logits = self.base_model(x)
+        return logits / self.temperature
+
+    def fit_temperature(self, logits: torch.Tensor, labels: torch.Tensor, max_iter: int = 50):
+        """
+        calibration set の logits + labels から log_temperature のみを最適化。
+        logits は事前に `base_model.eval()` + `torch.no_grad()` で抽出しておく：
+
+            base_model.eval()
+            with torch.no_grad():
+                logits = torch.cat([base_model(x).detach() for x, _ in calib_loader])
+                labels = torch.cat([y for _, y in calib_loader])
+        """
+        nll_criterion = nn.CrossEntropyLoss()
+        optimizer = optim.LBFGS([self.log_temperature], lr=0.01, max_iter=max_iter)
+
+        def closure():
+            optimizer.zero_grad()
+            loss = nll_criterion(logits / self.temperature, labels)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        return float(self.temperature.item())
+```
+
+### Skill 契約
+
+```yaml
+# temperature_scaling_contract.yaml
+temperature_scaling:
+  enabled: true
+  calibration_set:
+    source: "val_split_of_current_training"   # test 使用は fatal
+    n_samples_min: 500                         # 少なすぎると T 推定が不安定
+  optimizer:
+    name: "LBFGS"
+    max_iter: 50
+  acceptance:
+    ece_after_scaling_threshold: 0.03          # example
+    # accuracy 変化ではなく個別予測の変化を数える（argmax 保存の厳密チェック）
+    prediction_change_count_max: 0             # tie 以外の変化は 0 でなければ fatal
+    allow_tie_only_changes: true               # 完全同点の場合のみ変化許容
+    accuracy_change_max_delta: 0.0             # 補助チェック（0 が理想）
+  temperature_constraint:
+    positive_only: true                        # log 空間で持つことで自動保証
+  provenance:
+    log_temperature_value: true
+    log_calibration_set_hash: true
+  agent_authorization:
+    l1: "inference_with_scaled_model_only"
+    l2: "can_refit_temperature_on_new_val_set"
+    l3: "same_as_l2"
+  # temperature の学習後変更は L3 でも都度承認必須
+  refit_approval_required: true
+```
+
+---
+
+## 9.6 Deep Ensemble Skill — M モデルで不確かさを分解
+
+Deep Ensemble は「異なる seed / 初期化で M 個のモデルを独立に学習し、推論時に平均と分散を取る」手法です（Lakshminarayanan et al., 2017）。
+
+- **簡単**：学習コードそのまま × M
+- **強力**：多くのベンチマークで MC-Dropout / BNN を上回る calibration と OOD 検出性能
+- **並列化容易**：M 個の学習ジョブは独立
+
+### 実装骨格
+
+```python
+# deep_ensemble.py
+import torch
+from typing import Callable, List
+
+class DeepEnsemble:
+    def __init__(self, model_factory: Callable[[int], torch.nn.Module], m: int):
+        """
+        model_factory(seed) は seed から独立学習済みモデルを返す関数。
+        m は ensemble 数（推奨 5-10）。
+        """
+        self.models: List[torch.nn.Module] = []
+        for seed in range(m):
+            _set_seeds(seed)                            # 第5章 Layer 1: worker seed 実 seed を記録
+            self.models.append(model_factory(seed))
+
+    def predict_distribution(self, x: torch.Tensor) -> dict:
+        """
+        M モデルの softmax を集計。
+        戻り値:
+          mean_probs      : (batch, K)  M モデル平均
+          member_probs    : (M, batch, K) 各モデル出力
+          predictive_entropy: (batch,)   総不確かさ H[E[p]]
+          expected_entropy  : (batch,)   aleatoric 近似 E[H[p]]
+          mutual_information: (batch,)   epistemic 近似 H[E[p]] - E[H[p]]
+        """
+        member_probs = torch.stack([
+            m(x).softmax(-1) for m in self.models
+        ], dim=0)                                        # (M, batch, K)
+        mean_probs = member_probs.mean(dim=0)            # (batch, K)
+
+        # 総 predictive entropy
+        eps = 1e-12
+        predictive_entropy = -(mean_probs * (mean_probs + eps).log()).sum(-1)  # (batch,)
+        # aleatoric 近似（各モデルの entropy 平均）
+        member_entropy = -(member_probs * (member_probs + eps).log()).sum(-1)  # (M, batch)
+        expected_entropy = member_entropy.mean(0)                              # (batch,)
+        # epistemic 近似
+        mutual_information = predictive_entropy - expected_entropy             # (batch,)
+
+        return {
+            "mean_probs": mean_probs,
+            "member_probs": member_probs,
+            "predictive_entropy": predictive_entropy,
+            "expected_entropy": expected_entropy,
+            "mutual_information": mutual_information,
+        }
+```
+
+### Uncertainty 分解の解釈
+
+| 量 | 意味 | 高いとき |
+|---|---|---|
+| **`predictive_entropy`** ($H[\mathbb{E}[p]]$) | 総不確かさ | このサンプルは全体的に判別困難 |
+| **`expected_entropy`** ($\mathbb{E}[H[p]]$) | aleatoric（データノイズ）近似 | 個々のモデルがそれぞれ高 entropy で迷っている（データが本質的にあいまい）。**モデル間の意見の分かれは `mutual_information` で見る** |
+| **`mutual_information`** ($H[\mathbb{E}[p]] - \mathbb{E}[H[p]]$) | epistemic（モデル不確かさ）近似 | モデル間で意見が分かれている（学習データ不足の可能性） |
+
+> [!NOTE]
+> **この分解は近似**です。「aleatoric = ノイズ、epistemic = 知識不足」という厳密な因果分解にはなりません（Deep Ensemble の epistemic は "分散" 由来で、真の posterior 上の不確かさとは限らない）。実務上は「両者を並置して監視する」が現実的です。
+
+> [!IMPORTANT]
+> **`_set_seeds(seed)` の実装要件**：Python `random`・NumPy・PyTorch CPU/CUDA・DataLoader worker seed（第5章 Layer 1）を **すべて** 設定します。それでも Deep Ensemble メンバー間の**真の独立性は保証されず**、data order・augmentation RNG・pretrained 初期化・checkpoint 共有などで多様性が崩れる可能性があります。契約に以下を追加してください：
+>
+> ```yaml
+> ensemble_diversity:
+>   record_member_seed: true
+>   record_data_order_seed_per_member: true
+>   record_augmentation_seed_per_member: true
+>   require_distinct_initialization_hash: true      # 初期重み hash が全 M で異なる
+>   min_pairwise_disagreement_on_val: "task_specific"  # 相関崩壊の早期検出
+> ```
+
+### 正規化 entropy（Ch06 §7.3 の forward reference を回収）
+
+第7章 §7.3 で「`predictive_entropy_normalized > 0.3` で自律停止」と参照した数値の正体：
+
+$$
+\mathrm{predictive\_entropy\_normalized} = \frac{H[\mathbb{E}[p]]}{\log K}
+$$
+
+$K$ はクラス数。$\log K$ で割ることで **値域を [0, 1] に正規化**、クラス数が違うタスク間で閾値を比較できます。
+
+```python
+def predictive_entropy_normalized(mean_probs: torch.Tensor) -> torch.Tensor:
+    """mean_probs: (batch, K) -> (batch,) in [0, 1]"""
+    eps = 1e-12
+    K = mean_probs.shape[-1]
+    assert K > 1, "entropy normalization requires K > 1"
+    H = -(mean_probs * (mean_probs + eps).log()).sum(-1)
+    log_k = torch.log(torch.tensor(K, dtype=H.dtype, device=H.device))  # device 揃える
+    return H / log_k
+```
+
+---
+
+## 9.7 `val_ood_score` の実装候補 — 第7章の forward reference 回収
+
+第7章 §7.3 では `ood_stop_gate.monitor = "val_ood_score_placeholder"` として **forward reference** にしていました。この章で 4 つの実装候補を提示します。
+
+| 実装 | 計算コスト | 追加モデル | 特徴 |
+|---|---|---|---|
+| **A. Max-softmax uncertainty** | 極低 | なし | `1 - max(softmax)`。値域 [0, 1-1/K]、方向は「大きいほど危険」。overconfidence の影響を受けるが baseline として便利 |
+| **B. Predictive entropy (normalized)** | 極低 | なし | Deep Ensemble または単一モデルで計算可 |
+| **C. Deep Ensemble mutual information** | 中 | Deep Ensemble | epistemic の近似指標。OOD で高くなる |
+| **D. Mahalanobis on penultimate** | 中 | calibration set | 第8章 §8.5 の domain_gap と同じ手法（**役割は違う**、§9.10 で整理） |
+
+### 推奨：Deep Ensemble 前提なら B + C の併用
+
+```yaml
+# val_ood_score_implementation.yaml
+val_ood_score:
+  primary_metric: "predictive_entropy_normalized"    # §9.6 の実装
+  secondary_metric: "mutual_information"             # epistemic 監視
+  thresholds:                                        # example; calibration set から derive
+    warn: 0.3                                        # 上位 20% あたりを想定
+    stop: 0.5                                        # 上位 5% あたりを想定
+  aggregation_over_batch: "max"                      # バッチ内の worst-case を採用
+  calibration_set:
+    source: "val_split_of_current_training"
+    reference_sha256: "..."
+```
+
+**単一モデル運用（Deep Ensemble 未使用）の場合**は A + B のみで代替できます。ただし epistemic の情報は失われるため、`domain_gap_gate`（第8章 §8.5）との併用が必須です。
+
+---
+
+## 9.8 `uncertainty_stop_gate` 契約 — Agentic 自律停止の設計
+
+推論時に不確かさが閾値を超えたらエージェントは **自律決定を停止し Human に投げる**。この振る舞いを契約化します。
+
+```yaml
+# uncertainty_stop_gate.yaml
+uncertainty_stop_gate:
+  enabled: true
+  # 監視する指標（複数可、いずれかが閾値超過で発動）
+  monitors:
+    - metric: "predictive_entropy_normalized"
+      threshold_warn: 0.3
+      threshold_stop: 0.5
+    - metric: "mutual_information"                   # epistemic
+      threshold_warn: 0.15
+      threshold_stop: 0.30
+    - metric: "max_softmax_uncertainty"              # = 1 - max_softmax_probability
+      direction: "higher_is_riskier"                  # 明示的な方向（実装バグ防止）
+      threshold_warn: 0.35                            # つまり max_softmax_probability < 0.65 で warn
+      threshold_stop: 0.55                            # つまり max_softmax_probability < 0.45 で stop
+  # calibration の前提
+  requires_calibration_check_first: true             # ECE < ece_threshold でないと gate 無効
+  requires_temperature_scaling_if_ece_high: true
+
+  # 動作
+  action_on_warn: "flag_and_continue_with_annotation"
+  action_on_stop: "route_to_human_with_full_provenance"
+  # stop 発動時に Human に渡す情報
+  human_handoff_payload:
+    - "sample_id"
+    - "triggered_metric_names"                       # どの monitor が発動したか
+    - "thresholds_used"                              # 発動時の閾値
+    - "predicted_class_with_confidence"
+    - "top_k_classes_with_probabilities"             # k=3 程度
     - "predictive_entropy_normalized"
     - "mutual_information"
     - "max_softmax_uncertainty"
+    - "ensemble_member_predictions"
+    - "domain_gap_score"                             # §8.5 と併記
+    - "recent_calibration_ece"
+    - "temperature_value"                            # §9.5 の T
+    - "model_version"
+    - "calibration_set_hash"
+    - "raw_input_or_sanitized_view_uri"              # Human が実サンプルを確認できるように
+    - "recommended_next_action"                      # 推奨アクション（Human は上書き可）
+    - "allowed_human_actions"                        # Human が選べる action リスト
+    - "provenance_uri"
 
-known_limitations:
-  epistemic_expressiveness: "weak_compared_to_deep_ensemble"
-  dropout_mask_diversity: "may_correlate_when_T_small"
-  documented_as: "epistemic_uncertainty_proxy_not_true_bayesian"
+  # エージェント権限
+  agent_authorization:
+    l1: "can_only_observe_gate_output"
+    l2: "can_execute_action_on_warn_but_not_disable"
+    l3: "same_as_l2"
+    disable_gate_all_levels: forbidden               # 全レベル無効化禁止
+    threshold_change_by_agent: forbidden             # 全レベル閾値変更禁止
 
-provenance:
-  record_T: true
-  record_dropout_rate_per_layer: true
-  record_seed: true
-  record_which_layers_were_train_mode: true        # BatchNorm 等が train になっていないことを証跡化
+  # 監査
+  audit:
+    log_every_gate_evaluation: true
+    weekly_summary_to_human: true
+    consecutive_stop_warning: 5                       # 5 回連続 stop で weekly より早く警告
+```
+
+### エージェント判断シーケンス
+
+```mermaid
+sequenceDiagram
+    participant S as Sample
+    participant M as Model / Ensemble
+    participant G as uncertainty_stop_gate
+    participant A as Agent (L2)
+    participant H as Human
+
+    S->>M: predict(x)
+    M-->>G: (mean_probs, member_probs, entropy, MI, max_softmax_unc)
+    G->>G: 各 monitor を評価<br/>(entropy / MI / max_softmax_uncertainty)
+    alt すべての monitor が warn 未満
+        G-->>A: continue (自律決定 OK)
+    else いずれかが warn <= x < stop
+        G-->>A: flag_and_continue
+        A->>H: 週次サマリーに flag 記録
+    else いずれかが stop 以上
+        G-->>A: route_to_human
+        A->>H: full_provenance を添えて送信
+        H-->>A: 判定 / 再学習指示
+    end
 ```
 
 > [!IMPORTANT]
-> **`record_which_layers_were_train_mode` は必須**です。過去に「BatchNorm も train モードのままで MC-Dropout」を回した結果、running statistics が汚染された事故が多数報告されています。契約でログを義務化してください。
+> **`uncertainty_stop_gate` は Skill を跨いで共通化**します。1D CNN Skill（第7章）でも、転移学習 Skill（第8章）でも、Foundation Model Skill（第12章）でも、この契約フォーマットを再利用します。閾値は Skill ごとに calibrate しますが、フィールドスキーマは統一します。
 
 ---
 
-## 9.5 MC-Dropout の失敗パターンと対策
+## 9.9 単一モデル vs Deep Ensemble vs 事後 calibration — 判断表
 
-| 失敗 | 症状 | 対策 |
+| 状況 | 推奨 | 理由 |
 |---|---|---|
-| **dropout 層がないモデルに適用** | `_assert_mc_dropout_prerequisites` で即 fatal | `requires.model_must_contain_dropout_layers` fatal assert（YAML + code 両方） |
-| **BatchNorm も train モード** | running mean/var が汚染、次回 eval で予測が壊れる | `_enable_dropout_only` で dropout 層のみ選択 + `try/finally` で状態復元 |
-| **推論後にモデルが train mode に残る** | 続く normal 推論で dropout が有効化されたまま | `_restore_module_modes` を必ず finally で呼ぶ |
-| **dropout rate が全層 0** | dropout mask のばらつきなし → **`mutual_information ≈ 0`**（予測 entropy 自体は非ゼロたりうる） | fatal assert + provenance に per-layer rate 記録 |
-| **T が小さい（<10）** | 分散推定が不安定 | `T.min: 10`、agent は L2 でも下限を下げられない、code で fatal assert |
-| **T が過大（>100）** | GPU 時間浪費、性能向上飽和 | `T.max: 100`、L3 でも事前承認 |
-| **MC-Dropout の epistemic を "真の epistemic" と主張** | Human が過信 | Skill ドキュメントと provenance に "proxy" と明記 |
-| **`torch.manual_seed()` が global RNG を汚染** | 後続の学習/推論で乱数系列が想定外に | `torch.random.fork_rng()` で subprocess 的に隔離 |
-| **推論のたびに seed 記録なし** | Human と agent で異なる結果 | seed 記録を契約で必須化 |
+| **正解率が最優先、不確かさは補助** | 単一モデル + temperature scaling | 計算コスト最小、calibration は改善可 |
+| **Human-in-the-loop で自律停止が必要** | **Deep Ensemble (M=5)** | epistemic 分解が可能、OOD 検出も強い |
+| **少データで epistemic を強く出したい** | Deep Ensemble (M=5-10) or MC-Dropout（第10章） | M を増やすほど安定 |
+| **GPU / 時間が極めて制約** | 単一モデル + temperature scaling + max-softmax gate | Deep Ensemble は諦める、代わりに `domain_gap_gate`（第8章）を厳しめに |
+| **PyMC 階層に接続したい** | Deep Ensemble の平均予測を層別 feature に（第14章）| 深層特徴の不確かさは第14章 capstone で |
+
+### エージェントに任せてよい判断
+
+| 判断場面 | L1 | L2 | L3 | 説明 |
+|---|:---:|:---:|:---:|---|
+| Deep Ensemble メンバー数 M の変更 | ❌ | ❌ | ⚠️ | L3 でも事前承認が必要（provenance 全体が変わる） |
+| `predictive_entropy_normalized` の閾値変更 | ❌ | ❌ | ❌ | 全レベル禁止 |
+| temperature 値の再学習（新 val set で） | ❌ | ✅ | ✅ | L2 は `refit_approval_required: true` の下で可 |
+| Gate 発動時の Human 送り | ❌ | ✅ | ✅ | 決定的動作、L2 で可 |
+| Gate 無効化 | ❌ | ❌ | ❌ | 全レベル禁止 |
 
 ---
 
-## 9.6 BNN 3 系統の位置づけ
+## 9.10 `domain_gap_gate`（第8章）と `uncertainty_stop_gate`（本章）の役割分担
 
-**BNN (Bayesian Neural Network)** は重み $w$ 自体を分布として扱います。学習は事後分布 $p(w | \mathcal{D})$ の推論。実装アプローチは 3 系統：
+両者は **どちらも「怪しいサンプルで止まる」** ですが、**測っている対象と発動タイミングが違います**。
 
-| 系統 | 代表手法 | ライブラリ | 学習コスト | posterior 表現力 | 実務適用性 |
-|---|---|---|---|---|---|
-| **Variational Inference (VI)** | Bayes by Backprop, MFVI | Pyro, TyXe, blitz-bayesian-pytorch | 中（backward パス 2 倍程度） | 中（factorized Gaussian 前提） | ○ |
-| **Laplace / SWAG** | Laplace 近似、SWAG | laplace-torch | 低（学習後の追加処理のみ） | 弱〜中 | ◎ |
-| **SG-MCMC** | SGLD, SGHMC, cSGLD | 実装は自作か Pyro | 高（多数のサンプル保管） | 強（真の posterior 近傍） | △ |
+| 観点 | `domain_gap_gate` (§8.5) | `uncertainty_stop_gate` (§9.8) |
+|---|---|---|
+| **測るもの** | feature-level：penultimate 出力が事前学習分布からどれくらい離れているか | output-level：softmax 出力の不確かさ（entropy / MI / max-softmax） |
+| **発動タイミング** | 学習前・推論時（両方） | 推論時のみ |
+| **計算方法** | Mahalanobis / cosine / FID-like | predictive entropy / mutual information / max-softmax |
+| **必要なもの** | Human curated calibration set + shrinkage covariance | 学習済みモデル + calibration set |
+| **fine-tune を止められるか** | ✅ block_finetune 可能 | ❌ 学習停止には使わない |
+| **Deep Ensemble が必要か** | 不要（単一モデルの penultimate で計算） | epistemic 分解には Ensemble 必須 |
+| **典型的な発動理由** | 「そもそも事前学習モデルに認識できない領域」 | 「認識できるが確信が持てない」 |
 
-> [!TIP]
-> **本章では Bayes by Backprop（VI 系）の最小実装**を示します。理由：(1) 学習コストが Deep Ensemble に近い / (2) 実装が理解しやすい / (3) posterior が明示的で Human 説明に使える。**Laplace 近似は付録**、SG-MCMC は本書の範囲外とします。
-
-### vol-02 PyMC/NumPyro との使い分け
-
-| 状況 | 推奨 |
-|---|---|
-| モデルが小さく（数百〜数千パラメータ）、完全な posterior が欲しい | **vol-02 第10-12章 PyMC / NumPyro** |
-| モデルが深層（数百万〜） | **本章 BNN**（VI 近似） |
-| 深層特徴を抽出して階層構造の推論 | **第13章**（深層 → PyMC 階層モデル） |
-
----
-
-## 9.7 Bayes by Backprop の最小実装
-
-各重み $w_i$ を Gaussian $\mathcal{N}(\mu_i, \sigma_i^2)$ で表現し、$\mu_i, \sigma_i$ を学習します。
-
-### 数式
-
-Variational posterior $q_\theta(w) = \prod_i \mathcal{N}(w_i | \mu_i, \sigma_i^2)$、prior $p(w) = \prod_i \mathcal{N}(w_i | 0, \sigma_p^2)$ に対して ELBO を最大化：
-
-$$
-\mathcal{L}(\theta) = \mathbb{E}_{q_\theta(w)}[\log p(\mathcal{D} | w)] - \mathrm{KL}[q_\theta(w) \| p(w)]
-$$
-
-第 1 項は再パラメータ化トリック $w = \mu + \sigma \odot \epsilon, \epsilon \sim \mathcal{N}(0, I)$ で backprop 可能に。
-
-### 実装（最小構成）
-
-```python
-# bayes_by_backprop.py
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-class BayesianLinear(nn.Module):
-    """重み平均 mu, 対数分散 rho（softplus で sigma）を学習可能に持つ Linear。"""
-    def __init__(self, in_features: int, out_features: int, prior_sigma: float = 1.0):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.prior_sigma = prior_sigma
-
-        # 平均・対数分散パラメータ（バイアス略）
-        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features).normal_(0, 0.1))
-        self.weight_rho = nn.Parameter(torch.full((out_features, in_features), -5.0))
-        self.bias_mu = nn.Parameter(torch.zeros(out_features))
-        self.bias_rho = nn.Parameter(torch.full((out_features,), -5.0))
-
-    def _sigma(self, rho: torch.Tensor) -> torch.Tensor:
-        return F.softplus(rho)          # 常に正
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_sigma = self._sigma(self.weight_rho)
-        b_sigma = self._sigma(self.bias_rho)
-        # 再パラメータ化
-        w = self.weight_mu + w_sigma * torch.randn_like(w_sigma)
-        b = self.bias_mu + b_sigma * torch.randn_like(b_sigma)
-        return F.linear(x, w, b)
-
-    def kl_to_prior(self) -> torch.Tensor:
-        """factorized Gaussian の KL divergence（prior は等方 Gaussian）。"""
-        w_sigma = self._sigma(self.weight_rho)
-        b_sigma = self._sigma(self.bias_rho)
-        p_sigma = self.prior_sigma
-
-        def _kl(mu, sigma):
-            return (
-                torch.log(torch.tensor(p_sigma, device=mu.device) / sigma)
-                + (sigma.pow(2) + mu.pow(2)) / (2 * p_sigma ** 2)
-                - 0.5
-            ).sum()
-
-        return _kl(self.weight_mu, w_sigma) + _kl(self.bias_mu, b_sigma)
-
-
-def elbo_loss(
-    mean_log_likelihood_per_sample: torch.Tensor,
-    kl: torch.Tensor,
-    n_data: int,
-    kl_weight: float = 1.0,
-) -> torch.Tensor:
-    """
-    負の ELBO を最小化する形式で返す。
-
-    重要：`mean_log_likelihood_per_sample` は **サンプル 1 個あたりの log-likelihood の平均**
-    （たとえば `F.log_softmax(logits, -1).gather(...).mean()`）。
-    「mini-batch 上の合計」を渡すと likelihood 項が batch size でスケールし、
-    KL は `n_data` で割られるため、ELBO のバランスが崩壊する。
-
-    合計形式で渡したい場合はこう：
-        loss = -(n_data / batch_size) * batch_log_likelihood_sum + kl_weight * kl
-    """
-    return -mean_log_likelihood_per_sample + kl_weight * kl / n_data
-```
-
-### 推論時のサンプリング
-
-```python
-@torch.no_grad()
-def bnn_predict(model: nn.Module, x: torch.Tensor, S: int = 30) -> dict:
-    """
-    S 回 posterior サンプリングして予測分布を得る。
-    出力形式は MC-Dropout と同一（uncertainty_stop_gate 互換）。
-
-    重要：確率性は **`BayesianLinear` の再パラメータ化のみ** に限定する。
-    BatchNorm や Dropout が混在する場合、eval モードにしてそれらの寄与を止めないと、
-    MI が「重み posterior 由来」なのか「他の確率層由来」なのか解釈不能になる。
-    """
-    prev_states = {name: m.training for name, m in model.named_modules()}
-    model.eval()                                     # BN 統計凍結、Dropout 停止
-    try:
-        sample_probs = []
-        for _ in range(S):
-            logits = model(x)                        # BayesianLinear 内部で自動的に w をサンプル
-            sample_probs.append(logits.softmax(-1))
-        sample_probs = torch.stack(sample_probs, dim=0)  # (S, batch, K)
-    finally:
-        for name, m in model.named_modules():
-            if name in prev_states:
-                m.train(prev_states[name])
-
-    mean_probs = sample_probs.mean(0)
-    K = mean_probs.shape[-1]
-    eps = 1e-12
-    predictive_entropy = -(mean_probs * (mean_probs + eps).log()).sum(-1)
-    member_entropy = -(sample_probs * (sample_probs + eps).log()).sum(-1)
-    expected_entropy = member_entropy.mean(0)
-    mutual_information = predictive_entropy - expected_entropy
-    log_k = torch.log(torch.tensor(K, dtype=predictive_entropy.dtype, device=predictive_entropy.device))
-    return {
-        "mean_probs": mean_probs,
-        "predictive_entropy_normalized": predictive_entropy / log_k,
-        "mutual_information": mutual_information,
-        "expected_entropy": expected_entropy,
-        "max_softmax_uncertainty": 1.0 - mean_probs.max(-1).values,
-    }
-```
-
----
-
-## 9.8 BNN Skill の契約と承認ゲート
+### 両者を並置する契約
 
 ```yaml
-# bnn_uncertainty.yaml
-skill: "bnn_uncertainty"
-version: "1.0.0"
-approach: "bayes_by_backprop"                       # 明示（Laplace / SG-MCMC と区別）
-
-requires:
-  posterior_family: "mean_field_gaussian"           # 明示
-  prior:
-    family: "isotropic_gaussian"
-    sigma: 1.0
-    documented_assumption: true                     # 事前分布の恣意性を明記
-  reparameterization_trick: true
-
-training:
-  kl_weight_schedule: "linear_warmup_then_constant"
-  kl_weight_final: 1.0
-  n_epochs_min: 50
-  monitor:
-    - "elbo"
-    - "log_likelihood_component"
-    - "kl_component"
-    - "mean_predictive_entropy_val"                 # 収束モニタ
-
-acceptance:
-  elbo_stable_last_10_epochs: true
-  kl_not_collapsing_to_zero: true                   # posterior が prior に張り付く「prior 型 collapse」検知
-  kl_not_exploding: true                            # σ→0 の「決定論型 collapse」で KL が爆発するのを検知
-  posterior_std_range:
-    min: 1e-4
-    max: 5.0
-  reject_if_all_sigma_approach_zero: true           # 決定論的 NN に退化していないか
-  reject_if_predictions_are_sample_invariant: true  # posterior sample S 個の予測が同一 → 実質決定論
-
-agent_authorization:
-  L1: "inference_only_with_frozen_posterior"
-  L2:
-    can_finetune: false                             # BNN の fine-tune は L2 では不可
-    can_change_prior: false
-    can_change_posterior_family: false
-  L3:
-    can_finetune: "with_prior_approval"
-    can_change_prior: "with_prior_approval"
-    can_change_posterior_family: "forbidden_all_levels"  # VI → SG-MCMC 切替は Human のみ
-
-provenance:
-  bayesian_inference_config:                        # 第4章スキーマの BNN 拡張ブロック
-                                                    # （Ch07 Layer 4 と同様の追加パターン）
-    posterior_family: "mean_field_gaussian"
-    prior_family: "isotropic_gaussian"
-    prior_sigma: 1.0
-    kl_weight_final: 1.0
-    n_samples_S_at_inference: 30
-    elbo_final: "value"
-    posterior_std_summary:
-      min: "value"
-      p50: "value"
-      max: "value"
-    monte_carlo_seed: "value"
-```
-
-> [!WARNING]
-> **BNN の "確率" は "prior + variational family の関数" です**。prior を変えれば数字が変わります。**Human に見せるときは prior の設定を必ず併記**し、"事前分布を変えれば予測分布も変わる" ことを説明してください。エージェントが prior を勝手に変えることは全レベルで禁止。
-
----
-
-## 9.9 Conformal Prediction の位置づけ（比較表準備）
-
-**Conformal Prediction (CP)** は「モデルに依存しない予測区間の保証」を与える枠組みです。詳細は本書の範囲外ですが、比較表に載せるため要点だけ：
-
-- **分布仮定不要**（任意のモデルに valid）
-- **exchangeability 前提**（i.i.d. と近い仮定）
-- **保証は marginal**（サンプルごとではなくカバレッジ率）
-- **予測集合（分類）または予測区間（回帰）**を出力
-
-### 分類での使用イメージ
-
-```
-入力 x
-  → base classifier で class probability を得る
-  → calibration set の nonconformity score から threshold を決める
-  → 予測集合 C(x) = { y : score(x, y) <= threshold } を返す
-  → P(y_true ∈ C(x)) >= 1 - α を保証（α = 0.1 → 90% 保証）
+# combined_ood_and_uncertainty.yaml
+# 第8章 domain_gap_gate は pass / review / stop の tri-state を返す
+sample_admission_policy:
+  step_1_domain_gap:                  # 第8章 §8.5
+    reference: "domain_gap_gate.yaml"
+    on_pass: "run_step_2"
+    on_review: "route_to_human_with_optional_uncertainty_context"
+                                      # step 2 を実行するが結果は Human 参考用
+                                      # step 1 の review 判定を step 2 で覆すことは禁止
+    on_stop: "block_inference"        # ここで止まったら uncertainty 測る意味がない
+  step_2_uncertainty:                 # 本章 §9.8
+    reference: "uncertainty_stop_gate.yaml"
+    run_when_step_1: ["pass", "review_for_context_only"]
+    cannot_override_step_1_review_or_stop: true
+    on_stop: "route_to_human"
 ```
 
 > [!TIP]
-> **CP は他手法と直交**します。Deep Ensemble / MC-Dropout / BNN の出力に対して conformal を後付けできます。**「不確かさ推定 = 内在的手法（Ensemble/MC-Dropout/BNN）」と「予測区間の保証 = CP」は別問題**として設計してください。
-
-### CP の落とし穴
-
-- **exchangeability 崩壊で保証消失**（分布シフト時に無効化）→ 第7章 `domain_gap_gate` を通過したサンプルにのみ CP を適用する運用が現実的
-- **`domain_gap_gate` は exchangeability 集合を変える**：CP を gate 通過後に運用するなら、**calibration set も同じ gate を通したサンプルで再校正**すること。得られる保証は "gate を通ったサンプル母集団の operational coverage" であり、gate 前の元母集団の保証ではないと Human 資料に明記する
-- **予測集合が大きすぎて実用性なし**（class 数が多い場合）→ adaptive CP / class-conditional CP を検討
-- **calibration set の汚染**（第5章 anti-leakage 違反）→ 契約で必ず分離
+> **段階チェックの順序を逆にしない**。「先に uncertainty 見て、それが低ければ通す」だと、domain gap が大きく本来は認識できていないサンプルを、たまたま overconfident に「認識できた」と判定して通してしまう可能性があります。**必ず「feature-level 分布内か」→「output-level 確信度は十分か」の順**。
 
 ---
 
-## 9.10 4 手法使い分け表
+## 9.11 失敗パターンと改善版
 
-エージェントが不確かさ推定手法を選ぶときの判断表。
-
-| 観点 | Deep Ensemble | MC-Dropout | BNN (Bayes by Backprop) | Conformal Prediction |
-|---|---|---|---|---|
-| **学習コスト** | × M（例: × 5） | × 1 | × 1.5〜2（VI overhead） | × 1（後付け） |
-| **推論コスト** | × M | × T（例: × 30） | × S（例: × 30） | × 1 + 校正 |
-| **GPU メモリ** | × M | × 1 | × 2〜（μ, σ 保持） | × 1 |
-| **モデルの前提** | 制約なし | dropout 層必須 | Bayesian 層への置換必須 | 制約なし |
-| **epistemic 表現力** | 強（複数 mode） | 弱〜中（1 mode 周辺） | 中（factorized Gaussian） | N/A（保証は別軸） |
-| **aleatoric 分解** | 可（第8章） | 可 | 可 | ✕（予測集合のみ） |
-| **予測区間の保証** | ✕（校正で近似） | ✕ | ✕（prior 依存） | **○（marginal coverage）** |
-| **Human 解釈** | 中（M モデルの多様性） | 低（proxy） | 高（重み分布 μ, σ を提示） | 高（予測集合の大きさ） |
-| **`uncertainty_stop_gate` との相性** | ◎ | ○ | ○ | 予測集合サイズを別 monitor に |
-| **分布シフト時の頑健性** | 中（epistemic 上昇で検知） | 弱 | 中 | ✕（保証消失） |
-| **実装難度** | 中 | 極低 | 高 | 中 |
-| **監査ログ量** | 大（M × provenance） | 中 | 中〜大（posterior sample） | 中 |
-| **契約破損時の危険度** | 中（M メンバー間 correlation） | 高（BN 汚染など） | 高（posterior collapse） | 中（exchangeability） |
-
-### エージェントの提案ロジック（YAML）
-
-```yaml
-# uncertainty_method_selection.yaml
-skill: "uncertainty_method_selection_table"
-version: "1.0.0"
-
-inputs:
-  - gpu_budget_multiplier_available: "float, e.g. 1.0, 3.0, 5.0"
-  - human_interpretability_priority: "low|medium|high"
-  - regulatory_coverage_guarantee_required: "bool"
-  - existing_model_has_dropout: "bool"
-  - can_replace_layers_with_bayesian: "bool"
-  - distribution_shift_expected: "bool"
-
-decision_rules:
-  - if:
-      regulatory_coverage_guarantee_required: true
-      distribution_shift_expected: true
-    then:
-      primary: "route_to_human_no_valid_automatic_method"
-      reason: "shift 下で CP の marginal coverage 保証は消失、他手法も保証を提供しない。Human が再校正/停止を決定"
-
-  - if:
-      regulatory_coverage_guarantee_required: true
-      distribution_shift_expected: false
-    then:
-      primary: "conformal_prediction"
-      secondary: "deep_ensemble_or_mc_dropout_for_internal_uncertainty"
-      caveat: "calibration set と本番の exchangeability を運用で担保"
-
-  - if:
-      gpu_budget_multiplier_available: ">= 3.0"
-      distribution_shift_expected: true
-    then:
-      primary: "deep_ensemble"
-      reason: "epistemic を強く推定できる、shift 検知に有利"
-
-  - if:
-      gpu_budget_multiplier_available: "< 3.0"
-      existing_model_has_dropout: true
-    then:
-      primary: "mc_dropout"
-      caveat: "epistemic は proxy であること Human に明示"
-
-  - if:
-      human_interpretability_priority: "high"
-      can_replace_layers_with_bayesian: true
-    then:
-      primary: "bnn_bayes_by_backprop"
-      caveat: "prior 設定を Human 説明資料に必ず含める"
-
-  - fallback:
-      when: "existing_model_has_dropout: true"
-      primary: "mc_dropout"
-      reason: "実装コスト最小の baseline"
-  - fallback_final:
-      when: "no other rule matched"
-      primary: "single_model_max_softmax_uncertainty_with_domain_gap_gate"
-      reason: "MC-Dropout 不可・BNN 化不可の場合の最小構成。第7章 domain_gap_gate と第8章 max_softmax_uncertainty のみで運用し、Human 監視頻度を上げる"
-
-agent_authorization:
-  L1: "propose_method_only, no_execution"
-  L2: "execute_within_proposed_set"
-  L3: "execute_and_override_with_prior_approval"
-
-output_provenance:
-  record_all_inputs: true
-  record_decision_rule_matched: true
-  record_alternatives_considered: true
-  record_human_review_ref_if_L3_override: true
-```
-
----
-
-## 9.11 vol-02 PyMC/NumPyro との接続点
-
-vol-02 では階層モデルの完全な posterior を得るために PyMC / NumPyro を使いました。深層 × BNN との接続は**「深層特徴 → 階層モデル」**という段構成が実務的です（第13章 capstone で詳細）。
-
-```mermaid
-flowchart LR
-    A["ARIM 画像/スペクトル"] --> B["深層モデル<br/>+ MC-Dropout or BNN"]
-    B --> C["深層特徴 z<br/>+ epistemic uncertainty u"]
-    C --> D["PyMC 階層モデル<br/>vol-02 第10-12章"]
-    D --> E["装置間 / ロット間 / 研究室間<br/>階層効果の完全 posterior"]
-    E --> F["Agentic 判断<br/>+ Human 承認"]
-```
-
-### 接続時の注意
-
-| 論点 | 対処 |
-|---|---|
-| 深層側の epistemic が階層側で aleatoric として扱われる | 深層 uncertainty を階層モデルの観測分散に組み込む（第13章） |
-| BNN prior と PyMC prior の二重設定 | 深層側は "特徴抽出"、階層側は "階層効果" と役割を分ける |
-| 深層 fine-tune のたびに階層モデル再校正 | `training_config.yaml` に依存関係を宣言、agent は L2 でもトリガ不可 |
-
----
-
-## 9.12 失敗パターンと対策
-
-| 失敗 | 症状 / 兆候 | 対策 |
+| 失敗 | 原因 | 改善版 |
 |---|---|---|
-| MC-Dropout で BatchNorm も train モード | eval 時の予測が非決定的に壊れる | `_enable_dropout_only` で dropout 層のみ切替、per-layer state を provenance に記録 |
-| BNN の **決定論型 posterior collapse** | 全 σ が 0 に近づき決定論的 NN と同じ挙動、posterior sample S 個の予測が同一 | `reject_if_all_sigma_approach_zero` + `reject_if_predictions_are_sample_invariant`、KL weight schedule 見直し |
-| BNN の **prior 型 posterior collapse** | KL が 0 に近づき q(w) ≈ p(w)、posterior が学習に失敗 | `kl_not_collapsing_to_zero` acceptance、prior sigma と KL warmup を再設計 |
-| BNN の **prior 支配**（prior domination） | prior sigma を変えると予測分布が大きく変わる | Human 説明資料に prior 設定を必須記載、prior 変更は L3 でも要承認 |
-| Conformal set が全 class を含む | 予測集合の実用性ゼロ | α, calibration set size, model quality を再検討 |
-| Conformal の exchangeability 崩壊 | shift 下で coverage が保証値を下回る | `domain_gap_gate` 通過後のみ CP を有効化 |
-| MC-Dropout の T が過小で分散不安定 | 再実行で結果がぶれる | `T.min` 契約強制、seed 記録 |
-| BNN の重みサンプル S を Human と agent で変える | 数字が合わない | S を Skill レベルで固定、変更は L3 承認必須 |
-| 4 手法を **混ぜて "総合スコア"** を作る | 意味論が壊れ、監査で説明不能 | 各手法の出力は**別 monitor** として `uncertainty_stop_gate` に流す、混ぜない |
-| 手法選択の記録なし | なぜその手法を選んだか監査で説明できない | `uncertainty_method_selection` の decision provenance を必ず保存 |
-| Deep Ensemble を装って MC-Dropout で運用 | Human 資料に "ensemble" と書きつつ実装は MC-Dropout | Skill 名を厳密に区別、レポートに手法名を fatal assert で刻印 |
+| confidence 0.9 のサンプルが 30% 誤答 | 生 softmax を鵜呑み | §9.4 ECE 測定 → §9.5 temperature scaling |
+| ECE 0.02 なのに OOD で誤動作 | in-distribution calibration だけ見た | `domain_gap_gate` と併用（§9.10） |
+| Deep Ensemble を M=2 で運用 | コスト削減 | M ≥ 5 推奨、`consecutive_stop_warning` で監視 |
+| ensemble の全モデルが同じ seed でスタート | model_factory 実装バグ | `_set_seeds(seed)` を必須化、provenance に M 個の seed を記録 |
+| `predictive_entropy_normalized` を対数 K で割り忘れ | 実装ミス | クラス数が違う Skill 間で閾値が比較不能に。単体テストを書く |
+| temperature scaling で accuracy が変わった | argmax が保持されない実装 | temperature は logits を割るだけ。他の変更を混ぜない |
+| Gate 発動が多すぎて Human 疲弊 | 閾値が厳しすぎ or 学習不足 | まず ECE を下げる → 閾値再校正 → データ追加 |
+| Gate を「一時的に無効化」した後戻し忘れ | manual override | 契約で `disable_gate_all_levels: forbidden`、監査ログ必須 |
+| calibration set と test set が重複 | anti-leakage 違反 | 第6章 `deep_split_contract` で分離を fatal assert |
+| epistemic uncertainty が単一 checkpoint で推定できないのに主張 | Deep Ensemble/MC-Dropout なしで epistemic を語る | 単一モデルなら `max_softmax` + `domain_gap_gate` のみに絞る |
+| **Ensemble メンバーが seed 違いでも相関している** | data order・augmentation seed・初期化 hash が共有 | `ensemble_diversity` 契約に `require_distinct_initialization_hash: true` と `min_pairwise_disagreement_on_val`、`record_data_order_seed_per_member` を追加 |
+| **ECE / 閾値が seed 間で不安定** | calibration set が小さい / 特定 seed の偶然 | 複数 seed で calibration set を切り、ECE の平均・分散を報告。閾値は 95% CI で保守的に決める |
+| **閾値が時間と共に drift する（装置変化・分布シフト）** | 一度校正した閾値を放置 | 月次で ECE / 閾値を再校正するタスクを設ける、`weekly_summary_to_human` に監視項目を追加 |
+| **クラス不均衡下で ECE bin が空になる** | bin 数固定 15 で少数クラス消失 | 適応 bin（等頻度）に切替、または `n_bins` を減らす。bin ごとのサンプル数もレポート |
+| **temperature scaling を汚染された calibration set で学習** | val に test の一部が混入した | Ch05 anti-leakage assert に加えて calibration_set_hash を provenance に記録し、再現時に照合 |
+| **Deep Ensemble 推論時に model.eval() 忘れ** | dropout が active のまま推論 | 推論エントリで全メンバーを `eval()` に強制。`assert not m.training for m in ensemble.models` |
 
 ---
 
-## 9.13 まとめ
+## 9.12 この章のチェックリスト
 
-- MC-Dropout は「dropout 層を推論時 on にする」だけの安価な epistemic uncertainty proxy。ただし理論的裏付けには仮定が多く、**真のベイズではない**
-- BNN（Bayes by Backprop）は重み分布を学習する近似ベイズ。VI / Laplace / SG-MCMC の 3 系統があり、本書は VI 系（Bayes by Backprop）を最小実装
-- Conformal Prediction は分布仮定に頼らない予測区間の保証。**他手法と直交**し、後付けで組み合わせられる
-- 4 手法を比較する使い分け表を Skill として実装し、エージェントは L1〜L3 権限に応じて提案・実行
-- vol-02 PyMC/NumPyro との接続は「深層特徴 → 階層モデル」の段構成が実務的（第13章 capstone で完成）
+- [ ] 学習済みモデルに対して val set で ECE / Brier を計算している
+- [ ] ECE > 0.05（または task-specific 閾値）なら temperature scaling を適用している
+- [ ] Temperature 適用後、accuracy が変わっていないことを確認している
+- [ ] Deep Ensemble を採用する場合、M ≥ 5 で seed を別々にしている
+- [ ] 各 ensemble メンバーの seed を provenance に記録している
+- [ ] `predictive_entropy` / `expected_entropy` / `mutual_information` を分けて計算している
+- [ ] `predictive_entropy_normalized = H / log K` で正規化している
+- [ ] 第7章 §7.3 の `val_ood_score` を §9.7 の実装候補で具体化している
+- [ ] `uncertainty_stop_gate` を Skill 契約に組み込んでいる
+- [ ] `uncertainty_stop_gate` の閾値変更を全レベル禁止している
+- [ ] `disable_gate_all_levels: forbidden` を設定している
+- [ ] Gate 発動時の `human_handoff_payload` を明示している
+- [ ] `domain_gap_gate` と `uncertainty_stop_gate` の**両者を並置**し、順序を「feature-level → output-level」にしている
+- [ ] calibration set と test set が重複していない（第6章 anti-leakage 契約で fatal assert）
+- [ ] Deep Ensemble を持たない単一モデル運用では、epistemic を主張していない
 
-## 9.14 章末チェックリスト
+---
 
-- [ ] MC-Dropout Skill の `_enable_dropout_only` は BatchNorm を train にしないことを確認したか
-- [ ] MC-Dropout の T は契約範囲内か（min ≤ T ≤ max）
-- [ ] `record_which_layers_were_train_mode` が provenance に記録されているか
-- [ ] BNN の posterior collapse チェック（σ が 0 に近づいていないか）
-- [ ] BNN の prior 設定を Human 説明資料に明記したか
-- [ ] Conformal Prediction を使う場合、`domain_gap_gate` 通過後に限定されているか
-- [ ] 4 手法選択の decision rule が provenance に記録されているか
-- [ ] エージェント権限（L1-L3）と `agent_authorization` YAML が一致しているか
-- [ ] 手法出力はすべて第8章 `uncertainty_stop_gate` 互換の schema か（`mean_probs`, `predictive_entropy_normalized`, `mutual_information`）。**ただし Conformal Prediction のみ例外**で、`prediction_set_size` / `interval_width` / `coverage_alpha` を別 monitor として gate に追加すること
-- [ ] 手法を混ぜず、各 monitor 独立で gate に流しているか
+## 9.13 ワーク・まとめ・参考資料
 
-## 9.15 ワーク
+### 演習
 
-**W9-1**: 既存の CNN（第6章）に MC-Dropout を適用し、T=10, 30, 100 で `predictive_entropy_normalized` の分散を比較せよ。T の下限を決める根拠を書き、`mc_dropout_predict.yaml` の `T.min` に反映せよ。
+1. **ECE 計算の実装**：CIFAR-10 で公開されている pre-trained ResNet の softmax 出力（val 5000 サンプル）に対して、`expected_calibration_error(n_bins=15)` を実装・計算せよ。教材上のパターンでは ECE ≈ 0.08 になる想定。
+2. **Temperature scaling の効果測定**：上記モデルに対して val の 500 サンプルで T を最適化し、残り 4500 サンプルで ECE 改善を測定せよ。T ≈ 1.5-2.5 になれば期待通り。
+3. **Deep Ensemble の実装**：第7章の 1D CNN を M=5 で ensemble し、`predictive_entropy_normalized` と `mutual_information` を計算せよ。OOD として意図的に augmentation を強化したサンプルを混ぜ、両指標が上がるか確認せよ。
+4. **Gate 契約の設計**：あなたが実装したい Skill（例：SEM 画像分類）について、`uncertainty_stop_gate.yaml` を書け。`monitors` の 3 指標について、warn / stop 閾値の初期値を calibration set の 80% / 95% タイル値から derive せよ。
+5. **並置 gate のシナリオシミュレーション**：以下 3 サンプルについて、`sample_admission_policy` の 2 段階チェックが pass / stop するか判定せよ。
+   - サンプル A: normalized_gap 0.1, predictive_entropy_normalized 0.2 → ?
+   - サンプル B: normalized_gap 0.4, predictive_entropy_normalized 0.15 → ?
+   - サンプル C: normalized_gap 0.15, predictive_entropy_normalized 0.55 → ?
 
-**W9-2**: BayesianLinear で MLP を書き、MNIST または ARIM 風合成データで学習せよ。学習曲線に ELBO / log-likelihood / KL の 3 曲線を重ねてプロットし、KL が collapse していないことを確認せよ。
+### まとめ
 
-**W9-3**: 同一の val セットに対し、MC-Dropout / BNN / Deep Ensemble（第8章）の `mutual_information` 分布をヒストグラムで重ね描きし、"どの手法が epistemic を強く見せるか" を Human に説明せよ。
+- **Softmax confidence ≠ 予測確率**。ECE / Brier / reliability diagram で必ず measure する
+- **Temperature scaling** は accuracy を保ちつつ ECE を下げる最小コストの post-hoc 法
+- **Deep Ensemble (M=5-10)** で `predictive_entropy` / `mutual_information` を分解できる。epistemic 監視の第一選択
+- **`predictive_entropy_normalized = H / log K`** で値域 [0, 1]、クラス数を跨いで閾値比較可
+- **第7章 `val_ood_score` の実装候補 4 種**（max-softmax / normalized entropy / mutual info / Mahalanobis）から選ぶ
+- **`uncertainty_stop_gate`** は監視指標・閾値・action・authorization を明文化した契約。Skill 間で共通化する
+- **第8章 `domain_gap_gate`（feature-level）と本章 `uncertainty_stop_gate`（output-level）は役割が違う**。並置して「feature → output」の順序で評価する
+- **Gate 無効化は全レベル禁止**。閾値変更は事前 Human 承認が必要
 
-**W9-4**: `uncertainty_method_selection_table` の YAML を、ARIM の 6 データ型テンプレート（vol-01 第13章）ごとに埋めよ。各データ型で primary 手法と caveat を書け。
+### 参考資料
 
-## 9.16 参考資料
+**本書内**：
+- 第5章 §5.4-4.10（provenance 3 レイヤ、Agentic 学習権限 L1-L3）
+- 第6章（`deep_split_contract` の calibration/test 分離）
+- 第7章 §7.3（`val_ood_score` forward reference の起点）
+- 第8章 §8.5（`domain_gap_gate`：feature-level OOD）
+- 第10章（MC-Dropout / BNN、conformal prediction 比較表）
+- 第11章（誤判定流し戻し UX、attribution）
+- 第14章（capstone：深層特徴 × PyMC 階層に不確かさを渡す）
+- 第15章（Deep Ensemble の過信・BNN の未収束）
 
-- Gal, Y., & Ghahramani, Z. (2016). Dropout as a Bayesian Approximation: Representing Model Uncertainty in Deep Learning. ICML.
-- Blundell, C., et al. (2015). Weight Uncertainty in Neural Networks (Bayes by Backprop). ICML.
-- Maddox, W. J., et al. (2019). A Simple Baseline for Bayesian Uncertainty in Deep Learning (SWAG). NeurIPS.
-- Daxberger, E., et al. (2021). Laplace Redux — Effortless Bayesian Deep Learning. NeurIPS.
-- Angelopoulos, A. N., & Bates, S. (2023). A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification.
-- Fort, S., Hu, H., & Lakshminarayanan, B. (2019). Deep Ensembles: A Loss Landscape Perspective. arXiv.
-- vol-02 第10-12章（PyMC / NumPyro による本格ベイズ推論）
-- 本書 第8章（Deep Ensemble と `uncertainty_stop_gate`）
-- 本書 第13章（深層特徴 × 階層モデル capstone）
-- 本書 付録B（Pyro / NumPyro / laplace-torch チートシート）
+**vol-01/02**：
+- vol-02 第10章（予測区間、conformal prediction 基礎）
+- vol-02 第11-13章（PyMC の $\hat{R}$ / ESS / PPC など診断）
+
+**外部**：
+- Guo et al. — "On Calibration of Modern Neural Networks", ICML 2017 [https://arxiv.org/abs/1706.04599](https://arxiv.org/abs/1706.04599)
+- Lakshminarayanan et al. — "Simple and Scalable Predictive Uncertainty Estimation using Deep Ensembles", NeurIPS 2017 [https://arxiv.org/abs/1612.01474](https://arxiv.org/abs/1612.01474)
+- Ovadia et al. — "Can You Trust Your Model's Uncertainty?", NeurIPS 2019 [https://arxiv.org/abs/1906.02530](https://arxiv.org/abs/1906.02530)
+- Kendall & Gal — "What Uncertainties Do We Need in Bayesian Deep Learning?", NeurIPS 2017 [https://arxiv.org/abs/1703.04977](https://arxiv.org/abs/1703.04977)
+- Naeini et al. — "Obtaining Well Calibrated Probabilities Using Bayesian Binning", AAAI 2015 [https://cdn.aaai.org/ojs/9602/9602-13-13130-1-2-20201228.pdf](https://cdn.aaai.org/ojs/9602/9602-13-13130-1-2-20201228.pdf)
+- Hendrycks & Gimpel — "A Baseline for Detecting Misclassified and OOD Examples", ICLR 2017 [https://arxiv.org/abs/1610.02136](https://arxiv.org/abs/1610.02136)

@@ -11,13 +11,13 @@
 
 | 目的 | 参照するテンプレート | 該当章 |
 |---|---|---|
-| CNN / ViT で画像分類 Skill を作る | A.2（画像分類） | 第6章 |
-| 画像→物性値の回帰 Skill を作る | A.3（画像回帰） | 第6章・第7章 |
-| 1D CNN / 1D Transformer でスペクトル分類 Skill を作る | A.4（スペクトル分類） | 第5章 |
-| TabNet / FT-Transformer で表形式回帰 Skill を作る | A.5（表形式回帰） | 第5章・第12章 |
-| Foundation Model 転移学習 Skill を作る | A.6（転移学習） | 第7章・第11章 |
-| SSL（SimCLR / MAE 等）事前学習 Skill を作る | A.7（自己教師あり） | 第7章 |
-| BNN / MC-Dropout / Deep Ensemble Skill を作る | A.8（不確かさ） | 第8章・第9章 |
+| CNN / ViT で画像分類 Skill を作る | A.2（画像分類） | 第7章 |
+| 画像→物性値の回帰 Skill を作る | A.3（画像回帰） | 第7章・第8章 |
+| 1D CNN / 1D Transformer でスペクトル分類 Skill を作る | A.4（スペクトル分類） | 第6章 |
+| TabNet / FT-Transformer で表形式回帰 Skill を作る | A.5（表形式回帰） | 第6章・第13章 |
+| Foundation Model 転移学習 Skill を作る | A.6（転移学習） | 第8章・第12章 |
+| SSL（SimCLR / MAE 等）事前学習 Skill を作る | A.7（自己教師あり） | 第8章 |
+| BNN / MC-Dropout / Deep Ensemble Skill を作る | A.8（不確かさ） | 第9章・第10章 |
 | provenance schema の全項目を確認する | A.9（完全スキーマ） | 第4・11・13章 |
 
 **テンプレの共通要素**（6 要素）は vol-01 §A.2.2 に準拠：①目的 / ②入力条件 / ③出力形式 / ④成功条件 / ⑤禁止事項（severity 付き）/ ⑥再現性条件。vol-03 では **⑦ Agentic 契約** を追加します（agent tier / 承認ゲート / 不確かさ停止条件）。
@@ -37,7 +37,7 @@ vol-03 で新規に追加されるパスは **Skill ディレクトリの内側*
 ```text
 <vol-03 repo root>/
 ├── data/
-│   ├── synthetic-hierarchy/          ← vol-02 継承（第13章 capstone で再利用）
+│   ├── synthetic-hierarchy/          ← vol-02 継承（第14章 capstone で再利用）
 │   └── synthetic-deep/               ← ★vol-03 追加：深層向け合成データ（付録C）
 │       ├── images/                   ← 画像サンプル（SEM 風、Raman 風）
 │       ├── spectra/                  ← 1D スペクトル
@@ -46,7 +46,7 @@ vol-03 で新規に追加されるパスは **Skill ディレクトリの内側*
 │   ├── generate_synthetic_hierarchy.py   ← vol-02 継承
 │   └── generate_synthetic_deep.py        ← ★vol-03 追加
 ├── weights/                          ← ★vol-03 追加：ローカル weight cache
-│   ├── foundation/                       ← FM の hash-verified copy（第11章）
+│   ├── foundation/                       ← FM の hash-verified copy（第12章）
 │   └── fine_tuned/                       ← 派生モデル
 └── .github/skills/                   ← 各 Skill はここに配置（vol-01 A.2.1）
     └── <skill-name>/
@@ -73,13 +73,13 @@ vol-02 の `artifacts/` / `diagnostics/` に加え、深層学習の中間物と
 │   ├── epoch_<NNN>.safetensors            ← 各 epoch or best のみ保存
 │   ├── checkpoint_registry.jsonl          ← append-only、Ch4 の overwrite policy
 │   └── README.md                          ← 保持ポリシー・削除規則
-└── wandb_run/                        ← ★vol-03 追加（optional、第15章 §15.10）
+└── wandb_run/                        ← ★vol-03 追加（optional、第16章 §16.10）
     ├── run_id.txt                         ← MLflow / W&B run_id の pin
     └── metrics_hash.txt                   ← tracking との改ざん検知
 ```
 
 > [!TIP]
-> `checkpoints/` は **append-only**（Ch4 `checkpoint_overwrite_policy: append_only`）が原則。「best」は上書きファイル（`best.safetensors`）ではなく**不変な checkpoint への署名付きポインタ**として `checkpoint_registry.jsonl` に記録する（例：`{"best_of_run_<id>": "epoch_042.safetensors", "signed_by": "..."}`）。ディスク節約が必要な場合でも最終 signed checkpoint と best pointer 対象の実体は残し、中間削除は `checkpoint_registry.jsonl` に append で記録する。**silent な上書きは AG-03（第14章）に該当**。
+> `checkpoints/` は **append-only**（Ch4 `checkpoint_overwrite_policy: append_only`）が原則。「best」は上書きファイル（`best.safetensors`）ではなく**不変な checkpoint への署名付きポインタ**として `checkpoint_registry.jsonl` に記録する（例：`{"best_of_run_<id>": "epoch_042.safetensors", "signed_by": "..."}`）。ディスク節約が必要な場合でも最終 signed checkpoint と best pointer 対象の実体は残し、中間削除は `checkpoint_registry.jsonl` に append で記録する。**silent な上書きは AG-03（第15章）に該当**。
 
 ### A.1.2 テンプレの読み方
 
@@ -93,12 +93,12 @@ vol-02 の `artifacts/` / `diagnostics/` に加え、深層学習の中間物と
 
 - 目的行は 1 文で書く（`- 目的: ...`）
 - 入力・出力条件は data contract（Ch4）を参照 (`- input_schema_ref: data-contract-<name>.yaml`)
-- Agentic 契約は Ch4 §4.6-4.9 の tier / 承認 / 停止契約を Skill 側で pin
-- Severity は `CRITICAL` / `HIGH` / `MEDIUM` / `LOW` の 4 段（Ch14 §14.3 準拠）
+- Agentic 契約は Ch4 §5.6-4.9 の tier / 承認 / 停止契約を Skill 側で pin
+- Severity は `CRITICAL` / `HIGH` / `MEDIUM` / `LOW` の 4 段（Ch14 §15.3 準拠）
 
 ---
 
-## A.2 画像分類 Skill テンプレート（第6章）
+## A.2 画像分類 Skill テンプレート（第7章）
 
 ### A.2.1 `SKILL.md` 雛形
 
@@ -258,7 +258,7 @@ def train(cfg: dict, data: dict, approval_record: dict) -> dict:
 
 ---
 
-## A.3 画像回帰 Skill テンプレート（第6章・第7章）
+## A.3 画像回帰 Skill テンプレート（第7章・第8章）
 
 ### A.3.1 `SKILL.md` 雛形（差分のみ）
 
@@ -341,7 +341,7 @@ def gaussian_nll_loss(pred_mu: torch.Tensor,
 
 ---
 
-## A.4 スペクトル分類 Skill テンプレート（第5章）
+## A.4 スペクトル分類 Skill テンプレート（第6章）
 
 ### A.4.1 `SKILL.md` 雛形（差分のみ）
 
@@ -351,7 +351,7 @@ version: "0.1.0"
 agent_tier_required: "L2"
 purpose: >
   Raman / IR / XPS 等の 1D スペクトルから物質種別を分類する Skill。
-  1D CNN or 1D Transformer、Raman FM 転移も選択可（第7章）。
+  1D CNN or 1D Transformer、Raman FM 転移も選択可（第8章）。
 
 inputs:
   data_contract_ref: "data-contract-spectrum-<technique>.yaml"
@@ -417,7 +417,7 @@ class Spectrum1DCNN(nn.Module):
 
 ---
 
-## A.5 表形式回帰 Skill テンプレート（第5章・第12章）
+## A.5 表形式回帰 Skill テンプレート（第6章・第13章）
 
 ### A.5.1 `SKILL.md` 雛形（差分のみ）
 
@@ -438,7 +438,7 @@ success_criteria:
   r2_baseline_relative_improvement_min: 0.05              # 直近ベースライン対比の絶対差
   r2_absolute_min: "task-defined (例: 0.65-0.80)"
   vs_gbm_baseline_improvement_pct_min: 5                   # GBM 比 5% 以上改善
-  # 改善が 5% 未満なら深層を選ばず GBM を採用（第12章）
+  # 改善が 5% 未満なら深層を選ばず GBM を採用（第13章）
 
 forbidden:
   - action: "target_encoding_fitted_on_full_dataset"
@@ -466,7 +466,7 @@ agent_authorization:                                        # Ch4 canonical
 
 ---
 
-## A.6 転移学習 Skill テンプレート（第7章・第11章）
+## A.6 転移学習 Skill テンプレート（第8章・第12章）
 
 ### A.6.1 `SKILL.md` 雛形
 
@@ -553,7 +553,7 @@ from huggingface_hub import snapshot_download, HfApi
 
 def load_fm_with_verify(repo_id: str, revision: str, expected_manifest: dict):
     """
-    expected_manifest: 承認済み manifest（Ch11 §11.4）
+    expected_manifest: 承認済み manifest（Ch11 §12.4）
       - revision_commit_hash: "40-hex SHA"
       - declared_license: "..."
       - pretraining_data_license: "..."
@@ -612,7 +612,7 @@ def load_fm_with_verify(repo_id: str, revision: str, expected_manifest: dict):
 
 ---
 
-## A.7 自己教師あり事前学習 Skill テンプレート（第7章）
+## A.7 自己教師あり事前学習 Skill テンプレート（第8章）
 
 ### A.7.1 `SKILL.md` 雛形（差分のみ）
 
@@ -663,7 +663,7 @@ agent_authorization:                                   # Ch4 canonical
 
 ---
 
-## A.8 不確かさ推定 Skill テンプレート（第8章・第9章）
+## A.8 不確かさ推定 Skill テンプレート（第9章・第10章）
 
 ### A.8.1 `SKILL.md` 雛形
 
@@ -978,18 +978,18 @@ gate_state_machine:
 # Section 10: Audit (Ch14 canonical, expanded)
 # ============================================================
 audit_result_provenance:
-  audit_id: "sha256"                                   # Ch14 §14.8
+  audit_id: "sha256"                                   # Ch14 §15.8
   registry_hash_at_run_start: "sha256"                 # Ch14 registry version
   registry_version_at_run_start: "e.g., v2.0"
   effective_registry_hash_from_chain: "sha256"         # Ch14 registry_versioning
   decision: "pass | warn | block"
   blocking_decision_signature: "signature over decision field (Ch14)"
-  cross_reference_findings: "list of finding_id + status (Ch14 §14.8)"
+  cross_reference_findings: "list of finding_id + status (Ch14 §15.8)"
   non_agent_verifier_signatures:                       # Ch14 canonical
     verifiers: "list of {pubkey, signature, timestamp}"
     quorum_size_for_pass: 1                            # 最低 1
     quorum_size_for_block_exception: 2                 # blocking 例外は 2 以上
-  runtime_and_periodic_audit_guards_ref:               # Ch14 §14.8 canonical
+  runtime_and_periodic_audit_guards_ref:               # Ch14 §15.8 canonical
     inference_time_guard_active: "bool"
     drift_guard_active: "bool"
     rollback_guard_active: "bool"
@@ -1083,7 +1083,7 @@ responsibility_ledger_entry:                           # Ch15 canonical, split p
 7. **Ch13 chain context を準備** — `integrated_provenance_chain_ref` に紐づく上流 provenance（data / augmentation / weights / FM / gate1-3）が chain として揃うことを確認
 8. **Ch14 registry version/hash を pin** — `registry_version_at_run_start` と `registry_hash_at_run_start` を Skill 実行開始時にキャプチャ
 9. **外部 append-only ledger 参照を用意** — scheduler / inference / model-registry ledger の突合対象を Skill が読み出せる形にする
-10. **cross_reference_checks を宣言** — audit と ledger の突合、gate と inference の突合など Ch14 §14.8 の 4 種類を Skill 契約に列挙
+10. **cross_reference_checks を宣言** — audit と ledger の突合、gate と inference の突合など Ch14 §15.8 の 4 種類を Skill 契約に列挙
 11. **provenance schema の subset を必須項目マトリクスで確認**
 12. **PR 前チェックリストを埋める**
 13. **Ch14 audit を pre-merge で 1 回走らせる**（`agentic_deep_failure_audit`）— `non_agent_verifier >= 1`、blocking 例外時は `>= 2`
@@ -1115,16 +1115,16 @@ responsibility_ledger_entry:                           # Ch15 canonical, split p
 
 ### 本書内の該当章
 
-- 第4章：Skill 契約 6 要素、agent tier、approved_hp_range、training_job_approval
-- 第5章：Augmentation contract、augmentation_provenance
+- 第5章：Skill 契約 6 要素、agent tier、approved_hp_range、training_job_approval
+- 第6章：Augmentation contract、augmentation_provenance
 - 第6-7章：CNN/ViT/1D CNN 実装、SSL、転移学習
 - 第8-9章：Deep Ensemble / MC-Dropout / BNN、不確かさ停止
-- 第10章：Grad-CAM、feature attribution、diagnostics
-- 第11章：Foundation Model provenance、fm_update_gate
-- 第12章：checkpoint registry、GBM vs 深層の比較
-- 第13章：Gate1/2/3、integrated_provenance_chain
-- 第14章：failure_pattern_registry、agentic_deep_failure_audit、audit_id
-- 第15章：organization_gpu_resource_policy、model_distribution_contract、responsibility_ledger
+- 第11章：Grad-CAM、feature attribution、diagnostics
+- 第12章：Foundation Model provenance、fm_update_gate
+- 第13章：checkpoint registry、GBM vs 深層の比較
+- 第14章：Gate1/2/3、integrated_provenance_chain
+- 第15章：failure_pattern_registry、agentic_deep_failure_audit、audit_id
+- 第16章：organization_gpu_resource_policy、model_distribution_contract、responsibility_ledger
 
 ### 外部参考
 

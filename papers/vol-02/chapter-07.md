@@ -1,475 +1,384 @@
-# 第7章 モデル選択・交差検証・データリーク検知
+# 第7章 教師なし学習を Skill 化する
 
 > **本章の到達目標**
-> - k-fold / stratified / group / time-series の CV を、データ性質から**機械的に**選び分けられる
-> - **同一試料・同一ロット・時系列**の 3 種の group leak を、`GroupKFold` / `TimeSeriesSplit` で予防できる
-> - **前処理・特徴量選択・欠損補完・ハイパーパラメータ探索**を、Pipeline + `GridSearchCV` / ネスト CV で fold 内実施できる
-> - ハイパーパラメータ探索と本評価を **ネスト CV** で分離し、独立テストへの過剰参照を防げる
-> - AI エージェント特有のリーク（**会話コンテキスト経由の情報伝播・後付け特徴量追加・test スコア駆動探索**）を検知できる
-> - 本章末の **CV 設計チェックリスト** を、以降すべての Skill 実装で使う
+> - 第6章の Skill 構造を、**教師なし学習**（PCA・クラスタリング・異常検知）に拡張できる
+> - 目的変数がないゆえに難しくなる「成功条件」を、`task_type` ごとに書き下せる
+> - PCA・k-means・HDBSCAN・Isolation Forest を、目的とデータ性質から選び分けられる
+> - 3 つのハンズオン（PCA でスペクトル群、クラスタリングで回折パターン群、異常検知で顕微鏡画像特徴量）を、共通構造で実装できる
+> - 教師なし学習特有の落とし穴（**「見えたパターン」の後付け解釈**、クラスタ数の後付け変更）を回避できる
 >
 > **本章で扱わないこと**
-> - モデル自体の解釈（SHAP / PDP / permutation importance） → **第8章**
-> - PyMC / ベイズ推論の診断（$\hat{R}$ / ESS / PPC） → **第10章・第12章**
-> - 深層学習の CV（early stopping、時間軸に沿った検証） → 本書外
-> - 統計的検定（多重比較補正の理論） → 統計学の教科書に譲る。ただし多重比較の実務的落とし穴は本章 §7.7 で言及
+> - CV / resample の詳細設計（grouped bootstrap、nested resampling、系統的リサンプリング） → **第8章**（本章では成功条件と Skill 化のための最小 bootstrap のみ扱う）
+> - SHAP・PDP 等の教師あり用解釈手法 → **第9章**（PCA loading の解釈は本章で扱う）
+> - 深層 embedding（オートエンコーダ・自己教師あり学習） → 本書外（vol-03 予定）
+> - 統計的検定を伴う異常検知（外れ値検定など） → 統計学の教科書に譲る
 
 ---
 
-## 7.1 なぜこの章か——第5章の「とりあえず KFold」の限界
+## 7.1 教師なし学習と Skill 化の難しさ
 
-第5章では、Skill 構造を示すために `KFold(n_splits=5, shuffle=True)` を素で使いました。しかし、次のような場面では **これだけでは不十分** です：
+教師あり学習には「予測誤差」という揺るぎない評価軸がありました。**教師なし学習にはそれがありません**——正解ラベルがないため、「何をもって成功とするか」を自分で定義する必要があります。この違いが Skill 化を難しくします。
 
-- **同一試料の反復測定が train と test に分かれて入る** → CV スコアが良くても実運用では悪化（第5章 §5.9 の代表症状）
-- **同一ロットの試料が分割違反** → 「見たことのある組成領域」で評価してしまう
-- **時系列データで未来を先に見る** → CV では「予測できた」ように見えるが、実運用では成立しない
-- **前処理を全データで実施** → CV の各 fold で微妙にリーク
-- **ハイパーパラメータを何度も試して、独立テストで確認** → 独立テストが「本当の独立」ではなくなる
+第6章から本章に持ち越すもの・変わるもの：
 
-**第7章は、「どう推定するか」だけに集中します**。第5章・第6章では「何を予測するか」「何を成功とみなすか」が主題でしたが、ここでは **推定手続きそのものの正しさ** を問います。
+| 要素 | 第6章（教師あり） | 第7章（教師なし） |
+|---|---|---|
+| ①目的 | 「予測/分類する」 | 「**構造を抽出する** / 異常を検出する / 次元を減らす」 |
+| ②入力 | `X` + `y` + 識別子 | `X` + 識別子（`y` は評価用に持てば持つ、無くてもよい） |
+| ③出力 | 予測値・確率 + provenance | **潜在表現 / クラスタ ID / 異常度スコア** + 可視化 |
+| ④成功条件 | 予測誤差の 3 点セット | **タスク種別に応じた内部指標 + 安定性 + ドメイン整合** |
+| ⑤禁止事項 | データリーク・後付け変更 | 上記 + **「見えたパターン」の後付け解釈**・クラスタ数後付け変更 |
+| ⑥再現性 | `data_split` / `cv_scheme` 等 | 上記 + **初期化 seed（k-means）・並び順（HDBSCAN）** |
+
+**特に難しいのは④成功条件**です。第5章 §5.3 で `task_type` ごとの成功条件表を示しましたが、本章ではそれを実装レベルまで具体化します。
 
 > [!IMPORTANT]
-> **第7章はすべての教師あり／教師なし Skill の共通規律**です。ここを飛ばして第8章以降に進むと、以降の章の成果物すべての信頼性が損なわれます。Route C（sklearn のみ）読者にとっては本章が **必読** です（第1章 §1.6）。
+> **教師なし学習では、Skill 仕様書の④成功条件を書けないまま実装に進むと、後で「なんとなく良さそう」で採用してしまいます**。本章の 3 ハンズオンは、成功条件を先に書き下すことで、この落とし穴を避けます。
 
 ---
 
-## 7.2 CV の 4 分類と選択マップ
+## 7.2 3 つのハンズオン概観
 
-scikit-learn の `model_selection` には 20 以上の splitter がありますが、**実務で覚えるべきは 4 分類**です：
+| ハンズオン | データ | task_type | 主手法 | 該当節 |
+|---|---|---|---|---|
+| A. PCA でスペクトル群 | RRUFF Raman など | `dimensionality_reduction` | PCA、Kernel PCA | §7.3 |
+| B. クラスタリングで回折パターン群 | XRD パターン群（合成 or ARIM 抜粋） | `clustering` | k-means, HDBSCAN | §7.4 |
+| C. 異常検知で顕微鏡画像特徴量 | 事前抽出した画像特徴量（Magpie 相当） | `anomaly_detection` | Isolation Forest, One-Class SVM | §7.5 |
 
-| 分類 | Splitter | 使う場面 |
-|---|---|---|
-| **一般 CV** | `KFold`, `ShuffleSplit`, `RepeatedKFold` | データが i.i.d.、識別子・時系列・グループ構造なし |
-| **層化 CV** | `StratifiedKFold`, `StratifiedShuffleSplit` | 分類、クラス不均衡あり |
-| **グループ CV** | `GroupKFold`, `GroupShuffleSplit`, `LeaveOneGroupOut`, `StratifiedGroupKFold` | 反復測定・ロット・被験者・機器などのグループ構造あり |
-| **時系列 CV** | `TimeSeriesSplit`（scikit-learn 標準）、rolling / expanding window（自作 or `sktime`） | 時系列データ |
+**共通構造**は第6章 §6.4 の 5 ブロック（入力検証 / Pipeline / 学習・評価 / 予測・可視化 / provenance）を継承します。教師なしでは train/test 分割の概念が薄い（あるいは異なる）ため、**§6.2 の anti-leakage split contract は「安定性評価のための resample split」用**に置き換えて使います（§7.4 で詳述）。
 
-### 選択マップ
+---
 
-```mermaid
-flowchart TD
-    A[データを準備] --> B{時間順序に依存?}
-    B -->|Yes| B2{同一試料/ロット/被験者<br/>が時系列で複数測定?}
-    B2 -->|Yes| B3["Group-aware TimeSeriesSplit<br/>／panel split／自作 splitter<br/>（標準では不足）"]
-    B2 -->|No| C[TimeSeriesSplit / rolling]
-    B -->|No| D{同一試料/ロット/被験者<br/>が複数レコード?}
-    D -->|Yes| E{分類 + クラス不均衡?}
-    E -->|Yes| F[StratifiedGroupKFold]
-    E -->|No| G[GroupKFold]
-    D -->|No| H{分類 + クラス不均衡?}
-    H -->|Yes| I[StratifiedKFold]
-    H -->|No| J[KFold shuffle=True]
+## 7.3 ハンズオン A：PCA でスペクトル群を要約する
+
+**目的**：Raman スペクトル群を数個の主成分に要約し、①群構造の可視化、②後続 Skill 用の低次元特徴量、③異常サンプルの一次スクリーニングに用いる。
+
+### Skill 仕様書（要約）
+
+| 要素 | 内容 |
+|---|---|
+| ① 目的 | スペクトル群を線形部分空間で要約。`task_type=dimensionality_reduction` |
+| ② 入力 | 波数（列）× 試料（行）の tabular。前処理済み（ベースライン補正・正規化）を前提 |
+| ③ 出力 | `PCA` オブジェクト、成分行列、寄与率、スコアプロット（可視化）、provenance |
+| ④ 成功条件 | ①**累積寄与率**：第 K 主成分で目安 **0.80〜0.90**（データ型ごとに仕様書で固定。再構成誤差・下流タスク性能も併用可）／②**成分の安定性**：bootstrap で loading 一致率が高い（下記の subspace / individual 判定を使い分け）／③**既知群整合**：ラベルがあれば、スコアプロットで既知群が視覚的に分離（事後評価用ラベル、入力には混ぜない） |
+| ⑤ 禁止事項 | 全データで前処理してから PCA、CV や bootstrap を通さない安定性宣言、成分の物理的意味の後付け決定 |
+| ⑥ 再現性 | `n_components`、`whiten`、`svd_solver`、`random_state`（`svd_solver="randomized"` 使用時）、前処理チェイン |
+
+### 実装スケルトン
+
+```python
+from sklearn.decomposition import PCA
+
+pipeline = Pipeline([
+    # 前処理は必ず Pipeline 内で
+    ("scaler", StandardScaler(with_std=False)),  # 平均のみ中心化
+    ("pca",    PCA(n_components=10, svd_solver="full", random_state=42)),
+])
+pipeline.fit(X_train)
+Z_train = pipeline.transform(X_train)
+explained = pipeline.named_steps["pca"].explained_variance_ratio_
 ```
 
+### 成分の安定性を bootstrap で評価
+
+**「たまたま第 1 成分が出た」ではなく「サンプルが多少違っても同じ第 1 成分が出る」ことを確認**します：
+
+```python
+from sklearn.base import clone
+from scipy.optimize import linear_sum_assignment
+
+def _take(X, idx):
+    return X.iloc[idx] if hasattr(X, "iloc") else X[idx]
+
+def bootstrap_pca_stability(pipeline, X, n_components=3, n_boot=100, seed=0):
+    """Pipeline ごと bootstrap で fit し、成分の安定性を評価する。
+
+    返り値：
+      individual_agree : 各成分の loading 一致率（縮退が無い場合の目安）
+      subspace_agree   : 上位 K 成分の張る部分空間の一致率
+                         （固有値が近い/縮退している場合はこちらを見る）
+    """
+    rng = np.random.default_rng(seed)
+    ref_model = clone(pipeline).fit(X)
+    ref_comp = ref_model.named_steps["pca"].components_[:n_components]
+
+    individual = np.zeros(n_components)
+    subspace = 0.0
+    for _ in range(n_boot):
+        idx = rng.choice(len(X), len(X), replace=True)
+        boot_model = clone(pipeline).fit(_take(X, idx))
+        boot_comp = boot_model.named_steps["pca"].components_[:n_components]
+
+        # 1) 成分の対応を Hungarian matching で揃える（並び替え対応）
+        sim = np.abs(ref_comp @ boot_comp.T)
+        row_ind, col_ind = linear_sum_assignment(-sim)
+        matched = sim[row_ind, col_ind]
+        individual += (matched > 0.9).astype(int)
+
+        # 2) subspace 一致率：Frobenius 内積で部分空間の重なりを測る
+        proj = ref_comp @ boot_comp.T
+        subspace += np.linalg.norm(proj, "fro") ** 2 / n_components
+
+    return individual / n_boot, subspace / n_boot
+```
+
+**設計上のポイント**：
+
+- **Pipeline ごと `clone()` して resample 内で fit**：前処理も bootstrap に含める（外側で一度だけ fit するとリーク）
+- **`X.iloc[idx]` / `X[idx]` を DataFrame/ndarray 両対応**
+- **Hungarian matching で成分順序の入れ替わりに対応**：bootstrap 後は必ずしも第 k 成分 ↔ 第 k 成分ではない
+- **subspace 一致率**：固有値が近い・縮退している場合、個別 loading は安定しなくても部分空間としては安定なことがある。この場合は **PC1〜PCk の部分空間としてまとめて解釈**し、個別成分に物理的意味を与えない
+
 > [!WARNING]
-> **時間順序 + グループ構造の併存**は標準 splitter だけでは対応不能な場合が多く、`LeaveOneGroupOut` + 時間順序制約や、`sktime` の panel splitter、または自作 splitter が必要になります。「同一試料を時系列で繰り返し測定」「ロット別の経時変化」などが該当します。
+> **loading の物理的解釈は、`individual_agree ≥ 0.9` の成分についてのみ**行います。近接固有値・縮退がある場合は `subspace_agree ≥ 0.9` を確認した上で「PC1-PCk の部分空間」として解釈し、**個別成分に名前を付けるのは避けます**。安定率が低い成分に「この成分は結晶構造の秩序を表す」などと語るのは、統計版の p-hacking（第5章 §5.4）です。
 
-### 4 分類の意思決定を仕様書に書く
+### 可視化
 
-Skill 仕様書 ⑥ 再現性条件の `cv_scheme` フィールドに、**選択根拠**まで書きます：
+- **スクリー図**（`explained_variance_ratio_` の棒グラフ）：K の選択根拠
+- **スコアプロット**（PC1 vs PC2）：既知群があれば色分け（**事後評価用**、入力には混ぜない）
+- **loading プロット**（PCA）：**物理的解釈は安定成分のみ**（縮退成分は subspace として提示）
+
+---
+
+## 7.4 ハンズオン B：クラスタリングで回折パターン群を分類する
+
+**目的**：XRD パターン群を教師なしでクラスタリングし、①既知相の再確認、②未知相の候補抽出、③次のラベル付け対象の優先順位付けに用いる。
+
+### Skill 仕様書（要約 + A との差分）
+
+| 要素 | A との差分 |
+|---|---|
+| ① 目的 | パターン群のクラスタ構造抽出。`task_type=clustering` |
+| ② 入力 | 2θ 軸を統一補間済みの XRD パターン（tabular）、または PCA 済み低次元表現 |
+| ③ 出力 | クラスタラベル、代表パターン、silhouette 等の内部指標、可視化、provenance |
+| ④ 成功条件 | ①**内部指標**：k-means の場合 silhouette ≥ 0.5（目安）、HDBSCAN では非ノイズ点に限定して silhouette を計算し 2 クラスタ以上あることを確認、あるいは DBCV / cluster persistence を併用／②**安定性**：resample を含む bootstrap で ARI ≥ 0.7 ／③**既知ラベルがあれば** ARI / NMI で外部評価（入力には混ぜない） |
+| ⑤ 禁止事項 | クラスタ数 K を結果を見た後で変更、silhouette 最大化 K を「発見された K」と主張、外れ値の後付け除外 |
+| ⑥ 再現性 | アルゴリズム名、`n_clusters`（k-means）、`min_cluster_size` / `min_samples`（HDBSCAN）、`random_state` |
+
+### k-means と HDBSCAN の使い分け
+
+| 観点 | k-means | HDBSCAN |
+|---|---|---|
+| クラスタ数 | 事前指定（K が既知の時） | 自動決定（未知の時） |
+| クラスタ形状 | 凸・球状 | 任意形状 |
+| ノイズ扱い | なし（全点をどこかに割り当て） | ノイズ点を `-1` にラベリング |
+| 密度差 | 苦手 | 得意 |
+| ARIM でよくある使い方 | 既知相の 5〜10 クラス分類 | 未知相探索・外れ試料抽出 |
+
+**両方を実行して比較する**のは Skill 増殖ですが、**目的が違えば別 Skill として並列運用**するのは妥当です。仕様書 ①目的にどちらを選ぶかを明記します。
+
+### 実装スケルトン（HDBSCAN）
+
+```python
+from sklearn.cluster import HDBSCAN  # scikit-learn 1.3+ で組込み
+
+pipeline = Pipeline([
+    ("pca",     PCA(n_components=10, random_state=42)),  # 次元削減
+    ("cluster", HDBSCAN(min_cluster_size=5, min_samples=3)),
+])
+pipeline.fit(X_train)
+labels = pipeline.named_steps["cluster"].labels_
+n_noise = np.sum(labels == -1)
+```
+
+HDBSCAN は `predict` を持たないため、**新規サンプルへの割り当ては別 Skill**（`approximate_predict` を別ライブラリで使うか、代表点への距離ベースで割り当て）にします。
+
+### 安定性評価：bootstrap ARI
+
+**「同じデータ・同じ乱数」で同じクラスタが出るのは当たり前**。教師なしで問うべきは「サンプルが少し変わっても同じクラスタが出るか」です：
+
+```python
+from sklearn.base import clone
+from sklearn.metrics import adjusted_rand_score
+
+def _take(X, idx):
+    return X.iloc[idx] if hasattr(X, "iloc") else X[idx]
+
+def bootstrap_cluster_stability(pipeline, X, n_boot=50, subsample_ratio=0.8, seed=0):
+    """Pipeline ごと resample し、部分集合上で ARI を測る。
+
+    ・pipeline は `.named_steps["cluster"].labels_` を持つ必要がある
+      （k-means, HDBSCAN 等）
+    ・ref は X 全体で fit、boot は 80% resample で fit
+    ・ARI は boot の resample index 上で ref[idx] vs boot を比較（順序整合）
+    """
+    rng = np.random.default_rng(seed)
+    ref_model = clone(pipeline).fit(X)
+    ref = ref_model.named_steps["cluster"].labels_
+    aris = []
+    for _ in range(n_boot):
+        idx = rng.choice(len(X), size=int(len(X) * subsample_ratio), replace=False)
+        boot_model = clone(pipeline).fit(_take(X, idx))
+        boot = boot_model.named_steps["cluster"].labels_
+        # boot は X[idx] 順なので、ref も idx 順に合わせる
+        aris.append(adjusted_rand_score(ref[idx], boot))
+    return float(np.mean(aris)), float(np.std(aris))
+```
+
+**設計上のポイント**：
+
+- **`clone()` で毎回 Pipeline 全体を初期化**（前処理も含めて resample 内で fit）
+- **`ref[idx]` と `boot` の順序整合**：`boot` は `X[idx]` 順にラベル付けされるので、参照側も同じ順序で切り出す（`np.intersect1d` はソートしてしまうので使わない）
+- **`labels_` を持つクラスタラー限定**：k-means / HDBSCAN OK、`fit_predict` 型のみのクラスタラーは helper が必要
+- **subsample_ratio は仕様書で固定**（後付け変更禁止）
+
+**ARI < 0.7 なら「見えたクラスタは偶発的である可能性」を仕様書に明記**して警告を出します。HDBSCAN のようにノイズ点（`-1`）がある場合、silhouette は非ノイズ点に限定して計算し、非ノイズクラスタが 2 以上あることを事前確認します（`if (labels != -1).sum() >= 2 and n_clusters >= 2` の条件で silhouette を計算）。
+
+### 教師なしにおける「anti-leakage split contract」の読み替え
+
+第6章 §6.2 の契約は、教師なしでは次の項目に置き換えます：
+
+1. **前処理を全データで実施しない**：欠損補完・特徴量選択・PCA・スケーリングはすべて bootstrap の各 resample 内で fit（Pipeline + `clone()` で担保）
+2. **同一標本の反復測定は resample 単位でまとめて出し入れ**：`specimen_id` を group にした group-bootstrap（対応データのみ）
+3. **識別子列を特徴量に含めない**：`sample_id` / `specimen_id` / `group_id` が `X` に混入していないことを Skill 入口で検査
+4. **既知ラベルは評価専用**：クラスタリング・PCA の入力に混ぜず、スコアプロットの色分けにも「事後評価用」と明記
+5. **resample index と group assignment を provenance に保存**：`bootstrap_seed`、`subsample_ratio`、`n_boot`、各 resample の index を記録
+
+**教師なしでも fold 内前処理は必須**です。
+
+---
+
+## 7.5 ハンズオン C：異常検知で顕微鏡画像特徴量から外れ試料を抽出
+
+**目的**：顕微鏡画像から事前抽出した特徴量（形状記述子・テクスチャ記述子）から、「他と異なる」試料を検出し、目視確認優先度を付ける。
+
+### Skill 仕様書（要約 + A/B との差分）
+
+| 要素 | A/B との差分 |
+|---|---|
+| ① 目的 | 外れ試料の検出。`task_type=anomaly_detection` |
+| ② 入力 | 事前抽出済み画像特徴量（形状・テクスチャ・PCA 済み低次元表現） |
+| ③ 出力 | 異常度スコア（連続値）、閾値超過フラグ、優先度ランキング、可視化 |
+| ④ 成功条件 | ①**既知異常があれば**：件数ベースで「既知異常 N 件中 K 件以上を上位 M に含む」を仕様書で固定（例：5 件中 4 件以上を上位 20 に含む）。bootstrap CI を併記／②**既知異常が無ければ**：目視確認上位 K 件のうち専門家判定で 5 割以上が「確かに異常」（人間評価が必須）／③contamination / 閾値を仕様書で凍結し、後付け変更を audit で追跡 |
+| ⑤ 禁止事項 | 異常度分布を見た後で閾値を緩める、既知異常でチューニングした後に同じ異常でテストする、目視確認結果を Skill 実行後に契約に追加、「スコアが単峰でないから異常」といった分布形状のみでの合否判定 |
+| ⑥ 再現性 | 手法、`contamination`（Isolation Forest）、`nu`（One-Class SVM）、`random_state`、特徴量スケール |
+
+### Isolation Forest vs One-Class SVM
+
+| 観点 | Isolation Forest | One-Class SVM |
+|---|---|---|
+| 前提 | 「異常はランダム分割で早く isolate される」 | 「正常はカーネル空間で 1 つの領域に収まる」 |
+| データ量 | 大規模に強い | 小〜中規模、O(n²) メモリ |
+| 特徴量スケール | 比較的頑健 | 敏感（標準化必須） |
+| 解釈 | パス長ベース、直感的 | サポートベクター経由、間接的 |
+| ARIM での目安 | 数千サンプル以上 | 数十〜数百サンプル |
+
+### 実装スケルトン（Isolation Forest）
+
+```python
+from sklearn.ensemble import IsolationForest
+
+pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("model",  IsolationForest(
+        n_estimators=200, contamination=0.05,
+        random_state=42, n_jobs=-1,
+    )),
+])
+pipeline.fit(X_train)
+scores = -pipeline.named_steps["model"].score_samples(X_train)  # 大きいほど異常
+is_anomaly = pipeline.named_steps["model"].predict(X_train) == -1
+```
+
+### `contamination` パラメータの扱いは要注意
+
+`contamination`（想定異常割合）は **仕様書段階で固定**します。**結果を見て `contamination` を変えるのは第5章 §5.4 の循環設計**です。既知異常がない場合、`contamination="auto"` または「最小可視化のための 5%」を仕様書で書いておき、独立評価では変更しません。
+
+---
+
+## 7.6 教師なし学習特有の落とし穴
+
+第6章 §6.9 の失敗表に、教師なし特有の項目を追加します：
+
+| 症状 | 原因 | 改善策 | 該当節 |
+|---|---|---|---|
+| 「良さそうなクラスタが見えた」で採用 | 内部指標・安定性・外部評価を省略 | 3 点評価（内部指標・bootstrap 安定性・可能ならドメイン評価）を仕様書 ④ に明記 | §7.4 |
+| クラスタ数 K を silhouette 最大で選ぶ → それを「発見」と主張 | 探索と本評価が未分離 | K を仕様書で固定するか、探索用と本評価用の Skill を分離 | §7.4, §5.4 |
+| PCA 第 1 成分に「結晶秩序」などと名前を付ける | 成分安定性が未検証 | bootstrap 安定率 ≥ 0.9 の成分にのみ解釈を許可 | §7.3 |
+| 異常検知の閾値を、結果を見た後に緩めて「異常なし」と主張 | 循環設計 | 閾値・`contamination` を仕様書で固定、監査ログで検証 | §7.5, §5.4 |
+| 特徴量スケールを揃えず k-means を回す → クラスタが変数のスケールで決まる | 前処理漏れ | 標準化を Pipeline 内に | §7.4 |
+| 「異常」と「珍しい」を区別せずに報告 | 用語の未定義 | 仕様書 ① で「珍しさ vs 物理的異常」を定義、可能ならラベル付けサイクルへ | §7.5 |
+
+---
+
+## 7.7 可視化ガイド
+
+教師なし学習の Skill では、**可視化が成功条件の一部**です（数字だけでは判断できないため）。共通ルール：
+
+- **スクリー図**（PCA）：K 選択の根拠を残す
+- **スコアプロット**（PCA / UMAP 等）：既知群があれば色分け、無ければクラスタラベルで色分け
+- **loading プロット**（PCA）：物理的解釈は安定成分のみ
+- **代表パターン**（クラスタリング）：各クラスタの中央値・平均・medoid を重ねて表示
+- **異常度分布**（異常検知）：ヒストグラム + 閾値線
+- **優先度ランキング**（異常検知）：上位 K 件のサムネイル（画像なら画像、パターンならプロット）
+
+**可視化ファイルも provenance の一部**として保存します（Skill 配下 `figures/pca_scree_v0.1.0.png` のようにバージョン付き。配置規約は付録A §A.1.1）。エージェントが**毎回図を再生成することを防ぐ**ため、次の figure manifest を保存します：
 
 ```yaml
-cv_scheme:
-  type: GroupKFold
-  n_splits: 5
-  group_column: specimen_id
-  rationale: |
-    RRUFF データは同一標本 (specimen) に対して複数のスペクトルを持つため、
-    KFold では標本レベル leak が起きる。GroupKFold で標本単位の分割を強制。
-    scikit-learn の RepeatedGroupKFold は存在しないため、繰り返しは
-    n_splits を大きく取るか seed を変えて自作する。
+figures:
+  - figure_id: pca_scree
+    figure_spec_version: 0.1.0
+    input_data_hash: <sha256 of X after preprocessing>
+    plot_code_hash: <sha256 of plot script>
+    plot_params: {n_components: 10, cmap: viridis}
+    skill_version: 0.1.0
+    generated_at: 2026-01-28T10:00:00Z
+    frozen: true    # 論文・報告書に使った図は true
 ```
 
-**「後から `TimeSeriesSplit` に変えました」は audit violation**（第4章 §4.5 分類 B）です。CV スキーム自体も凍結対象です。
+`input_data_hash` と `plot_params` が一致すれば再生成せず既存図を再利用します。見栄えを変えたい場合は `figure_spec_version` を上げ、旧版を残します。`frozen: true` の図は変更禁止（監査対象）。
 
 ---
 
-## 7.3 グループリークと `GroupKFold`
+## 7.8 章末チェックリスト・ワーク
 
-### グループリークの定義
+### セルフチェックリスト
 
-**同じ "実体" に由来する複数のレコードが train と test の両方に入ることを、group leak と呼びます**。実体としてよくあるもの：
+- [ ] ①目的で `task_type` が明記されているか？（dimensionality_reduction / clustering / anomaly_detection）
+- [ ] ④成功条件が「内部指標 + 安定性 + ドメイン評価 or 人間評価」の 3 点を含むか？
+- [ ] クラスタ数・成分数・`contamination` などのハイパーパラメータが仕様書で固定されているか？
+- [ ] bootstrap 安定性評価が実装されているか？
+- [ ] 前処理が Pipeline 内にあり、bootstrap の各 resample 内で fit されているか？
+- [ ] 可視化がバージョン付きで保存され、provenance に記録されているか？
+- [ ] 教師あり評価用の既知ラベルを、教師なし学習の**入力に混ぜていない**か？
 
-| データ型 | 実体 | group 列の候補 |
-|---|---|---|
-| 反復測定 | 同一試料 | `sample_id`, `specimen_id` |
-| 合成条件 | 同一ロット | `batch_id`, `lot_id` |
-| ユーザー研究 | 同一被験者 | `subject_id` |
-| 装置・時期 | 同一機器・同日 | `instrument_id`, `session_date` |
-| スペクトル群 | 同一 RRUFF entry | `rruff_id` |
+### ワーク
 
-**group leak があると、CV スコアが実運用より過大**になります。理由：test の「未知試料」が実は train と関連する試料であり、「初見データ」の予測タスクではなくなるためです。
-
-### `GroupKFold` の使い方
-
-```python
-from sklearn.model_selection import GroupKFold, cross_validate
-
-cv = GroupKFold(n_splits=5)
-scores = cross_validate(
-    pipeline, X_train, y_train,
-    groups=groups_train,               # ここが重要
-    cv=cv,
-    scoring=["neg_root_mean_squared_error", "r2"],
-    return_indices=True,
-)
-```
-
-**`groups` パラメータを渡し忘れると `GroupKFold` は使えません**。エージェントが `cross_validate` を書く場合、Skill 仕様書に `group_column` があれば **必ず `groups` を渡す**ように指示するテンプレートを用意します（§7.8 チェックリスト）。
-
-### 分類 + グループの場合：`StratifiedGroupKFold`
-
-分類タスクで **クラス不均衡** かつ **グループ構造** がある場合、`GroupKFold` だけではクラスが偏ります。`StratifiedGroupKFold` で両立します：
-
-```python
-from sklearn.model_selection import StratifiedGroupKFold
-
-cv = StratifiedGroupKFold(n_splits=5)
-for train_idx, test_idx in cv.split(X_train, y_train, groups=groups_train):
-    ...
-```
-
-### 反復回数を増やす場合
-
-`RepeatedKFold` / `RepeatedStratifiedKFold` は sklearn 標準にありますが、**`RepeatedGroupKFold` は存在しません**。反復が必要なら次のいずれか：
-
-- `n_splits` を大きくする（データが許す範囲で）
-- **`GroupShuffleSplit(n_splits=多い, random_state=seed)`** を使う（重複を許すため厳密な k-fold ではないが、実務ではこれが最も安全）
-- **ユニーク group ID をシャッフルして fold に割り当てる自作 splitter**（サンプル ↔ グループの alignment を保ったまま）
-
-> [!WARNING]
-> **`groups` ベクトル自体をシャッフルするコードは書かないでください**。サンプルと group ID の対応関係が壊れ、無効な分割になります。反復するのは「ユニーク group ID の割り当て順」であって、サンプルレベルの `groups` 列ではありません。scikit-learn 1.4 以降で `GroupKFold(shuffle=True, random_state=...)` が導入されているため、環境が許すならこれを使うのが最も簡潔です。
+1. 自分の実験データで、A / B / C のどれか 1 つを選び、Skill 仕様書を書く
+2. bootstrap 安定性評価を実装し、成分・クラスタが安定でない場合の警告メッセージを設計する
+3. 「見えたパターン」に名前を付けたくなったとき、**安定性を確認するまで名付けを保留する**運用ルールを Skill 仕様書 ⑤ に追記する
+4. 教師なし Skill の出力（潜在表現・クラスタラベル・異常度）を、**次の Skill の入力**として使う場面を 1 つ設計する（例：PCA の潜在表現を第6章の教師あり Skill に投入）。**このとき、PCA/クラスタリング等の教師なし前処理は必ず教師あり Skill の `Pipeline` 内に組み込み、各 train fold 内でのみ `fit` する**（全データで事前に fit してから split すると test 情報が漏れる。第6章 §6.2 と同じ原則）。resample / fit に使ったデータの範囲を provenance に残す
+5. 可視化のバージョン管理ルールを仕様書 ⑥ に追記する
 
 ---
 
-## 7.4 時系列リークと rolling / expanding CV
-
-### 時系列 CV の原則
-
-**train は test より過去でなければならない**。これは第5章 §5.2 で最小 holdout として扱いましたが、CV では「複数の window で繰り返し評価」する必要があります。
-
-主な設計：
-
-| 方式 | 特徴 | 使う場面 |
-|---|---|---|
-| **Expanding window（`TimeSeriesSplit`）** | 各 fold で train が拡大、test は次の window | データ蓄積とともに精度が向上する状況 |
-| **Rolling window** | train の window サイズを固定、両者をスライド | データ分布が時期で変化する状況 |
-| **Blocked K-Fold**（時系列内の独立 block を仮定） | train/test に時間ギャップを挟む | 系列内相関が短距離、独立性を仮定できる |
-| **Purged K-Fold**（金融時系列向け） | train/test の境界で系統的除外 | 特徴量計算のウィンドウが未来を含みうる |
-
-### `TimeSeriesSplit` の使用例
-
-```python
-from sklearn.model_selection import TimeSeriesSplit
-
-cv = TimeSeriesSplit(n_splits=5, gap=0, test_size=None)
-for train_idx, test_idx in cv.split(X_sorted):
-    # 事前に timestamp でソートしておく必要がある
-    ...
-```
-
-**注意点**：
-
-- **`X_sorted` は timestamp 昇順にソート済み**であることが前提。ソートを忘れると意味を成さない
-- **`gap` パラメータ**（scikit-learn 0.24+）：train と test の間に空ける index 数。系列内相関が長い場合や、遅延特徴量を使う場合は `gap > 0` にする
-- **`test_size` を指定しない**とデータ量から自動計算。実務では明示的に指定推奨
-
-### 遅延特徴量の未来参照リーク
-
-「t 時点の予測に t-1 以前の値を使う」ような遅延特徴量では、**特徴量計算のウィンドウが時点 t 自身を含む**と現在情報のリークになります。pandas の `rolling` はデフォルトで**trailing window（過去方向）**なので、それ自体が未来を含むわけではありませんが、**時点 t の特徴量として時点 t の値を含めてしまう**と、y_t の予測に y_t 由来の情報が入ります（以下 `value` は目的変数、または予測時点では未観測となる系列を想定します。予測時点で確定している外生変数はこの制約の対象外です）：
-
-```python
-# 悪い例 1：対称移動平均は未来を含む
-df["ma_10"] = df["value"].rolling(10, center=True).mean()
-
-# 悪い例 2：時点 t の特徴量に value_t を含めてしまう
-#   （rolling(10) は t-9 〜 t の平均。y_t の予測に value_t が入る）
-df["ma_10"] = df["value"].rolling(10).mean()
-
-# 良い例：予測時点 t の特徴量は t-1 以前のみを見る
-df["ma_10"] = df["value"].shift(1).rolling(10).mean()
-```
-
-**時系列予測では `shift(1)` を挟むのが基本**です。`shift(1).rolling(10)` は「時点 t の特徴量として t-1 〜 t-10 の平均」を計算します（timestamp 昇順が前提）。
-
----
-
-## 7.5 前処理・特徴量選択のリークを Pipeline で封じる
-
-### 全データ fit の落とし穴
-
-以下はすべて **fold ごとに train のみで fit** すべきものです：
-
-1. `StandardScaler` / `MinMaxScaler` / `RobustScaler`
-2. `PCA` / `TruncatedSVD`
-3. `SimpleImputer` / `KNNImputer` / `IterativeImputer`（欠損補完）
-4. `SelectKBest` / `SelectPercentile` / `RFE`（特徴量選択）
-5. カテゴリ変数の `TargetEncoder`（scikit-learn 1.3+。目的変数を使う。特にリークしやすい）
-6. カテゴリ変数の `OrdinalEncoder` / `OneHotEncoder`（train に無いカテゴリの扱い）
-
-**Pipeline に入れれば、`cross_validate` が自動的に fold ごとに fit** してくれます。**Pipeline に入れず手書きすると全部リークします**。
-
-### `ColumnTransformer` で列ごとの前処理
-
-異なる列に異なる前処理を適用する場合、`ColumnTransformer` を使います：
-
-```python
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.impute import SimpleImputer
-
-numeric_cols = ["temperature", "pressure", "concentration"]
-categorical_cols = ["method", "substrate"]
-
-preprocessor = ColumnTransformer([
-    ("num", Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler",  StandardScaler()),
-    ]), numeric_cols),
-    ("cat", Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot",  OneHotEncoder(handle_unknown="ignore")),
-    ]), categorical_cols),
-])
-
-pipeline = Pipeline([
-    ("preprocess", preprocessor),
-    ("model",      RandomForestRegressor(random_state=42)),
-])
-```
-
-**`OneHotEncoder(handle_unknown="ignore")` は重要**：train に無いカテゴリが test に現れると、無指定ではエラーになります。
-
-### 特徴量選択も fold 内で
-
-特徴量選択を全データで実施してから CV を回す（＝「予選」的な使い方）は、**特徴量選択のリーク**として広く知られています：
-
-```python
-# 悪い例：全データで SelectKBest してから CV
-selector = SelectKBest(k=20).fit(X, y)
-X_reduced = selector.transform(X)
-scores = cross_validate(model, X_reduced, y, cv=5)   # リーク
-
-# 良い例：Pipeline 内で fold ごとに選択
-pipeline = Pipeline([
-    ("selector", SelectKBest(k=20)),
-    ("model",    RandomForestRegressor(random_state=42)),
-])
-scores = cross_validate(pipeline, X, y, cv=5,
-                        return_indices=True)   # OK（provenance 付き）
-```
-
-> [!NOTE]
-> 第5章 §5.2 の方針に従い、本章でも `cross_validate(..., return_indices=True)` を推奨します（scikit-learn 1.3+）。`cross_val_score` は簡略例で使いますが、実務では `cross_validate` に統一してください。
-
----
-
-## 7.6 ネスト CV：ハイパーパラメータ探索と本評価の分離
-
-### なぜネスト CV か
-
-**同じ CV でハイパーパラメータ選択と汎化性能推定を両方行うと、性能推定が楽観バイアスを持つ**——これは統計学・ML の古典的な問題です（Cawley & Talbot 2010）。理由：CV スコアで選ばれたハイパーパラメータは、その CV スコアに対して過剰適合しているため。
-
-**ネスト CV** は、外側 CV で汎化性能を推定し、内側 CV でハイパーパラメータを選ぶ構造です：
-
-```
-外側 CV (5-fold): 各 fold で
-  ├─ train_outer (80%)
-  │   └─ 内側 CV (5-fold) で GridSearchCV → best hyperparams
-  │       └─ train_outer 全体で best hyperparams で refit
-  └─ test_outer (20%)
-      └─ refit したモデルで評価
-```
-
-### `GridSearchCV` + `cross_val_score` によるネスト CV
-
-**乱数を持つ splitter（`KFold(shuffle=True)` 等）の場合**の最小例：
-
-```python
-from sklearn.model_selection import GridSearchCV, cross_val_score, KFold
-
-param_grid = {"model__n_estimators": [100, 300], "model__max_depth": [5, 10, None]}
-inner_cv = KFold(n_splits=5, shuffle=True, random_state=42)
-outer_cv = KFold(n_splits=5, shuffle=True, random_state=1)
-
-grid = GridSearchCV(pipeline, param_grid, cv=inner_cv,
-                    scoring="neg_root_mean_squared_error", n_jobs=-1)
-nested_scores = cross_val_score(grid, X_train, y_train, cv=outer_cv,
-                                 scoring="neg_root_mean_squared_error")
-
-print(f"ネスト CV RMSE: {-nested_scores.mean():.3f} ± {nested_scores.std():.3f}")
-```
-
-**外側 CV の平均が「モデル選択手続き全体の汎化性能推定値」**、独立テストは **最後に 1 回だけ** 評価する保険の位置づけです。
-
-> [!IMPORTANT]
-> **ネスト CV の各 outer fold で選ばれる `best_params_` は異なり得ます**。外側スコアは「モデル選択手続き全体」の汎化性能推定であり、最終運用モデルは全 training データで同じ探索空間を再 fit して決めます（`GridSearchCV.fit(X_train, y_train).best_estimator_`）。「唯一の best_params が得られる」という誤解に注意してください。
-
-### グループ・時系列でのネスト CV
-
-`GroupKFold` / `TimeSeriesSplit` を内側 CV に組み込むと、`GridSearchCV` の内側で `groups` を自動伝播できないケースがあり、`cross_val_score(grid, ..., groups=groups)` では**外側にしか `groups` が伝わらず内側 CV が失敗するリスク**があります。**手動 outer loop** が安全です：
-
-```python
-from sklearn.model_selection import GroupKFold
-from sklearn.base import clone
-
-outer_cv = GroupKFold(n_splits=5)
-inner_cv = GroupKFold(n_splits=5)
-
-outer_scores = []
-best_params_list = []
-for train_idx, test_idx in outer_cv.split(X, y, groups):
-    X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
-    X_te, y_te = X.iloc[test_idx], y.iloc[test_idx]
-    g_tr = groups.iloc[train_idx]
-
-    grid = GridSearchCV(clone(pipeline), param_grid, cv=inner_cv,
-                        scoring="neg_root_mean_squared_error")
-    grid.fit(X_tr, y_tr, groups=g_tr)   # 内側にも groups を渡す
-    outer_scores.append(grid.score(X_te, y_te))
-    best_params_list.append(grid.best_params_)
-
-# scoring="neg_root_mean_squared_error" のため grid.score も負値。
-# 実際の RMSE で報告する場合は符号反転する。
-rmse_outer = -np.mean(outer_scores)
-print(f"Nested CV RMSE: {rmse_outer:.3f} ± {np.std(outer_scores):.3f}")
-```
-
-**注意**：
-
-- **`GroupKFold` / `TimeSeriesSplit` には乱数がない**ため、「内側と外側で `random_state` を変える」は**不要 / 無効**です。この指示は `KFold(shuffle=True)` / `ShuffleSplit` / `StratifiedKFold(shuffle=True)` 等の**乱数を持つ splitter 限定**です。
-- 時系列では `outer_cv = inner_cv = TimeSeriesSplit(...)` としつつ、内側は「外側 train 内で expanding」となるように outer loop で切り出したデータに再適用します。
-
-### いつネスト CV が必要か
-
-| 状況 | ネスト CV が必要か |
-|---|---|
-| 独立テストを持たない | **必要** |
-| 独立テストがあり、ハイパーパラメータ空間が小さい（3〜5 通り以下） | 単純 CV でも大きな bias は出にくい |
-| ハイパーパラメータ空間が広い（10 通り以上）| **必要** |
-| モデル種類自体を探索する（RF vs GBM vs Ridge…）| **必要** |
-
-**探索空間が広いのに単純 CV で最良を選び、独立テストで評価すると、独立テストが探索の一部になっている**（テストの複数回参照、第4章 §4.5 の B）ことに注意します。
-
----
-
-## 7.7 AI エージェント特有のリーク
-
-AI エージェントを使う分析では、**従来の統計/ML にはなかったタイプのリーク**が発生します。これは vol-01 第14章の「循環設計問題」を統計/ML の文脈で具体化したものであり、**第4章 §4.5 の禁止事項 6 項目を、エージェント運用時にどう発生するかへ展開したもの**です。Ch4 との重複ではなく、実行時の具体形として補完的に読んでください。
-
-### エージェント特有リーク・カタログ
-
-| # | リーク源 | 具体例 | 予防策 |
-|---|---|---|---|
-| 1 | **会話コンテキスト経由の情報伝播** | 独立テストのスコアをエージェントに見せた後で、「もっと良いモデルを試して」と依頼 → エージェントがテスト結果を暗黙に参照 | 独立テスト評価は最終 1 回、その結果を別セッション化 |
-| 2 | **後付け特徴量追加** | CV スコアが悪い → エージェントが自動で新特徴量を提案 → CV を回し直す（探索と本評価の混同） | 特徴量集合を仕様書 ⑥ で凍結、追加は Skill バージョンを上げて別実行 |
-| 3 | **test スコア駆動探索** | 「独立テストが悪い、改善方法は？」→ 改善案 → 適用 → 独立テスト再評価 のループ | test は 1 回のみ、悪ければ Skill 再設計 |
-| 4 | **ハイパーパラメータの後付け拡張** | GridSearch の範囲を、結果を見た後で広げる | パラメータ範囲を仕様書で凍結、拡張は audit violation |
-| 5 | **モデル選択の後付け** | RF で悪かったので GBM に切り替える → GBM のスコアだけ報告 | 探索空間を仕様書で凍結、モデル種類の切り替えも Skill バージョン管理 |
-| 6 | **多重比較の暗黙化** | 20 通りの分析を試して、有意だった 1 つを報告 | **予測モデルなら**：事前凍結、ネスト CV、独立テスト 1 回。**統計的検定を伴うなら**：Bonferroni / FDR（第9章で扱う範囲、本章では対象外） |
-| 7 | **チャットログ・メモリ・RAG への混入** | エージェントの会話履歴・メモリ・RAG コーパスに test 結果や holdout 情報が残り、次回の分析提案に混入する（LLM 重みの学習というより、実行時コンテキストの残留が現実的リスク） | チャットログは分析ログとして残すが、RAG コーパス化やメモリ登録は明示的に許可されたもの限定 |
-
-### 予防：エージェントに渡す情報の設計
-
-- **CV スコア** はエージェントに見せて OK（探索の材料）
-- **独立テストスコア** はエージェントに見せる前に「これで確定します」と宣言してから見せる、または別セッションで確定させる
-- **チャットで発見された "改善案"** は、その場では採用せず、**次バージョンの仕様書更新提案として記録**する（第4章 §4.4 の運用ルールを継承）
-
-### provenance の役割
-
-エージェント特有リークの検知には、**分析 provenance の完全記録**が必須です：
-
-- 各 Skill 実行の入力・出力・パラメータ
-- チャットセッションの ID と該当メッセージ
-- 特徴量集合・モデル種類のバージョン変更履歴
-- 独立テスト評価回数（1 を超えたら警告）
-
----
-
-## 7.8 CV 設計チェックリスト（本章の主成果物）
-
-以降のすべての Skill 実装で、**このチェックリストを通過してから独立テストに進む** ようにします。各項目には severity（🔴 fatal / 🟡 audit violation / 🔵 warning）を付与しました。
-
-### 事前設計チェック（Skill 仕様書段階）
-
-- [ ] 🔴 `task_type` を明記した（regression / classification / clustering / anomaly_detection / bayesian）
-- [ ] 🔴 `cv_scheme.type` を選択根拠付きで書いた（§7.2 選択マップに基づく）
-- [ ] 🔴 グループ構造がある場合、`group_column` を指定した
-- [ ] 🔴 時系列の場合、`timestamp_column` を指定し、`gap` を設計した
-- [ ] 🟡 クラス不均衡の場合、`Stratified*` を選んだ
-- [ ] 🟡 ハイパーパラメータ探索空間を仕様書で凍結した
-- [ ] 🟡 独立テストは 1 回のみ評価するルールを仕様書 ⑤ に明記した（複数回参照は第4章 §4.5 分類 B: audit violation）
-
-### 実装チェック（コード段階）
-
-- [ ] 🔴 前処理・欠損補完・特徴量選択・スケーリングを **すべて Pipeline 内**に配置した
-- [ ] 🔴 `cross_validate` に `groups=` を渡した（`GroupKFold` 使用時）
-- [ ] 🔴 時系列データを timestamp でソート済み
-- [ ] 🔴 `TargetEncoder`（scikit-learn 1.3+）を使う場合、fold 内で fit されるよう Pipeline 化した
-- [ ] 🟡 `OneHotEncoder(handle_unknown="ignore")` を設定した
-- [ ] 🟡 `return_indices=True`（scikit-learn 1.3+）で `data_split` を provenance に保存した
-- [ ] 🟡 ネスト CV を使うなら、内側・外側の splitter が独立している（乱数を持つ splitter の場合は `random_state` も別、`GroupKFold` / `TimeSeriesSplit` は該当なし）
-
-### 事後検証チェック（実行後）
-
-- [ ] 🔴 **`sample_id_train / sample_id_test` に重複が無い**（識別子レベルの overlap を検査。目的変数 `y_train / y_test` の値重複は正常なので対象外）
-- [ ] 🔴 `GroupKFold` 使用時：**各 fold ごとに `group_id_train / group_id_test` に overlap が無い**
-- [ ] 🔵 fold ごとの学習/検証スコアが極端に乖離していない（train >> test は過学習）
-- [ ] 🔵 fold 間の分散が想定内（1 つの fold だけ極端なら分割違反の疑い）
-- [ ] 🟡 独立テスト評価は 1 回のみ実施（第4章 §4.5 分類 B と整合）
-- [ ] 🟡 provenance に `cv_scheme` / `data_split` / `metric_definition` が全て記録された
-- [ ] 🟡 エージェントとのチャットで「独立テスト後の探索」が発生していない
-
-**severity 定義**（第4章 §4.5 と整合）：
-
-| severity | 意味 | 対応 |
-|---|---|---|
-| 🔴 fatal | データ流路の漏洩・仕様違反。結果は無効 | 即修正、既存結果は破棄 |
-| 🟡 audit violation | 評価基準の後付け・provenance 欠損。監査で指摘 | Skill バージョンを上げて再実行、または過去実行を audit に記録 |
-| 🔵 warning | 分割違反や過学習の兆候。要調査 | 原因調査、必要なら仕様書 ⑥ を強化 |
-
----
-
-## 7.9 章末ワーク
-
-1. **自分のデータで CV 選択マップ（§7.2）を辿り、`cv_scheme` を仕様書に書き下す**：選択根拠まで含めて 3〜5 行
-2. **意図的なリーク作りとその検知**：
-   - 全データで `StandardScaler.fit` → CV スコアの過大化を観察
-   - `GroupKFold` を `KFold` に変える → スコアの変化と分割違反を確認
-   - 特徴量選択を CV 外で実施 → スコアの変化を確認
-3. **ネスト CV を実装**し、単純 CV の best score との差を測定する（この差が「楽観バイアス」の実測値）
-4. **エージェントとのチャットログから、`§7.7` のリーク・カタログ 7 項目を検知するチェックリストを 1 つ選び、自分の運用に組み込む**
-5. **CV 設計チェックリスト（§7.8）を第5章・第6章の 3 ハンズオンすべてに適用**し、通らなかった項目を仕様書に反映
-
----
-
-## 7.10 本章のまとめ
-
-- CV の 4 分類（一般 / 層化 / グループ / 時系列）を、データ性質から機械的に選ぶ（§7.2 マップ）
-- **グループリーク** は同一試料・同一ロット・同一被験者・同一機器が train/test に分散した際に発生。`GroupKFold` / `StratifiedGroupKFold` で予防
-- **時系列リーク** は未来参照から発生。`TimeSeriesSplit` + `gap` + timestamp ソート、遅延特徴量は `shift(1)` が基本
-- **前処理・特徴量選択・欠損補完・スケーリング**は必ず Pipeline 内で fold ごとに fit
-- **ネスト CV** で「ハイパーパラメータ探索」と「汎化性能推定」を分離。独立テストは最終 1 回のみ
-- **AI エージェント特有のリーク** 7 種を明示的に予防：会話コンテキスト、後付け特徴量、test スコア駆動探索、パラメータ後付け拡張、モデル選択後付け、多重比較の暗黙化、**チャットログ・メモリ・RAG への混入**
-- 本章末の **CV 設計チェックリスト** を、以降のすべての Skill 実装で使う
+## 7.9 本章のまとめ
+
+- 教師なし学習の Skill 化で最も難しいのは④**成功条件**：`task_type` ごとに「内部指標・安定性・ドメイン評価」の 3 点で書く
+- PCA では **成分安定性の bootstrap 評価**、クラスタリングでは **ARI の bootstrap 評価**が必須。ここを省くと「見えたパターン」の後付け解釈になる
+- k-means / HDBSCAN / Isolation Forest / One-Class SVM を、**目的とデータ性質から選び分ける**。全部試して一番良いのを採用するのは循環設計
+- 教師なしでも、`anti-leakage split contract` は resample 単位で読み替えて適用する（fold 内前処理・同一標本の分離・ラベル混入禁止）
+- **可視化も Skill 成果物**：バージョン付きで保存、後付け変更禁止
+- 次章（第8章）では、教師あり・教師なしの両方に共通する **CV 設計とリーク検知** を深掘りする
 
 ---
 
 ## 参考資料
 
 ### 本書内の該当章
-- [第4章 統計/ML 分析用 Skill の設計原則](./chapter-04.md)（禁止事項 6 項目）
-- [第5章 教師あり学習を Skill 化する](./chapter-05.md)（anti-leakage split contract）
-- [第6章 教師なし学習を Skill 化する](./chapter-06.md)（bootstrap 安定性評価）
-- 第8章 解釈可能性とレポート化（次章）
-- 第14章 統計/ML 特有の失敗パターン（本章の禁止事項の事例集）
-- 付録B Scikit-learn チートシート（CV splitter リファレンス）
+- [第3章 ARIM データに現れる統計的課題](./chapter-03.md)
+- [第4章 Scikit-learn と PyMC の全体像・使い分け](./chapter-04.md)
+- [第5章 統計/ML 分析用 Skill の設計原則](./chapter-05.md)
+- [第6章 教師あり学習を Skill 化する](./chapter-06.md)
+- 第8章 モデル選択・交差検証・データリーク検知（bootstrap 詳細）
+- 第9章 解釈可能性とレポート化
+- 第15章 統計/ML 特有の失敗パターン（教師なしの失敗事例）
+- 付録B Scikit-learn チートシート
 
 ### 外部参考
-- scikit-learn User Guide - Cross-validation: <https://scikit-learn.org/stable/modules/cross_validation.html>
-- scikit-learn User Guide - Grid Search: <https://scikit-learn.org/stable/modules/grid_search.html>
-- Cawley, G. C., & Talbot, N. L. C. "On Over-fitting in Model Selection and Subsequent Selection Bias in Performance Evaluation." *Journal of Machine Learning Research* **11**, 2079–2107 (2010). — ネスト CV の必要性を示す古典
-- Kapoor, S., & Narayanan, A. "Leakage and the reproducibility crisis in machine-learning-based science." *Patterns* **4**, 100804 (2023). <https://doi.org/10.1016/j.patter.2023.100804> — データリークの類型化
-- Varma, S., & Simon, R. "Bias in error estimation when using cross-validation for model selection." *BMC Bioinformatics* **7**, 91 (2006). — 楽観バイアスの初期実証
-- Roberts, D. R. et al. "Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure." *Ecography* **40**, 913–929 (2017). — 構造化データの CV 設計
-- de Prado, M. L. *Advances in Financial Machine Learning*. Wiley, 2018. — Purged K-Fold（金融時系列向け）の解説
+- scikit-learn User Guide - Unsupervised learning: <https://scikit-learn.org/stable/unsupervised_learning.html>
+- Campello, R. J. G. B., Moulavi, D., & Sander, J. "Density-Based Clustering Based on Hierarchical Density Estimates." *PAKDD 2013*, LNCS **7819**, pp.160–172. <https://doi.org/10.1007/978-3-642-37456-2_14>
+- McInnes, L., Healy, J., & Astels, S. "hdbscan: Hierarchical density based clustering." *Journal of Open Source Software* **2**, 205 (2017).
+- Liu, F. T., Ting, K. M., & Zhou, Z.-H. "Isolation Forest." *ICDM 2008*, pp.413–422. <https://doi.org/10.1109/ICDM.2008.17>
+- Hubert, L., & Arabie, P. "Comparing partitions." *Journal of Classification* **2**, 193–218 (1985). — Adjusted Rand Index の原典
+- Rousseeuw, P. J. "Silhouettes: a graphical aid to the interpretation and validation of cluster analysis." *Journal of Computational and Applied Mathematics* **20**, 53–65 (1987).

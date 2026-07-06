@@ -53,7 +53,7 @@ Step 6: 最終手段として target_accept を 0.99 に上げる
 Step 7: バックエンド変更（NumPyro CPU → NutPie など）
 ```
 
-> **`target_accept=0.99` を最初にやらない**：Ch12 §12.6 の梯子どおり **原因の localize → 標準化 → 非中心化** を先に潰す。`target_accept` を先に上げると根本原因（曲率・スケール・パラメータ化）が隠れ、認定 provenance に「発散 0 だが `target_accept=0.99` に依存」の脆いモデルが残る。
+> **`target_accept=0.99` を最初にやらない**：Ch12 §13.6 の梯子どおり **原因の localize → 標準化 → 非中心化** を先に潰す。`target_accept` を先に上げると根本原因（曲率・スケール・パラメータ化）が隠れ、認定 provenance に「発散 0 だが `target_accept=0.99` に依存」の脆いモデルが残る。
 
 ### C.2.3 divergences 対処例
 
@@ -125,8 +125,8 @@ with warnings.catch_warnings():
 | 特徴量数 >> サンプル数 | 正則化強化 (`alpha` 増), feature selection |
 | 木のモデル | `max_depth` 減, `min_samples_leaf` 増, `n_estimators` 減も |
 | ニューラル系 | dropout, early stopping, weight decay |
-| ハイパーパラ探索が広い | Nested CV（Ch7 §7.6） |
-| Bayesian で post が prior に張り付かず prior 支配 | prior を弱く（Ch14 §14.5） |
+| ハイパーパラ探索が広い | Nested CV（Ch7 §8.6） |
+| Bayesian で post が prior に張り付かず prior 支配 | prior を弱く（Ch14 §15.5） |
 
 ### C.4.3 sample size learning curve
 
@@ -153,7 +153,7 @@ sizes, train_s, test_s = learning_curve(
 - [ ] Target encoding を全データで fit していないか？
 - [ ] 「未来の特徴量」が含まれていないか（feature_availability_time チェック）
 
-### C.5.2 リーク検知テスト（Ch14 §14.10 #1）
+### C.5.2 リーク検知テスト（Ch14 §15.10 #1）
 
 ```python
 from sklearn.base import clone
@@ -187,7 +187,7 @@ def audit_scaler_leakage(model, preprocess, X, y, cv, groups=None,
     return {"correct_r2": s_correct, "leaked_r2": s_leaked, "signed_diff": diff}
 ```
 
-> **注意（スモークテスト）**：これは「Scaler を CV 外で fit する」典型パターンの再現テストで、あらゆるリーク（target encoding, 特徴量選択, 時系列の未来参照 等）を検知できるわけではない。個別のリークパターンには **Ch14 §14.2** の該当項目のテストを追加すること。判定は `abs()` ではなく **符号付き**（漏洩ケースが有意に良い＝上振れのみ検知）にする。
+> **注意（スモークテスト）**：これは「Scaler を CV 外で fit する」典型パターンの再現テストで、あらゆるリーク（target encoding, 特徴量選択, 時系列の未来参照 等）を検知できるわけではない。個別のリークパターンには **Ch14 §15.2** の該当項目のテストを追加すること。判定は `abs()` ではなく **符号付き**（漏洩ケースが有意に良い＝上振れのみ検知）にする。
 
 ---
 
@@ -228,7 +228,7 @@ print("x64 enabled:", jax.config.jax_enable_x64)
 | `An NVIDIA GPU may be present ... jaxlib is not installed. Falling back to cpu.` | GPU jaxlib 未インストール | CPU で OK / 必要なら CUDA 版インストール |
 | メモリ不足（GPU） | chain 全並列で VRAM 消費 | chain 数を減らす（`chains=2`）／CPU バックエンドに固定（`nuts_sampler="pymc"` or `chain_method="sequential"`）／NumPyro/JAX の `chain_method`・`postprocessing_backend` を確認 |
 
-### C.7.3 バックエンド差の許容範囲（第10章 §10.9）
+### C.7.3 バックエンド差の許容範囲（第11章 §11.9）
 
 **tolerance の設計**：
 ```
@@ -266,7 +266,7 @@ print("x64 enabled:", jax.config.jax_enable_x64)
 | Materials Project 経由（MPContribs / 論文 supplementary） | 装置間・研究室間（該当データセットに依存） | 個別（要確認） | 小-中 | △〜◎（該当データセット確認要） |
 | NIST SRD（Standard Reference Data） | 認証値・不確かさ（raw 階層は SRD 製品による）| Public Domain（一部有償・要ライセンス） | 大 | ◎（Bayesian 校正）／raw 階層は要確認 |
 | NOMAD Repository | 計算ラボ × 手法 | メタデータ CC BY / 個別 DS は別 | 巨大 | ◯（計算 vs 実験） |
-| RRUFF Raman | 試料 × 装置 | 教育研究用 | 中 | ◯（第13章 Layer 1-2） |
+| RRUFF Raman | 試料 × 装置 | 教育研究用 | 中 | ◯（第14章 Layer 1-2） |
 | MatBench | 単一データセット | CC BY（原データ別） | 中 | ×（階層構造なし・校正の認証値でもない） |
 | ChemBench | 化学 benchmarks | 個別 | 中 | △ |
 | PDB (Protein Data Bank) | 装置 × 手法 | Public Domain | 巨大 | △（材料外） |
@@ -291,10 +291,10 @@ print("x64 enabled:", jax.config.jax_enable_x64)
       # MPContribs / 論文 supplementary から個別取得する
       docs = mpr.summary.search(...)
   ```
-- **本書での用途**：第11章 §11.4 の装置効果モデル、第13章 Layer 3 の階層モデル（**要出典確認**）
+- **本書での用途**：第12章 §12.4 の装置効果モデル、第14章 Layer 3 の階層モデル（**要出典確認**）
 - **注意点**：
   - `mpr.summary.search` は round-robin 実験データを直接返さない。**MPContribs / 論文 supplementary を明示的に指す**
-  - 装置数（inst_count）が 3〜5 と少ない場合、`sigma_inst` の事後が prior に依存（Ch14 §14.5 パターン B）
+  - 装置数（inst_count）が 3〜5 と少ない場合、`sigma_inst` の事後が prior に依存（Ch14 §15.5 パターン B）
   - **API key の取り扱い**：commit しない、`.env` で管理
 
 ### C.8.3 NIST SRD
@@ -320,7 +320,7 @@ print("x64 enabled:", jax.config.jax_enable_x64)
 - **URL**：<https://nomad-lab.eu/>
 - **ライセンス**：**CC BY 4.0**（メタデータ）+ 個別データセットのライセンス
 - **アクセス**：`nomad` Python パッケージ、または API
-- **本書での用途**：**計算コード × 手法**の階層構造（第13章拡張）
+- **本書での用途**：**計算コード × 手法**の階層構造（第14章拡張）
 - **注意点**：
   - 計算データなので観測誤差は擬似的（数値誤差）
   - 手法（DFT-GGA / DFT-LDA / DFT-hybrid）を階層のレベルとして扱う
@@ -332,10 +332,10 @@ print("x64 enabled:", jax.config.jax_enable_x64)
 - **URL**：<https://rruff.info/>
 - **ライセンス**：**教育・研究用途で自由**（詳細は個別確認）
 - **入手**：Web からの直接ダウンロード（バルク API なし）
-- **本書での用途**：第13章 Layer 1（sklearn 分類）、Layer 2（Bayesian 校正）
+- **本書での用途**：第14章 Layer 1（sklearn 分類）、Layer 2（Bayesian 校正）
 - **注意点**：
   - 励起波長・装置ごとにスペクトルの形状が変わる → group_key として `excitation_wavelength` or `instrument_id`
-  - **同一鉱物が train/test 両方に入らない**よう GroupKFold 必須（Ch14 §14.2 B）
+  - **同一鉱物が train/test 両方に入らない**よう GroupKFold 必須（Ch14 §15.2 B）
 
 ### C.8.6 ARIM 公開データ（本書の第一候補）
 
@@ -345,11 +345,11 @@ print("x64 enabled:", jax.config.jax_enable_x64)
 - **ライセンス**：**個別データセットごとに一次確認する**（ARIM 全体で単一ライセンスとは限らない）
 - **入手**：拠点ごとの公開データセット、ARIM DX 事業のデータ基盤
 - **階層構造**：**装置（inst）× 拠点（facility）× 試料（sample）× ロット（lot）** の 4 階層
-- **本書での用途**：**第11章・第13章の第一候補**
+- **本書での用途**：**第12章・第14章の第一候補**
 - **注意点**：
-  - **本書の Ch02 §2.9 で CC BY-NC-SA 4.0 と明記しているのは、本書が同梱する「ARIM 風合成階層データ」のライセンス**であって、実 ARIM 公開データのライセンスとは別。実データを使う場合は該当データセット／ポータルの利用規約を必ず一次確認する
+  - **本書の Ch02 §3.9 で CC BY-NC-SA 4.0 と明記しているのは、本書が同梱する「ARIM 風合成階層データ」のライセンス**であって、実 ARIM 公開データのライセンスとは別。実データを使う場合は該当データセット／ポータルの利用規約を必ず一次確認する
   - もし実データが CC BY-NC 系の場合、Skill を商用製品に組み込む用途では利用不可
-  - `arim_context.instrument_id`, `facility_id`, `sample_id`, `lot_id` を provenance に記録（Ch15 §15.5.3）
+  - `arim_context.instrument_id`, `facility_id`, `sample_id`, `lot_id` を provenance に記録（Ch15 §16.5.3）
   - **拠点間で単位表記が異なる場合**：Ch4 のデータ契約で単位統一を必須化
 
 ### C.8.7 データ選定判断フロー
@@ -378,7 +378,7 @@ Q4: 教育・演習が主目的？
 |---|---|
 | ライセンス | 用途（研究／商用／再配布）に対して明示的に許諾されている |
 | 階層キー | `inst_id` / `facility_id` / `lot_id` 等が **明示的に取得可能** |
-| Group 数 | `n_group ≥ Ch11 §11.4 の applicability domain 最小値`（例: `inst ≥ 3`）|
+| Group 数 | `n_group ≥ Ch11 §12.4 の applicability domain 最小値`（例: `inst ≥ 3`）|
 | 不確かさ | 認証値・観測不確かさが提供されている（Bayesian 校正用途）|
 | 取得再現性 | API / 静的ダウンロードで **バージョン付き** に再取得できる |
 | Citation | 引用形式（DOI / BibTeX 等）が公開されている |
@@ -392,8 +392,8 @@ Q4: 教育・演習が主目的？
 - [ ] **アクセス制限**（API key, 認証）を `.env` / secret manager で管理
 - [ ] **データバージョン**を provenance の `dataset_sha256` に記録（Ch4）
 - [ ] **単位・欠損・外れ値**を EDA で確認（Ch4 のデータ契約）
-- [ ] **階層構造の group 数**（inst_count, lot_count 等）を確認（Ch11 §11.4 の applicability domain）
-- [ ] **合成データではない**ことを `data_source: real` として provenance に記録（Ch14 §14.8）
+- [ ] **階層構造の group 数**（inst_count, lot_count 等）を確認（Ch11 §12.4 の applicability domain）
+- [ ] **合成データではない**ことを `data_source: real` として provenance に記録（Ch14 §15.8）
 
 ---
 
@@ -416,14 +416,14 @@ vol-02 本編と 3 付録はここで完結です。
 
 ### 本書内の該当章
 
-- 第4章：データ契約・provenance
-- 第7章 / 第14章 §14.2：データリーク
-- 第10章 §10.9 / 第14章 §14.7：バックエンド差
-- 第11章 §11.4：階層モデル applicability domain
-- 第12章 §12.9：MCMC 診断 14 項目
-- 第14章 §14.5：prior 暴走
-- 第14章 §14.8：合成 vs 実データ
-- 第15章 §15.5.3：arim_context provenance
+- 第5章：データ契約・provenance
+- 第8章 / 第15章 §15.2：データリーク
+- 第11章 §11.9 / 第15章 §15.7：バックエンド差
+- 第12章 §12.4：階層モデル applicability domain
+- 第13章 §13.9：MCMC 診断 14 項目
+- 第15章 §15.5：prior 暴走
+- 第15章 §15.8：合成 vs 実データ
+- 第16章 §16.5.3：arim_context provenance
 - 付録A A.7：完全 provenance schema
 - 付録B B.3, B.4：バックエンド・MCMC 対処
 

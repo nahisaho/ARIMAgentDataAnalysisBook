@@ -1,597 +1,524 @@
-# 第7章 転移学習 / fine-tuning を Skill 化する — Agentic 判断つき
+# 第7章　教師あり深層 Agentic Skill を作る
+
+第6章で用意した **`deep_split_contract`** と **`augmentation_contract`** を土台に、この章では 3 つの**教師あり深層 Agentic Skill** をハンズオン化します。すべて **ARIM 風合成データ**を主軸に使い、公開ベンチマークは補助的な対比としてのみ挙げます。
+
+vol-02 第6章の教師あり ML Skill（線形・PLS・RF・GBM）と、この章のハンズオン A（1D CNN）は同じ「スペクトル分類」タスクを扱います。**同じデータに古典 ML と深層を並置**し、どちらを選ぶかの判断根拠を明示することが、この章の隠れた目的です。
 
 > [!NOTE]
-> **本章の到達目標**
-> - **転移学習 4 戦略**（frozen feature extractor / partial fine-tune / full fine-tune / LoRA・PEFT）を、データ規模・装置固有性・計算資源から**機械的に**選び分けられる
-> - **事前学習重みの分布外検知**（feature-level domain gap early warning）を Skill に組み込める
-> - **装置ごとに fine-tune 戦略を切り替える判断表**を書ける（同じデータ型でも装置が違えば戦略が変わる）
-> - **「今日のバッチだけで再 fine-tune するか」の承認ゲート**を設計できる
-> - **少データ材料での fine-tune 評価戦略**（vol-02 第7章 CV 設計を深層に、grouped × few-shot × 事前学習の 3 軸）を実装できる
-> - **エージェントに fine-tune を実行させる Skill** において、勝手にモデルを更新できない契約を書ける
+> **この章の到達目標**：
+> - 教師あり深層 Skill 3 種（1D CNN / 2D CNN / Tabular Transformer）の**契約と実装スケルトン**を書ける
+> - 各 Skill で **「エージェントが判断する場面」** と **「Human 承認ゲートを通す場面」** を分けられる
+> - vol-02 の GBM と 1D CNN の比較で「深層を選ぶべきタイミング」を根拠つきで語れる
+> - epoch 数決定・early stopping 起動・分布外検知後の停止を契約フィールドで書ける
 >
-> **本章で扱わないこと**
-> - Foundation Model の内部構造・アーキテクチャ詳細 → **第11章**（FM）
-> - 事前学習そのもの（大規模データからの自己教師あり学習） → **第12章**（SSL）
-> - 不確かさの本格的な扱い（BNN / Deep Ensemble / Predictive Entropy） → **第8-9章**
-> - ハイパーパラメータの Bayesian Optimization → **vol-04**（第7章末の道しるべ）
+> **この章で扱わないこと**：
+> - 転移学習・fine-tuning（第8章）
+> - 不確かさ推定（第8-9章、この章では確定的予測のみ）
+> - Attribution / Grad-CAM（第11章）
+> - Foundation Model（第12章）
 
 ---
 
-## 7.1 この章で作る Skill
+## 7.1 この章で作る 3 Skill と共通ラッパー
 
-3 つの **転移学習 Agentic Skill** と 1 つの **判断表** を作ります。
+この章では 3 つの Skill と 1 つの共通ラッパーを作ります。すべて第5章 §5.9 のテンプレート（7 セクション）に従います。
 
-| Skill | データ型 | ベース戦略 | 想定装置 |
+| Skill 名 | データ型 | モデル | 目的 |
 |---|---|---|---|
-| **`spectrum_transfer_1d`** | 1D スペクトル（IR / Raman） | 事前学習 1D CNN → head 交換 + partial fine-tune | 装置 A（校正済み） / 装置 B（新規） |
-| **`sem_transfer_2d`** | 2D 画像（SEM） | ImageNet 事前学習 ResNet18 → LoRA fine-tune | SEM 装置 α / β / γ |
-| **`tabular_transfer`** | Tabular（組成・実験条件） | 事前学習 FT-Transformer → frozen feature + linear head | 装置横断（tabular） |
+| **`spectrum_cnn_classifier`** | スペクトル（IR/Raman） | 1D CNN | ARIM 風合成 IR スペクトルの材料クラス分類 |
+| **`sem_cnn_classifier`** | SEM 画像 | 2D CNN | ARIM 風合成 SEM 画像の相分類（結晶 / 非晶質 / 混合） |
+| **`composition_transformer`** | Tabular（組成・実験条件） | FT-Transformer | ARIM 風合成組成データからの物性予測（回帰） |
+| **`deep_supervised_runner`**（ラッパー） | 上記 3 種を共通 API で駆動 | — | 契約検証・provenance 記録・エージェント権限 enforcement |
 
-さらに、**判断表と承認ゲート**を成果物として設計します。
-
-- **成果物 4**：装置別 fine-tune 戦略判断表（`instrument_finetune_decision_table.yaml`）
-- **成果物 5**：日次 re-fine-tune 承認ゲート仕様（`daily_refinetune_gate.yaml`）
-
-各 Skill は第4章の 7 セクション仕様書、第5章の 2 契約（`deep_split_contract` + `augmentation_contract`）、第6章の `training_config.yaml` を継承した上で、**転移学習に特有の追加契約 3 種**を導入します：
-
-1. **`pretrained_weights` provenance**（第4章 Layer 2 の厳格版）
-2. **`domain_gap_gate`**（feature-level 分布外検知）
-3. **`refinetune_authorization`**（日次 / バッチ単位の再学習権限）
+**「エージェントが判断する場面」を各 Skill に明示**することが、この章の中核です（第5章 §5.7 の L1-L3 権限を具体化）。
 
 ---
 
-## 7.2 なぜこの章が必要か — vol-02 第7章の限界と ARIM の現実
+## 7.2 3 ハンズオンの位置づけと vol-02 との対比
 
-### vol-02 第7章 vs vol-03 第7章
+### vol-02 第6章との対応
 
-vol-02 第7章では **CV 設計とデータリーク検知** を扱いました。それは「モデルは自分で学習する」前提でした。しかし現実の ARIM データでは：
+vol-02 §6.6-5.8 のハンズオン A/B/C（校正曲線 Skill / 物性予測 Skill / スペクトル分類 Skill）と、この章のハンズオンには **1 対 1 の対応がある部分と、対応がない部分**があります。
 
-- **単一装置の実験室スケール**では、深層モデルを **from-scratch で学習するデータが足りない**（第6章 §6.7 の議論）
-- 一方で **公開の事前学習モデル**（ImageNet, ChemBERTa, Uni-Mol, Raman-FM 等）は装置分布の外にある
-- **装置ごとに fine-tune 戦略を変える**必要がある：装置 A では frozen feature で十分、装置 B では partial fine-tune が必要、装置 C では LoRA、といった判断が発生する
+| 目的 | vol-02（古典 ML） | vol-03（深層） | どちらを選ぶ判断 |
+|---|---|---|---|
+| スペクトル分類 | ハンズオン C（PLS + GBM） | **ハンズオン A：1D CNN** | サンプル数 n ≥ 1000 かつピーク位置が装置間で変動、あるいは非線形な相互作用が支配的な場合に深層 |
+| 画像分類 | vol-02 は扱わない | **ハンズオン B：2D CNN** | 画像は原理的に深層が優位（vol-02 で扱わなかった） |
+| 組成 → 物性予測（回帰） | ハンズオン B（RF + GBM） | **ハンズオン C：FT-Transformer** | サンプル数 n ≥ 500 かつ交互作用が高次、あるいは異種特徴（連続 + カテゴリ）を扱う場合に**検証対象の境界域**。**n < 500 ならほぼ常に GBM 優位**。**GBM を mandatory baseline とし、上回れるか検証する立場**でのみ深層を検討する |
 
-```mermaid
-flowchart TB
-    A["新しい ARIM データバッチ"] --> B{"事前学習モデルの分布内?"}
-    B -->|"Yes (domain gap 小)"| C["frozen feature extractor<br/>+ linear head 再学習のみ"]
-    B -->|"No (domain gap 中)"| D{"データ量 n"}
-    B -->|"分布外 (domain gap 大)"| E["Human review<br/>→ 事前学習モデルの見直し"]
-    D -->|"n < 100"| F["frozen feature + head fine-tune"]
-    D -->|"100 <= n < 1000"| G["LoRA / PEFT<br/>partial fine-tune"]
-    D -->|"n >= 1000"| H["full fine-tune<br/>（承認ゲート必要）"]
-```
-
-**Agentic 特有の課題**：
-
-- **エージェントが勝手に fine-tune を起動**：GPU 時間・エネルギー・checkpoint の管理を無視して自律実行し、結果として整合性が崩れる
-- **エージェントが domain gap を無視**：事前学習分布から遠いデータに対しても「fine-tune すれば大丈夫」と誤った自信を持つ
-- **エージェントが日次 re-fine-tune を暴走**：新バッチ到着のたびに再学習し、モデルが日毎に変わる（provenance が追えない）
-
-この章は、これら 3 つの Agentic 特有問題を **契約と承認ゲート** で解決します。
-
----
-
-## 7.3 転移学習 4 戦略の比較と選択基準
-
-### 4 戦略の定義
-
-| 戦略 | 説明 | 更新される重み | 計算コスト | 破壊リスク |
-|---|---|---|---|---|
-| **A. Frozen feature extractor + linear head** | 事前学習モデルを固定、最終層のみ線形分類器で学習 | linear head の重みのみ | 極低 | ほぼゼロ |
-| **B. Partial fine-tune (last N layers)** | 最終 N 層のみ更新、他は frozen | 最終 N 層 + head | 低〜中 | 中 |
-| **C. LoRA / PEFT** | 各層に低ランク adapter を挿入し、adapter のみ更新 | adapter 重み（元重み変更なし） | 中 | 低（元重み保持） |
-| **D. Full fine-tune** | 全層を更新 | 全重み | 高 | 高（catastrophic forgetting） |
-
-### 選択マップ
+### 「深層を選ぶべきか」の判断基準（この章の裏テーマ）
 
 ```mermaid
 flowchart TD
-    A["新規データ n サンプル"] --> B{"normalized_gap_0_1<br/>(§7.5 の実 Mahalanobis を calibration の<br/>99% タイル値で正規化)"}
-    B -->|"小 (< 0.2)"| C{"n"}
-    B -->|"中 (0.2-0.5)"| D{"n"}
-    B -->|"大 (> 0.5)"| E["Human review<br/>事前学習モデル自体を再選定"]
-    C -->|"< 100"| C1["A: Frozen + linear head"]
-    C -->|">= 100"| C2["A または B: partial fine-tune 検討"]
-    D -->|"< 100"| D1["A: Frozen + head<br/>(データ不足で fine-tune 危険)"]
-    D -->|"100-1000"| D2["C: LoRA 推奨"]
-    D -->|">= 1000"| D3["B または D: partial or full fine-tune"]
+    START["教師あり分類/回帰タスク"] --> Q1{"データ型は?"}
+    Q1 -- "画像 / 高次元テンソル" --> D2["深層 (2D/3D CNN, ViT)"]
+    Q1 -- "スペクトル / 時系列" --> Q2{"n >= 1000?"}
+    Q1 -- "Tabular" --> Q3{"n >= 500?"}
+    Q2 -- "Yes" --> D1["深層 (1D CNN) を第一候補"]
+    Q2 -- "No" --> CM1["古典 ML (PLS/GBM) を第一候補、vol-02 参照"]
+    Q3 -- "Yes" --> Q4{"異種特徴 or 高次交互作用?"}
+    Q3 -- "No" --> CM2["GBM (vol-02) を第一候補"]
+    Q4 -- "Yes" --> D3["Tabular Transformer を試す"]
+    Q4 -- "No" --> CM3["GBM 継続を推奨"]
+```
+
+> [!IMPORTANT]
+> **n < 500 の tabular では、深層は GBM に負けます**（研究論文でも繰り返し確認されている）。この章のハンズオン C はあくまで「Tabular Transformer を試す方法」を示しますが、**採用するかは vol-02 GBM との対比で判断**します（§7.8）。
+
+---
+
+## 7.3 教師あり深層 Skill の共通構造
+
+3 ハンズオンすべてに共通する Skill 構造を先に定義します。第5章 §5.9 テンプレートを埋めた形です。
+
+### 契約セットの構成
+
+```
+skills/spectrum_cnn_classifier/          # ハンズオン A
+├── skill.yaml                            # 第5章 §5.9 テンプレート
+├── split_contract.yaml                   # 第6章 §6.3
+├── augmentation_contract.yaml            # 第6章 §6.5
+├── model_config.yaml                     # モデル固有ハイパー
+├── training_config.yaml                  # 学習ループ設定 + agent 権限
+├── ci_smoke_test.yaml                    # 第5章 §5.5
+└── src/
+    ├── model.py                          # 1D CNN 定義
+    ├── train.py                          # 学習ループ（契約 assert 込み）
+    ├── predict.py                        # 推論
+    └── provenance_writer.py              # 第5章 3 レイヤ provenance
+```
+
+### `training_config.yaml`（この章の中心）
+
+```yaml
+# training_config.yaml — 3 Skill 共通スキーマ
+version: "1.0"
+
+# 学習ループ設定（決定的部分は Human 固定）
+loop:
+  max_epochs_hard_cap: 30           # Human 固定の絶対上限。エージェントは変更不可
+  agent_requested_epochs: 15        # エージェントが選ぶ実行 epoch 数（hard cap 以下）
+  batch_size: 32
+  optimizer:
+    name: "AdamW"
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+  lr_scheduler:
+    name: "cosine"
+    warmup_epochs: 2
+  loss:
+    name: "cross_entropy"           # 分類の場合
+    label_smoothing: 0.05
+  gradient_clip_norm: 1.0
+
+# early stopping（エージェント判断可の代表例）
+early_stopping:
+  enabled: true
+  monitor: "val_f1_macro"
+  mode: "max"
+  patience: 5
+  min_delta: 0.005
+  agent_can_trigger: true           # エージェントが起動判断可
+  agent_can_disable: false          # 無効化は不可（audit violation）
+  agent_can_change_patience: false  # patience 変更は不可
+
+# 分布外検知後の停止（forward reference: 実装は第8-9章）
+# この章の 3 ハンズオンでは OOD スコアの実装は保留し、gate 定義のみ契約に残す
+ood_stop_gate:
+  enabled: false                    # 第8-9章で enabled: true に切り替え
+  status: "forward_reference"       # 第9章 predictive_entropy / 第10章 ensemble variance で実装
+  monitor: "val_ood_score_placeholder"
+  # 実装候補（第8-9章で選択）：
+  # - max_softmax_probability（第9章 §9.3）
+  # - predictive_entropy_normalized（第9章）
+  # - deep_ensemble_variance（第9章）
+  # - mahalanobis_distance_on_penultimate（第11章参考）
+  threshold: 0.3                    # 例示；実装後に装置校正データから導出
+  action: "stop_and_route_to_human"
+
+# エージェント権限（第5章 §5.7 と連動）
+agent_authorization:
+  level: L2
+  training_job_approval:
+    required: true
+    approver: "lab_admin@example.com"
+    approval_record_id: "APP-2026-0201-01"
+    approved_hp_range:
+      lr: [1.0e-4, 3.0e-3]
+      # epochs はエージェントが選ぶ範囲。max_epochs_hard_cap を超えられない
+      epochs: [5, 30]
+      batch_size: [16, 64]
+  checkpoint_overwrite_policy: "append_only"
+  uncertainty_stop_gate:
+    metric: "predictive_entropy_normalized"
+    threshold: 0.3
+    on_exceed: "route_to_human"
+  # 第5章 rubber-duck 追加分。この章は全て from-scratch のため、
+  # 外部重み読み込みは発生しない。第8章以降で厳格化する
+  weight_source: "from_scratch"      # from_scratch / pretrained_hf / pretrained_local
+  weight_load_policy:
+    applicable: false                # weight_source: from_scratch のときは適用外
+    # 第8章以降で外部重みを読む場合、以下 4 項目を必ず true にする
+    torch_load_weights_only: true
+    require_safetensors: true
+    require_weights_sha256_verified: true    # 第8章以降で必須
+    revision_must_be_commit_hash: true       # 第8章以降で必須
+    trust_remote_code: false
+```
+
+### 学習ループの契約 assert（実装スケルトン）
+
+**契約 assert は Skill 起動直後（train 開始前）に集中実行**します。以下は fatal / audit violation を fail-fast させる骨格です。
+
+```python
+# train.py — 契約検証込みの学習ループ骨格
+def _startup_asserts(config, split_contract, aug_contract, split_indices):
+    # [A] Augmentation 契約（fatal）
+    assert aug_contract["applied_scope"]["val"] is False, "fatal: val augmentation"
+    assert aug_contract["applied_scope"]["test"] is False, "fatal: test augmentation"
+    assert split_contract["augmentation_scope"]["applied_to"] == ["train"], "fatal: scope"
+    for aug in aug_contract.get("prohibited_augmentations", []):
+        assert aug["name"] not in aug_contract.get("selected_augmentations", []), \
+            f"fatal: prohibited augmentation selected: {aug['name']}"
+
+    # [B] Split 検証（fatal）
+    train_idx, val_idx, test_idx = split_indices
+    assert set(train_idx).isdisjoint(val_idx), "fatal: train/val overlap"
+    assert set(train_idx).isdisjoint(test_idx), "fatal: train/test overlap"
+    assert set(val_idx).isdisjoint(test_idx), "fatal: val/test overlap"
+    # grouped CV での装置別リークがないか
+    if split_contract["split_scheme"].get("group_key"):
+        assert _no_group_leakage(split_indices, split_contract), \
+            "fatal: instrument leakage across splits"
+
+    # [C] エージェント権限（audit violation）
+    auth = config["agent_authorization"]
+    assert auth["level"] in ("L1", "L2", "L3"), "audit: invalid level"
+    if auth["level"] == "L1":
+        raise RuntimeError("audit: L1 agents cannot execute training. "
+                           "training_config を Human または L2+ で実行")
+    assert auth["training_job_approval"]["required"], "audit: approval missing"
+    assert auth["training_job_approval"].get("approval_record_id"), \
+        "audit: no approval_record_id (job launch blocked)"
+    hp = auth["training_job_approval"]["approved_hp_range"]
+    assert hp["lr"][0] <= config["loop"]["optimizer"]["lr"] <= hp["lr"][1], \
+        "audit: lr out of approved range"
+    assert hp["batch_size"][0] <= config["loop"]["batch_size"] <= hp["batch_size"][1], \
+        "audit: batch_size out of approved range"
+
+    # [D] max_epochs hard cap（audit violation）
+    assert config["loop"]["agent_requested_epochs"] <= config["loop"]["max_epochs_hard_cap"], \
+        "audit: agent_requested_epochs exceeds hard cap"
+    assert hp["epochs"][1] <= config["loop"]["max_epochs_hard_cap"], \
+        "audit: approved_hp_range.epochs exceeds hard cap"
+
+    # [E] Checkpoint policy（fatal on unapproved overwrite）
+    policy = auth["checkpoint_overwrite_policy"]
+    assert policy in ("append_only", "overwrite_with_approval"), "audit: invalid policy"
+
+    # [F] OOD gate / uncertainty gate の monitor 存在確認
+    if config["ood_stop_gate"]["enabled"]:
+        assert config["ood_stop_gate"]["monitor"] != "val_ood_score_placeholder", \
+            "fatal: OOD gate enabled but monitor not implemented (see Ch08-09)"
+
+    # [G] Weight load policy（外部重みを使う場合のみ）
+    if config.get("weight_source", "from_scratch") != "from_scratch":
+        wlp = config["weight_load_policy"]
+        assert wlp["torch_load_weights_only"] is True, "fatal: unsafe torch.load"
+        assert wlp["require_safetensors"] is True, "fatal: safetensors required"
+        assert wlp["require_weights_sha256_verified"] is True, "fatal: sha256 required"
+        assert wlp["revision_must_be_commit_hash"] is True, "fatal: commit hash required"
+        assert wlp["trust_remote_code"] is False, "fatal: trust_remote_code=True forbidden"
+
+    # [H] Determinism / provenance（audit violation）
+    assert config.get("torch_deterministic_algorithms", True), \
+        "audit: deterministic algorithms disabled without justification"
+
+
+def train(config: dict, split_contract: dict, aug_contract: dict) -> None:
+    # [1] 起動時契約 assert（fail-fast）
+    split_indices = compute_splits(split_contract)
+    _startup_asserts(config, split_contract, aug_contract, split_indices)
+
+    # [2] provenance 3 レイヤ初期化（第5章 §5.4）
+    prov = ProvenanceWriter()
+    prov.record_layer1_gpu()               # cuda_version / cudnn / 実 worker seed
+    prov.record_layer2_weights(config)     # from_scratch の場合は weight_source のみ記録
+    prov.record_layer3_training(config)
+
+    # [3] エージェント HP 選択（L2 権限内で選択、範囲外は起動時 assert で捕捉済み）
+    lr = agent_select_hp("lr", config["agent_authorization"]["training_job_approval"]["approved_hp_range"])
+    prov.record_agent_decision(name="lr", value=lr, reason="warm restart")
+
+    # [4] 学習ループ本体（略）
+    # [5] early stopping / OOD stop の起動記録
+    # [6] provenance を append_only で書き出す
+    prov.commit(path="runs/2026-02-01/provenance.yaml")
+```
+
+> [!IMPORTANT]
+> **契約 assert は Skill 起動直後に実行**します。契約違反は学習開始前に fatal で停止させます。「学習を回してから気づく」では手遅れです（GPU 時間・エネルギーの無駄）。**8 種類のチェックカテゴリ**（A-H）を上記に集約しています。
+
+---
+
+## 7.4 ハンズオン A：1D CNN 分類 Skill（ARIM 風合成スペクトル）
+
+### タスク
+
+- 入力：IR スペクトル（波数 4000-400 cm⁻¹、リサンプル後 1024 点）
+- 出力：材料クラス 5 種の 1 つを予測、および分類確率
+- データ：**5 装置 × 各クラス 200 サンプル × 5 クラス = 5000 サンプル**（合成）
+- 装置間差：`rescale_intensity ±10%`、`axis_shift ±2 cm⁻¹`（第6章の contract に対応、**例示値**）
+
+> [!NOTE]
+> **本章のデータはすべて教材用の合成データ**です。実 ARIM データは含まれません。読者は自環境で `generate_synthetic_deep.py`（付録想定、Phase 1 asset）を使って生成し、**生成器の SHA と seed を provenance に必ず記録**してください（第5章 Layer 3 の一部）。実 ARIM データに Skill を適用する際は、装置種別・測定条件に合わせて `augmentation_contract` を書き直します。
+
+### モデル設計（1D CNN）
+
+**注**：以下の kernel/channel サイズは教材上のベースライン例です。実データでは smoke test を通してから NAS / grid search で調整します。
+
+```python
+class Spectrum1DCNN(nn.Module):
+    """
+    ARIM 風合成 IR スペクトル分類用の 1D CNN（教材ベースライン）。
+    - 入力: (batch, 1, 1024)
+    - 出力: (batch, 5)  # ロジット
+    - kernel 7/5/3 は 1024 点スペクトルに対する compact baseline。
+      最適値は自データで確認すること。
+    """
+    def __init__(self, n_classes: int = 5):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=7, padding=3),
+            nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128), nn.ReLU(), nn.AdaptiveAvgPool1d(1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(x))
+```
+
+### エージェントが判断する場面（この Skill の 5 箇所）
+
+| # | 判断場面 | L2 で許可される動作 | Human ゲート |
+|---|---|---|---|
+| 1 | 学習率の初期値選択 | `approved_hp_range.lr` 内から選択可 | 範囲外は `training_job_approval` |
+| 2 | epoch 数の決定（early stopping 経由） | `patience` は固定、閾値超過で自動停止可 | `agent_can_disable: false` |
+| 3 | augmentation 強度の選択 | 第6章 `augmentation_contract` の `strength_range` 内 | 範囲外は audit violation |
+| 4 | 予測時の不確かさ閾値超過 | `predictive_entropy_normalized > 0.3` で自律停止し Human 送り | Human は個別サンプルを判断 |
+| 5 | 分布外検知（OOD） | 第8-9章実装後、閾値超過で `stop_and_route_to_human` | この章では forward reference（`ood_stop_gate.enabled: false`） |
+
+### エージェントに**許されない**判断（この Skill）
+
+- モデルアーキテクチャの変更（`Conv1d` の kernel_size を変える等）
+- optimizer の変更（AdamW → SGD 等）
+- loss 関数の変更（cross_entropy → focal loss 等）
+- augmentation 種類の追加（第6章 §6.7 全レベル禁止）
+- val/test への augmentation 適用
+
+### CI CPU smoke test
+
+**smoke test の目的は「モデルが動くこと」の確認**であり、精度は指標にしません。品質不変条件（NaN なし・loss 有限・形状正しい・train のみに augmentation）に絞ります。
+
+```yaml
+# ci_smoke_test.yaml
+data_subset:
+  n_samples_per_class: 4         # 5 クラス × 4 = 20
+  n_instruments: 2               # 5 装置中 2 装置のみ
+epochs: 2
+batch_size: 8
+augmentation:
+  applied: true
+  reduced_strength: 0.5
+expected_invariants:
+  loss_finite: true              # inf / NaN が出ない
+  loss_decrease: true            # 2 epoch で loss が下降傾向（monotone は不要）
+  no_nan_in_gradients: true
+  output_shape: [8, 5]           # (batch=8, n_classes=5)
+  augmentation_only_on_train: true
+# 精度チェックは overfit-tiny test で行う（別ジョブ）
+overfit_tiny_test:
+  enabled: false                 # 追加時に true。20 サンプル・augmentation なしで
+                                 # 30 epoch 回して train accuracy > 0.9 が達成できるか
 ```
 
 > [!NOTE]
-> **上記の閾値（n < 100, gap < 0.2 等）は教材上の経験則**です。実際は事前学習分布・タスク種別・augmentation の効き方・GBM ベースラインとの比較で境界が動きます。**この判断表は Skill 設計のための出発点**であり、**必ず自データで frozen ベースライン → LoRA → full の順に検証**してから採用してください。
+> **CI での精度チェックは避ける**。2 epoch × 20 サンプル × augmentation ありで「accuracy > 0.4」のような閾値は seed 依存で flaky になります。精度を確認したい場合は `overfit_tiny_test`（augmentation を切って過学習させ、実装バグを検出）を別ジョブで走らせます。
 
-> [!IMPORTANT]
-> **domain gap のスケールと指標について**：本章では 2 種類の domain gap を使い分けます。
-> - **`normalized_gap_0_1`**（0-1 範囲、§7.3 の選択マップおよび §7.6 の判断表で使用）：**教材上の相対指標**。実装は Mahalanobis を calibration set の 99% タイル値で正規化するなど、値域を 0-1 に押し込めた形。
-> - **`mahalanobis_squared`**（実距離、§7.5 の gate 計算で使用）：`sklearn.covariance.*.mahalanobis()` が返す squared Mahalanobis 距離。値域は 0 〜 ∞。
->
-> 契約 YAML では `method` フィールドで明示し、**同じ変数名で異なるスケールを扱わない**ようにしてください。
+---
 
-### エージェントに任せられる/任せられない
+## 7.5 ハンズオン B：2D CNN 分類 Skill（ARIM 風合成 SEM 画像）
 
-| 判断場面 | L1 | L2 | L3 | 説明 |
-|---|:---:|:---:|:---:|---|
-| Skill 実行（推論） | ✅ | ✅ | ✅ | どの level でも推論は可 |
-| **frozen feature の linear head 再学習** | ❌ | ✅ | ✅ | L2 は事前承認範囲内で可 |
-| **LoRA fine-tune の起動** | ❌ | ✅ | ✅ | `refinetune_authorization` 内で可 |
-| **partial fine-tune の起動** | ❌ | ⚠️ | ✅ | L2 は `daily_refinetune_gate` などの Human 承認 gate を通せば可 |
-| **full fine-tune の起動** | ❌ | ❌ | ⚠️ | L3 の事前承認ワークフローに **full fine-tune が明示的に scope 内**でかつ都度 Human sign-off がある場合のみ可（本章は Ch04 §4.7 L3 定義より厳格化） |
-| **事前学習モデルの差し替え** | ❌ | ❌ | ❌ | 全レベル禁止（Human 契約変更） |
-| **domain gap 閾値の変更** | ❌ | ❌ | ❌ | 全レベル禁止 |
+### タスク
+
+- 入力：SEM 画像（256×256 グレースケール、5 装置分の合成）
+- 出力：相分類（結晶 / 非晶質 / 混合、3 クラス）
+- 装置間差：ノイズレベル・コントラスト・スケールバー位置
+
+### 契約の追加要件（画像特有）
+
+**結晶方位ありの場合の augmentation contract**（第6章 §6.5 の `image_crystalline.yaml`）：
+
+```yaml
+data_type: "image"
+orientation_semantics: "anisotropic_with_growth_direction"  # 結晶方位あり
+allowed_augmentations:
+  - name: "rescale_intensity"
+    strength_range: [0.85, 1.15]
+  - name: "additive_noise"
+    sigma_range: [0.01, 0.03]
+  - name: "small_rotation"
+    physical_validity: "conditional"
+    angle_range_deg: [-5, 5]         # 成長方向を保つため小角度のみ
+prohibited_augmentations:
+  - name: "large_rotation"            # ±90° / 180° 等
+    severity: "fatal"
+  - name: "mirror_reflection"
+    severity: "fatal"
+  - name: "invert_intensity_sign"
+    severity: "fatal"
+```
+
+**非晶質サンプルは別テンプレート** `image_amorphous.yaml`（`orientation_semantics: isotropic`）を使用。混合の場合は結晶方位が支配的なら `_crystalline.yaml` を使用。**エージェントはテンプレートを選ばず、Human が事前指定**します。
+
+### モデル設計（2D CNN、骨格のみ）
+
+- **ベースライン**：軽量 CNN（Conv-BN-ReLU × 3 段程度）を **from scratch 学習**
+- **ResNet18 は上限例**であり、5 装置 × 200 サンプル × 3 クラス（合計 3000 サンプル）程度では **overfit リスク大**。まず軽量 CNN で smoke + grouped CV を通し、必要に応じて ResNet18 を試す
+- **fine-tuning による ResNet18** は第8章で扱う（ImageNet 事前学習 → SEM 転移）
+- 入力：`(batch, 1, 256, 256)`（グレースケール）→ 3 チャネル複製せず 1ch 入力を扱う分岐アーキテクチャ
+- 出力：`(batch, 3)` ロジット
 
 > [!WARNING]
-> **full fine-tune は L3 でも Human sign-off 必須**とする理由：full fine-tune は事前学習重みを不可逆に上書きし、後続 Skill（推論・attribution）の provenance が変わります。Ch04 §4.7 では L3 は「事前承認ワークフロー ID 内で既存 checkpoint 上書き可」でしたが、**本章では full fine-tune に限り Ch04 より厳格化**し、pre-approved workflow ID に加えて実行直前の Human sign-off も要求します。「元に戻せない変更」は必ず Human ゲートを通す設計です（第4章 §4.7 の 4 承認ゲート思想の徹底）。
+> **from-scratch ResNet18 は装置間 grouped CV で崩れやすい**（特に合成 SEM のような限定的分布）。この章では軽量 CNN を第一候補にし、ResNet18 相当は「grouped CV で崩れないことを確認できたら試す」というオプション扱いです。転移学習は第8章。
+
+### エージェント判断場面（追加）
+
+ハンズオン A の 5 箇所に加え、画像特有：
+
+| # | 判断場面 | 権限 |
+|---|---|---|
+| 6 | 画像サイズの選択（256 / 384 / 512） | `approved_hp_range.image_size` 内から。デフォルトは 256 |
+| 7 | 結晶 / 非晶質テンプレートの選択 | **不可**（Human が事前指定、エージェントは選択しない） |
 
 ---
 
-## 7.4 事前学習重みの provenance 契約（第4章 Layer 2 の厳格版）
+## 7.6 ハンズオン C：Tabular Transformer（FT-Transformer / TabNet）
 
-第4章では `pretrained_weights` の provenance を **Layer 2** として定義しました。転移学習では **この Layer 2 を最も厳しく検証**します。
+### タスク
 
-```yaml
-# pretrained_weights_contract.yaml
-pretrained_weights:
-  source_type: "hf_hub"                    # hf_hub / local_registry / signed_url
-  weights_uri: "hf://microsoft/resnet-18"  # example URI（実在性は各自確認、社内 registry の場合は local_registry）
-  revision: "a1b2c3d4e5f6..."              # commit hash 必須（tag 名不可）
-  weights_sha256: "9f8e7d6c5b4a..."        # 事前計算した SHA256（config 内に直接記録）
-  weights_license: "MIT"
-  pretraining_data_license: "ImageNet-1k (research only)"
-  safetensors_available: true              # true でなければ **fatal (load block)**（Ch06 §6.3 と整合）
-  # 追加契約：pretraining の分布記述
-  pretraining_distribution:
-    modality: "natural_image_rgb_224x224"
-    class_semantics: "generic_object_recognition"
-    n_pretrain_samples: 1281167
-    intended_downstream:
-      - "natural_image_classification"
-      - "transfer_to_texture_analysis"
-    NOT_intended_for:
-      - "scientific_grayscale_imaging"     # SEM は NOT_intended の例
-      - "electron_microscopy"
-  # 追加契約：改変の禁止事項
-  modification_policy:
-    push_to_hub: false                     # 全レベル禁止（第4章 §4.8 継承）
-    revision_change_by_agent: false        # revision 変更は L3 でも不可
-    weight_replacement: false              # weight_source 変更は全レベル禁止
-    trust_remote_code: false               # 常に false
-
-# 起動時契約 assert（第6章 §6.3 の startup_asserts に追加）
-weight_load_policy:
-  torch_load_weights_only: true
-  require_safetensors: true
-  require_weights_sha256_verified: true    # 転移学習では常に true
-  revision_must_be_commit_hash: true       # 転移学習では常に true
-  trust_remote_code: false
-  domain_gap_check_before_training: true   # §7.5 の gate を「重み load 後・学習開始前」に実行
-  # 起動順（実装者向け）:
-  #   1. revision が commit hash 形式か検証
-  #   2. safetensors 存在確認 (fatal if missing)
-  #   3. weights_sha256 事前計算値との照合 (fatal on mismatch)
-  #   4. torch.load(weights_only=True) で安全 load、trust_remote_code=false
-  #   5. penultimate feature 抽出
-  #   6. domain_gap_gate 評価（§7.5）
-  #   7. gate が pass すれば学習/推論を許可
-```
+- 入力：組成データ（連続値 8 列：金属元素比率）+ 実験条件（カテゴリ 3 列：装置種類・雰囲気・温度帯）
+- 出力：物性値 1 つの回帰（例：バンドギャップ eV）
+- サンプル数：**n = 800**（Tabular Transformer を GBM と比較する**検証対象の境界域**。n だけでは採用判断できず、必ず GBM ベースラインと同一 split で比較する）
 
 > [!IMPORTANT]
-> **`pretraining_distribution.NOT_intended_for` フィールドは転移学習の Skill で最重要の防御**です。SEM 画像に対して ImageNet 事前学習を使うのは技術的には可能ですが、**NOT_intended リストに `"electron_microscopy"` が入っていれば、Skill は起動時に warning を出し、Human 確認を必須化**します（後述の §7.5 domain gap gate と連動）。
+> **n = 800 は「GBM に勝てる境界」ではなく「勝てるかを検証すべき境界」**です。実測では n = 5000 でも GBM が上回るケースが珍しくありません（Shwartz-Ziv & Armon, 2022）。**GBM を mandatory baseline** として同じ split で必ず走らせ、F1 / RMSE / ECE の 3 軸で比較してから採用可否を判断してください。
+
+### 契約の追加要件（Tabular 特有）
+
+- **連続値と カテゴリ値の分離**：契約に `numeric_columns` / `categorical_columns` を明示
+- **augmentation**：連続値のみ `additive_noise` + `mixup`、カテゴリ列 permutation は fatal（第6章 §6.5）
+- **grouped CV**：装置間 leakage を避けるため `group_key: "instrument_id"`
+
+### なぜ FT-Transformer を選ぶか
+
+| 特徴 | GBM（vol-02） | FT-Transformer |
+|---|---|---|
+| n < 500 での性能 | 強い | 弱い |
+| n ≥ 500 かつ**異種特徴** | 良好 | 拮抗〜有利 |
+| n ≥ 2000 かつ**高次交互作用** | 頭打ち | 有利 |
+| 学習コスト | 低 | 高（GPU 数分〜） |
+| 解釈可能性 | 中（SHAP 効く） | 低（attention は解釈が難しい） |
+| **推奨判断** | まず試す | GBM のスコアを超えられるか検証 |
+
+### エージェント判断場面（追加）
+
+| # | 判断場面 | 権限 |
+|---|---|---|
+| 8 | Tabular Transformer vs GBM の選択 | **不可**（Human が両方走らせて比較） |
+| 9 | カテゴリ列のエンコーディング方法 | **不可**（契約で `one_hot` / `learned_embedding` を Human 固定） |
+| 10 | mixup 適用強度 | `augmentation_contract` の `strength_range` 内 |
 
 ---
 
-## 7.5 Domain gap early warning — feature-level OOD 検知
+## 7.7 Transformer 骨格の比較（ViT vs 1D Transformer）
 
-事前学習モデルは「学習分布内」のデータに対してのみ性能を保証します。新規 ARIM データが分布外なら、**少データ fine-tune による改善保証はなく、性能低下・不安定化のリスクが高い**（大規模 labeled data があれば分布外でも改善する場合はある）。
+3 ハンズオンで扱わない **ViT / 1D Transformer** も、骨格として比較しておきます（採用判断は第8章の transfer learning と絡めて）。
 
-### なぜ入力ピクセル空間ではなく feature 空間で検知するのか
+### Transformer 骨格の目安（**教材上の経験則、実閾値は実測依存**）
 
-- **入力空間**：SEM 画像 vs 自然画像は明らかに違うが、統計だけでは domain gap の大きさを定量できない
-- **Feature 空間（penultimate layer 出力）**：事前学習モデルが「認識できているか」を直接測れる。calibration set との距離で domain gap を数値化できる
+| 特徴 | 1D CNN（ハンズオン A） | 1D Transformer | ViT | FT-Transformer（ハンズオン C） |
+|---|---|---|---|---|
+| データ | シーケンス（スペクトル） | シーケンス（スペクトル） | 画像 | Tabular |
+| 位置符号化 | 不要（畳み込みが位置を捉える） | 必要（sinusoidal / learned） | 必要（patch embedding） | 特徴量 embedding |
+| n の目安（**経験則・例示**） | ≥ 1000 | **≥ 5000** | **≥ 10000**（scratch）／転移で n ≥ 500 | ≥ 500 |
+| ARIM での適合 | 高 | 低（ARIM 単一装置では n 不足） | 転移前提なら中（第8章） | 中 |
+| 学習コスト | 低 | 中 | 高 | 中 |
 
-### Domain gap の計算方法
-
-```python
-# domain_gap_score.py
-import torch
-import numpy as np
-from sklearn.covariance import LedoitWolf   # 高次元少サンプルで安定（EmpiricalCovariance は避ける）
-
-def compute_domain_gap_mahalanobis_squared(
-    pretrained_model: torch.nn.Module,
-    calibration_features: np.ndarray,   # 事前学習分布の代表サンプル feature（Human が事前に用意）
-    new_batch: torch.Tensor,            # 新規データ（min_batch_size 以上）
-    covariance_estimator: str = "ledoit_wolf",
-) -> float:
-    """
-    事前学習分布と新規データの feature-level squared Mahalanobis 距離を計算。
-
-    注意：
-    - 返り値は **squared** Mahalanobis 距離（sklearn の mahalanobis() の仕様）。
-      値域 [0, ∞)。§7.5 の閾値 (warn/review/stop) はこの squared 値に対する目安。
-    - `LedoitWolf` shrinkage 共分散を使うことで、高次元 feature (>= 256 次元) に
-      対する少サンプル (n < 500) calibration でも安定する。
-    - `EmpiricalCovariance` はサンプル数 << 次元では特異に近づき信頼できない。
-    """
-    pretrained_model.eval()
-    with torch.no_grad():
-        new_features = _extract_penultimate(pretrained_model, new_batch).cpu().numpy()
-
-    if covariance_estimator == "ledoit_wolf":
-        cov = LedoitWolf().fit(calibration_features)
-    else:
-        raise ValueError("high-dim feature には LedoitWolf / OAS shrinkage を推奨")
-
-    # 新規バッチ平均と calibration 平均の squared Mahalanobis 距離
-    return float(cov.mahalanobis(new_features.mean(0, keepdims=True))[0])
-
-
-def compute_normalized_gap_0_1(
-    mahalanobis_squared_value: float,
-    calibration_99th_percentile: float,
-) -> float:
-    """
-    §7.3 選択マップ / §7.6 判断表用の正規化 gap。
-    calibration set 内で計算した Mahalanobis squared の 99% タイル値で正規化し、
-    値を [0, 1] にクリップする（1.0 超は 1.0 に）。
-    """
-    return float(min(mahalanobis_squared_value / calibration_99th_percentile, 1.0))
-```
-
-### Domain gap gate 契約
-
-```yaml
-# domain_gap_gate.yaml
-domain_gap_gate:
-  enabled: true
-  method: "mahalanobis_squared"            # squared Mahalanobis（sklearn 仕様）
-  covariance_estimator: "ledoit_wolf"      # 高次元向け shrinkage（EmpiricalCovariance 禁止）
-  feature_dim: 512                         # penultimate 次元（例：ResNet18 は 512）
-  min_calibration_samples_per_dim: 0.5     # 少なくとも次元数 × 0.5 のサンプルを推奨
-  calibration_set:
-    source: "curated_by_human"
-    n_samples: 200                         # example; feature_dim との比を上記制約で確認
-    reference_uri: "arim://calibration/2026-Q1"
-    reference_sha256: "..."
-    calibration_99th_percentile: 12.5      # normalized_gap_0_1 の正規化定数
-                                           #  （calibration set 内 squared Mahalanobis の 99% タイル）
-  thresholds:                              # squared Mahalanobis の目安（**example; calibration 必須**）
-    warn: 3.0                              # gap 小、fine-tune 可
-    review: 5.0                            # gap 中、Human 確認 → LoRA 推奨
-    stop: 8.0                              # gap 大、事前学習モデル自体を再選定
-  # 上記閾値は模擬 512 次元 feature の例。必ず自 calibration set の分布から
-  # (median, 95% タイル, 99% タイル) を求めて再校正すること
-  action_on_warn: "log_and_continue"
-  action_on_review: "route_to_human"
-  action_on_stop: "block_finetune"
-  # 起動時に必ず実行
-  run_before_training: true                # 重み load 後・学習開始前
-  run_before_inference: true               # 推論時にもチェック（第14章で参照）
-  # 推論時ガード（run_before_inference: true のときの補助設定）
-  inference_guard:
-    min_batch_size_for_gap_check: 8        # 単一サンプルでは batch mean が不安定
-    fallback_for_single_sample: "log_only" # log_only / block / route_to_human
-    cache_gap_by_batch_id: true            # 同一 batch_id への再計算を抑制
-    action_on_inference_review: "flag_prediction_and_continue"
-```
-
-> [!TIP]
-> **calibration_set は Human が curate する**必要があります。「事前学習データからランダムに 200 サンプル」ではなく、「その事前学習モデルが実際に**認識できていたサンプル**（高 confidence + 正解）」を選びます。ImageNet の場合、公開されている representative samples リストを使うか、事前学習モデルの val set から high-confidence correct を抽出します。
-
-### エージェントに任せられる判断
-
-| 判断場面 | L2 | 説明 |
-|---|:---:|---|
-| gap 計算の実行 | ✅ | 決定的処理、契約に従うのみ |
-| `action_on_warn` の実行（ログ記録） | ✅ | 決定的 |
-| `action_on_review` で Human に送る | ✅ | 決定的 |
-| **閾値の変更** | ❌ | 全レベル禁止 |
-| **calibration_set の差し替え** | ❌ | 全レベル禁止 |
-
----
-
-## 7.6 装置別 fine-tune 戦略判断表
-
-同じデータ型（例：SEM 画像）でも、装置ごとに fine-tune 戦略が変わります。これを **成果物 4**：`instrument_finetune_decision_table.yaml` として定式化します。
-
-```yaml
-# instrument_finetune_decision_table.yaml — SEM 3 装置の例
-schema_version: "1.0"
-domain: "SEM_image_classification"
-gap_metric: "normalized_gap_0_1"           # §7.3 選択マップと同じ相対スケール（§7.5 の Mahalanobis を calibration の 99% タイル値で正規化）
-pretrained_base:
-  uri: "hf://microsoft/resnet-18"          # example URI
-  revision: "a1b2c3d4..."
-
-# 装置ごとの判断ロジック
-instruments:
-  - id: "SEM_alpha"                         # 装置 α（校正済み・大量データあり）
-    calibration_status: "well_calibrated"
-    n_samples_available: 5000
-    domain_gap_last_measured: 0.3           # normalized_gap_0_1
-    recommended_strategy: "partial_fine_tune_last_2_layers"
-    reason: |
-      装置 α は校正済みで n = 5000 と豊富。domain gap も小さい (0.3)。
-      partial fine-tune で最終 2 層のみ更新すれば十分。full は overkill。
-    agent_min_level: "L2"                   # L1/L2/L3 taxonomy 内
-    required_gate: "training_job_approval"  # partial は §7.3 と一致：Human 承認 gate 必須
-    approval_required: true                 # 事前承認 (approval_record_id) が必要
-    agent_can_execute_daily: false          # 日次 re-fine-tune は禁止（partial は日次に不向き）
-
-  - id: "SEM_beta"                          # 装置 β（新規・少データ）
-    calibration_status: "recently_calibrated"
-    n_samples_available: 150
-    domain_gap_last_measured: 0.5
-    recommended_strategy: "lora_r8"
-    reason: |
-      装置 β は新規導入で n = 150 と少なく、domain gap 中程度 (0.5)。
-      LoRA (rank=8) で adapter のみ学習し、元重みを保持することでリスクを最小化。
-    agent_min_level: "L2"
-    required_gate: "daily_refinetune_gate"  # 日次 gate 経由なら L2 で可
-    approval_required: true
-    agent_can_execute_daily: true
-
-  - id: "SEM_gamma"                         # 装置 γ（未校正・分布外リスク大）
-    calibration_status: "not_calibrated"
-    n_samples_available: 30
-    domain_gap_last_measured: 0.9
-    recommended_strategy: "human_review_required"
-    reason: |
-      装置 γ は未校正、n = 30 と極少、domain gap 大 (0.9)。
-      fine-tune するとむしろ性能悪化のリスク大。
-      Human が (a) 装置を校正 (b) 事前学習モデル自体を差し替え を判断すべき。
-    agent_min_level: "none"                 # エージェント実行不可（Human のみ）
-    required_gate: "manual_only"
-    approval_required: true
-    agent_can_execute_daily: false
-
-# 判断ロジック（Skill 起動時に自動評価）
-decision_logic:
-  inputs:
-    - instrument_id
-    - n_samples_available
-    - domain_gap_score                      # normalized_gap_0_1
-  algorithm: "lookup_table_with_gap_override"
-  # domain_gap が recommended より大きくなったら strategy を降格
-  gap_override:
-    "0.0-0.2": "no_downgrade"
-    "0.2-0.5": "downgrade_to_lora_or_frozen"
-    "0.5-0.8": "route_to_human"
-    "0.8+": "block"
-```
-
-> [!IMPORTANT]
-> **この判断表は Human が装置ごとに書きます**。エージェントは表を読んで自動判断できますが、**表そのものを書き換えることは全レベルで禁止**です。装置校正状態の変化・データ蓄積の進捗に応じて、Human が定期的に見直します（推奨：四半期ごと）。
-
----
-
-## 7.7 「今日のバッチだけで再 fine-tune」承認ゲート
-
-Agentic 環境でよくある落とし穴：**新しいデータバッチが届くたびに、エージェントが自動で再学習を起動**する。これは以下の問題を起こします：
-
-- **モデルが日毎に変わる**：昨日の予測と今日の予測が違う理由が provenance で追えない
-- **GPU 資源の食い潰し**：他ユーザーの学習ジョブを阻害
-- **統計的に不健全**：日々のバッチは小さくノイズが大きく、単日データで fine-tune するとモデルが振動
-- **catastrophic forgetting**：日次 fine-tune を積み重ねると、当初の性能が失われる
-
-**成果物 5**：`daily_refinetune_gate.yaml` で防御します。
-
-```yaml
-# daily_refinetune_gate.yaml
-# 数値はすべて **example; must be calibrated per instrument/task**
-daily_refinetune_gate:
-  # 起動条件（すべて満たさないと fine-tune できない）
-  triggers_required_all:
-    - name: "min_new_samples"
-      threshold: 50                        # example: 50 サンプル以上溜まっていること
-    - name: "domain_gap_change"
-      threshold_relative: 0.15             # example: 前回学習時から gap が 15% 以上変化
-      baseline_gap_reference:              # ⚠️ agent が silently reset することを防ぐ
-        source: "last_approved_training_provenance"
-        field: "transfer_learning.domain_gap_at_start"
-        immutable_by_agent: true
-        require_provenance_hash: true      # 参照 provenance の SHA を照合
-    - name: "current_val_score_drop"
-      threshold: 0.05                      # example: 現在モデルの val F1 が 0.05 以上悪化
-    - name: "days_since_last_finetune"
-      min_days: 7                          # example: 前回から少なくとも 7 日空ける
-    - name: "human_approval"
-      approver_role: "lab_admin"
-      approval_record_id_required: true
-      max_approval_age_hours: 24           # 24 時間以内の approval のみ有効
-
-  # 実行制約
-  execution_constraints:
-    allowed_strategies_for_daily:          # 日次 gate では以下の戦略のみ許可
-      - "lora_r8"
-      - "lora_r16"
-                                           # partial / full は日次では禁止（別の
-                                           # training_job_approval gate 経由）
-    max_epochs_hard_cap: 5                 # example: 日次では 5 epoch まで
-    max_learning_rate: 5.0e-5              # example: 日次では小さめの LR
-    checkpoint_policy: "append_only_dated" # 日付付き append_only
-    previous_checkpoint_must_be_preserved: true
-
-  # 監視
-  monitoring:
-    log_all_attempts: true
-    weekly_summary_to_human: true          # 毎週 Human に「今週の fine-tune サマリー」
-    consecutive_finetune_warning: 3        # 3 日連続で fine-tune 起動があれば warn
-    rollback_on_val_degradation: true      # 前 checkpoint より悪ければ自動 rollback
-
-  # エージェント権限
-  agent_authorization:
-    l1_can_trigger: false
-    l2_can_trigger_with_human_approval: true
-    l3_can_trigger_within_preapproved_window: true
-    # 全レベル：triggers_required_all を 1 つでも満たさなければ block
-```
-
-### エージェント判断シーケンス（Mermaid）
-
-```mermaid
-sequenceDiagram
-    participant B as 新バッチ到着
-    participant A as Agent (L2)
-    participant G as Gate
-    participant H as Human
-    participant T as Trainer
-
-    B->>A: n=80 samples 到着
-    A->>G: refinetune 起動を要求
-    G->>G: triggers_required_all を評価
-    G->>G: min_new_samples 50 ✅
-    G->>G: domain_gap_change 0.18 ✅
-    G->>G: val_score_drop 0.06 ✅
-    G->>G: days_since_last 8 ✅
-    G->>H: human_approval 要求 (approval_record_id)
-    H-->>G: APP-2026-0703-01 (24h 有効)
-    G->>A: 全 trigger 満たす → 実行許可
-    A->>T: LoRA fine-tune 起動 (r=8, epochs<=5, lr<=5e-5)
-    T-->>A: 完了 (val F1 0.87 -> 0.91)
-    A->>G: append_only checkpoint 書き込み
-    G->>H: 週次サマリーに記録
-```
+> [!NOTE]
+> **上記「n の目安」は教材上の経験則**であり、実際の閾値は augmentation の効き方・転移学習の可否・タスクエントロピー・モデルサイズ・GBM ベースラインの強さで大きく変わります。「n = 5000 だから 1D Transformer を採用」ではなく、「n = 5000 で GBM / 1D CNN と並置比較して勝てば採用」で判断してください。
 
 > [!WARNING]
-> **triggers_required_all を 1 つでも欠かせば fine-tune はブロック**されます。エージェントが「なんとなく」再学習を起動できないように設計しています。特に **human_approval の `max_approval_age_hours: 24`** は重要で、「昨日の承認で今日走らせる」を防ぎます。
+> **Transformer 系は from-scratch では ARIM 単装置スケールで負けます**。転移学習の枠で使う（第8章、第12章）ことを前提にしてください。この章のハンズオン C（FT-Transformer）は Tabular で例外的に n ≥ 500 で「検証対象になる」構造。
 
 ---
 
-## 7.8 少データ材料での fine-tune 評価戦略（grouped × few-shot × 事前学習）
+## 7.8 vol-02 GBM との比較（ハンズオン A の並置実験）
 
-vol-02 第7章の CV 設計を深層に持ち込みますが、**転移学習では 3 つの新しい課題**が加わります：
+**同じ ARIM 風合成 IR スペクトルデータ**に対して、vol-02 のスペクトル分類 Skill（PLS + GBM）と、この章の 1D CNN Skill を並置します。
 
-### 課題 1：事前学習データと評価データの leakage
+### 比較プロトコル
 
-事前学習モデル（例：Raman-FM）が公開データセット D で訓練されているとき、あなたの評価データが D の一部でないか要確認です。
+| 項目 | vol-02（GBM） | vol-03（1D CNN） |
+|---|---|---|
+| 前処理 | ピーク抽出 → 特徴量エンジニアリング（vol-02 §6.8） | リサンプル 1024 点 → CNN が特徴を学習 |
+| CV | grouped 5-fold（装置別） | 同じ split_contract を共有 |
+| メトリクス | F1_macro、confusion matrix | F1_macro、confusion matrix、**ECE**（第5章追加） |
+| 実行環境 | CPU | GPU（CUDA） + CPU smoke test |
+| provenance | vol-02 版 | 第5章 3 レイヤ完全版 |
 
-```yaml
-# split_contract.yaml に追加
-pretraining_data_overlap_check:
-  method: "hash_and_near_duplicate"        # 完全一致だけでは crop/resize/smoothing の重複を見逃す
-  exact_hash:
-    algorithm: "sha256"
-    pretrain_dataset_hashes_source: "arim://finetune_leakage/2026-Q1"
-  near_duplicate:
-    perceptual_hash_for_images: true       # pHash / dHash 等
-    spectral_similarity_threshold: 0.98    # 例：cosine similarity（IR/Raman 等）
-    embedding_similarity_threshold: 0.95   # 事前学習 encoder の embedding cosine
-  action_on_exact_overlap: "exclude_from_test"
-  action_on_near_duplicate: "route_to_human_or_exclude"
-  minimum_test_size_after_exclusion: 30    # 除外後 test が 30 未満なら fatal
-```
+### 期待される結果パターン（**教材上の仮想パターン**）
 
-### 課題 2：装置別 grouped CV × few-shot の並列評価
+| データ規模 | GBM の F1 | 1D CNN の F1 | 判断 |
+|---|---|---|---|
+| n = 500 | 0.85 | 0.82 | GBM 継続 |
+| n = 2000 | 0.87 | 0.89 | 1D CNN 検討開始 |
+| n = 5000 | 0.87 | 0.93 | **1D CNN 採用、GBM は補助検証に** |
 
-少データ n < 500 で fine-tune するときは、**装置ごとの grouped CV** に加えて、**few-shot 学習**（1-shot / 5-shot / 10-shot）でも評価します。
-
-```python
-# few_shot_eval.py 骨格
-from sklearn.model_selection import GroupKFold
-
-def evaluate_finetune_strategy(
-    model, X, y, groups,   # groups = instrument_id
-    n_shot_list=(1, 5, 10, 50),
-) -> dict:
-    """
-    装置別 grouped CV × n-shot の 2 軸で fine-tune 戦略を評価。
-    - 各 fold で、train 側から n サンプル/クラスのみ使用
-    - 残りの train データは使わない（少データ現場をシミュレート）
-    """
-    results = {}
-    gkf = GroupKFold(n_splits=len(set(groups)))
-    for n_shot in n_shot_list:
-        scores = []
-        for train_idx, test_idx in gkf.split(X, y, groups=groups):
-            train_subset = _sample_n_per_class(X[train_idx], y[train_idx], n_shot)
-            fine_tuned = _finetune(model, train_subset)
-            score = _eval(fine_tuned, X[test_idx], y[test_idx])
-            scores.append(score)
-        results[f"n_shot_{n_shot}"] = {
-            "mean": float(np.mean(scores)),
-            "std": float(np.std(scores)),
-            "per_instrument": scores,
-        }
-    return results
-```
-
-### 課題 3：事前学習分布シフトの評価
-
-fine-tune 前後で、domain gap がどう変化したかを記録します（fine-tune で分布シフトが起きるのは正常だが、**過度なシフト = catastrophic forgetting** の兆候）。
-
-```yaml
-# finetune_evaluation_report.yaml
-finetune_evaluation:
-  before_finetune:
-    domain_gap_score: 0.35
-    val_f1_macro: 0.78
-  after_finetune:
-    domain_gap_score: 0.42        # 少しシフト（想定内）
-    val_f1_macro: 0.87            # 向上
-    catastrophic_forgetting_check:
-      pretrain_task_score_before: 0.92
-      pretrain_task_score_after: 0.88   # 4pt 低下（許容範囲）
-      threshold_for_warning: 0.10
-      status: "ok"
-  grouped_cv_by_instrument:
-    SEM_alpha: {mean: 0.89, std: 0.03}
-    SEM_beta:  {mean: 0.84, std: 0.06}
-    SEM_gamma: {mean: 0.61, std: 0.12}   # γ は不安定 → §7.6 判断表通り
-  few_shot_scores:
-    n_shot_5:  0.72
-    n_shot_10: 0.81
-    n_shot_50: 0.86
-```
+> [!IMPORTANT]
+> **上表の数値は教材上の仮想パターンです**。実測ベンチマーク値ではなく、**論文引用には使えません**。実際の F1 は装置固有性・クラス不均衡・特徴量エンジニアリングの質・augmentation・seed で大きく変わり、n = 5000 でも GBM が優位になるケースがあります。**必ず自データで実測してから判断**してください。「GBM がまだ強い」を認めることは正しい判断であり、恥ではありません。
 
 ---
 
-## 7.9 転移学習の provenance 拡張
+## 7.9 各 Skill での「エージェントが判断する場面」総括
 
-第4章の 3 レイヤ provenance に、**転移学習 3 追加項目**を加えます。
+3 ハンズオン + Tabular 追加 = 10 判断場面を整理します。
 
-```yaml
-# provenance.yaml — 転移学習拡張版
-schema_version: "1.1"
+> [!NOTE]
+> **列名「L2 で許可される動作」**：以下の表はエージェント権限 L2 での動作を示します。**L1 エージェントは学習・HP 選択・augmentation 実行が一切不可**で、契約検証と推論のみ行えます（第5章 §5.7）。L3 は L2 に加えて事前承認された ID 内で checkpoint 上書きと複数実験の自律スケジュールが可能。
 
-# Layer 1: GPU（第4章継承）
-gpu_backend: {...}
+| # | Skill | 判断場面 | L2 で許可される動作 | 監査ログ | 参照節 |
+|---|---|---|---|---|---|
+| 1 | A | 学習率選択 | `approved_hp_range.lr` 内 | `agent_decision_log` | §7.3 |
+| 2 | A | early stopping 起動 | 起動可、無効化不可 | `early_stopping_triggered_at` | §7.3 |
+| 3 | A | augmentation 強度 | `strength_range` 内 | 第6章 §6.7 | §7.4 |
+| 4 | A | 不確かさ超過時の停止 | 自律停止可 | `uncertainty_stop_events` | §7.3 |
+| 5 | A | OOD 検知後の停止 | 第8-9章実装後に自律停止 → Human 送り | `ood_stop_events` | §7.3（この章では disabled） |
+| 6 | B | 画像サイズ選択 | 事前定義候補から | `agent_decision_log` | §7.5 |
+| 7 | B | 結晶/非晶質テンプレート選択 | **不可**（Human 固定） | — | §7.5 |
+| 8 | C | GBM vs Transformer の選択 | **不可**（Human 比較） | — | §7.6 |
+| 9 | C | カテゴリ列エンコーディング | **不可**（Human 固定） | — | §7.6 |
+| 10 | C | mixup 強度 | `strength_range` 内 | 第6章 §6.7 | §7.6 |
 
-# Layer 2: 事前学習重み（§7.4 で厳格化）
-pretrained_weights: {...}
-
-# Layer 3: 学習設定（第6章継承）
-finetune_config: {...}
-augmentation_config: {...}
-
-# Layer 4: 転移学習追加項目（vol-03 §7.9 新設）
-transfer_learning:
-  strategy: "lora_r8"                     # A/B/C/D のどれか、または詳細名
-  domain_gap_at_start: 0.42
-  domain_gap_at_end: 0.44
-  frozen_layer_names:                     # frozen または LoRA 対象外の層
-    - "layer1.*"
-    - "layer2.*"
-  trainable_params_count: 45000
-  trainable_params_percent: 0.4           # 全パラメータ中 0.4%
-  base_weights_hash_before: "9f8e7d..."
-  base_weights_hash_after: "9f8e7d..."    # LoRA なら base 変わらず一致
-  adapter_weights_hash: "1a2b3c..."       # LoRA / PEFT の場合
-  finetune_data:
-    n_samples_used: 150
-    sampling_scheme: "grouped_by_instrument"
-    catastrophic_forgetting_delta: 0.04
-  refinetune_history:                     # 過去の日次 fine-tune 履歴
-    - date: "2026-06-25"
-      approval_record_id: "APP-2026-0625-02"
-      val_f1_delta: 0.03
-    - date: "2026-07-02"
-      approval_record_id: "APP-2026-0702-01"
-      val_f1_delta: 0.04
-    - date: "2026-07-03"
-      approval_record_id: "APP-2026-0703-01"
-      val_f1_delta: 0.04
-  consecutive_finetune_warning_triggered: false
-```
+**「不可」が 3 箇所ある**ことに注意してください。エージェントに何でも任せると、**構造的な判断**（テンプレート選択・モデル選択）で人が抜けます。この節の表は「Skill 設計時に **どこに人を残すか**」の設計書として機能します。
 
 ---
 
@@ -599,97 +526,76 @@ transfer_learning:
 
 | 失敗 | 原因 | 改善版 |
 |---|---|---|
-| fine-tune 後に性能悪化 | domain gap 大に対して full fine-tune を強行 | §7.5 gate で `action_on_review: route_to_human`、または LoRA に降格 |
-| モデルが日毎に変わり provenance が追えない | 日次 auto-refinetune | §7.7 `daily_refinetune_gate` で `min_days: 7` + human_approval 必須 |
-| 装置 γ で性能が出ない | 全装置一律の戦略 | §7.6 判断表で装置ごとに戦略を切り替え |
-| Catastrophic forgetting（pretrain タスクスコア大幅低下） | 少データで full fine-tune | LoRA に降格、`catastrophic_forgetting_check` を契約に追加 |
-| 事前学習データとの leakage | 評価データが pretrain データに含まれる | §7.8 `pretraining_data_overlap_check` を split_contract に追加 |
-| エージェントが `revision` を勝手に変えた | `modification_policy.revision_change_by_agent` が未設定 | §7.4 の modification_policy 契約を追加 |
-| LoRA adapter だけ差し替えて base 重みハッシュ検証を怠る | adapter が別の base に対して作られていた | provenance に `base_weights_hash_before` を必須化、起動時に照合 |
-| calibration_set が古い | 装置校正後も同じ calibration set を使い続けた | §7.5 `reference_uri` と `reference_sha256` を四半期ごとに更新 |
-| **normalized_gap_0_1 と mahalanobis_squared を混同** | 契約 YAML の `gap_metric` フィールド未指定 | §7.5 の `method` を必ず指定、§7.3 選択マップ・§7.6 判断表は明示的に `normalized_gap_0_1` を使う |
-| **LoRA fine-tune 後に base 重み hash が変わっていた** | frozen 指定漏れ・実装バグ | 起動時に `base_weights_hash_before == base_weights_hash_after` を **fatal assert**（LoRA/PEFT 戦略時のみ） |
-| **共分散推定が高次元少サンプルで不安定** | EmpiricalCovariance を使った | `LedoitWolf` / `OAS` に切替、`min_calibration_samples_per_dim` を契約に追加 |
-| **エージェントが baseline_gap_reference を silently reset** | reference を再計算する権限を持っていた | §7.7 `baseline_gap_reference.immutable_by_agent: true` + `require_provenance_hash: true` |
-| **near-duplicate leakage を見逃した** | 完全 hash 一致のみでチェック | §7.8 `method: "hash_and_near_duplicate"`（perceptual hash + embedding similarity） |
-| **単一サンプル推論で domain gap gate が誤動作** | batch mean の Mahalanobis が不安定 | §7.5 `inference_guard.min_batch_size_for_gap_check` を設定、単サンプルは `log_only` |
+| 学習が進まない（loss が下がらない） | LR が範囲外 or augmentation 強すぎ | 契約 assert で LR 範囲外を検知、augmentation 強度を smoke test で確認 |
+| CV スコアがばらつく（seed × 3 で std > 0.03） | GPU 非決定性（第3章） | `torch.use_deterministic_algorithms(True)` + `cublas_workspace_config` を provenance に |
+| test スコア > val スコア | augmentation が test に漏れている | 契約 assert `applied_scope.test: false`、Skill 起動時にランタイム検証 |
+| 装置 A で学習、装置 B で崩れる | grouped CV 未使用、または augmentation で装置差を消していた | 第6章 §6.6 の 3 分岐（消してはいけないケース）で分析 |
+| epoch を 30 → 100 に増やしたら精度上がった | max_epochs override（audit violation） | `max_epochs: 30` を Human 固定、エージェントは範囲内から選択のみ |
+| Tabular Transformer が GBM に負けた | n < 500 で深層を選んだ | §7.6 の判断表に従って GBM 継続、Tabular Transformer は保留 |
 
 ---
 
-## 7.11 この章のチェックリスト
+## 7.11 章末チェックリスト・ワーク
 
-Skill 実装前・レビュー時のチェック（第4章の 7 セクション + 第5章の 2 契約 + 第6章の `training_config.yaml` に加えて）：
+### チェックリスト
 
-- [ ] 転移学習 4 戦略（frozen / partial / LoRA / full）から機械的に選択できる
-- [ ] `pretrained_weights` に `revision` を commit hash で記録している
-- [ ] `weights_sha256` を事前計算し contract に記録している
-- [ ] `pretraining_distribution.NOT_intended_for` を書いている
-- [ ] `domain_gap_gate` で feature-level OOD 検知を組み込んでいる
-- [ ] `domain_gap_gate.method` で `mahalanobis_squared` / `normalized_gap_0_1` を明示的に指定している
-- [ ] 共分散推定に `LedoitWolf` / `OAS` を使っている（EmpiricalCovariance は不採用）
-- [ ] `calibration_set` が Human curate 済みで、`reference_sha256` が記録されている
-- [ ] `calibration_99th_percentile` から `normalized_gap_0_1` を計算している
-- [ ] 装置別 fine-tune 判断表（`instrument_finetune_decision_table.yaml`）を書いている
-- [ ] 判断表の各装置に `agent_min_level` + `required_gate` + `approval_required` の 3 フィールドを揃えている（`L2_with_daily_gate` のような taxonomy 外の記述は禁止）
-- [ ] 日次 re-fine-tune 承認ゲート（`daily_refinetune_gate.yaml`）を書いている
-- [ ] `triggers_required_all` に human_approval が含まれ、`max_approval_age_hours` を設定している
-- [ ] `baseline_gap_reference.immutable_by_agent: true` を設定し、agent が baseline を silent reset できないようにしている
-- [ ] `allowed_strategies_for_daily` を LoRA 系のみに制限している（partial / full は日次禁止）
-- [ ] `pretraining_data_overlap_check` を split_contract に追加している（`hash_and_near_duplicate`）
-- [ ] 装置別 grouped CV × few-shot 評価を実行している
-- [ ] `catastrophic_forgetting_check` を評価レポートに含めている
-- [ ] provenance に `transfer_learning` セクション（Layer 4）を追加している
-- [ ] **LoRA / PEFT 戦略時は `base_weights_hash_before == base_weights_hash_after` を fatal assert している**
-- [ ] `adapter_weights_hash` に加えて `adapter_base_weights_hash` を記録し、adapter がどの base 用か照合している
-- [ ] full fine-tune を L3 でも Human sign-off 必須にしている（pre-approved workflow scope 内かつ都度承認）
-- [ ] 事前学習モデルの差し替え / domain gap 閾値変更を全レベルで禁止している
-- [ ] 推論時 domain gap の `min_batch_size_for_gap_check` を設定している
+- [ ] 3 Skill（1D CNN / 2D CNN / FT-Transformer）の共通契約構造（`training_config.yaml`）を書ける
+- [ ] `agent_authorization.approved_hp_range` に含めるフィールドを列挙できる
+- [ ] エージェントが判断可の 10 場面と不可 3 場面を区別できる
+- [ ] early stopping と OOD stop の違いを説明できる
+- [ ] 1D CNN vs GBM の判断基準を n・特徴量・装置間差の軸で語れる
+- [ ] Tabular Transformer を n < 500 で使わない理由を説明できる
+- [ ] CI CPU smoke test の設定項目を列挙できる
+
+### ワーク
+
+自研究室の教師あり分類/回帰タスクを 1 つ選び、以下を実施：
+
+1. データ型（スペクトル / 画像 / Tabular）を確定し、対応する Skill 骨格を選ぶ
+2. `training_config.yaml` を自データに合わせて書く（`approved_hp_range` は Human が事前決定）
+3. §7.9 の判断場面表を自 Skill 版に書き換える（判断可 / Human 固定の分類）
+4. vol-02 の対応する Skill（GBM や PLS）が存在すれば、並置比較の計画を立てる
+5. CI CPU smoke test の設定を書き、CI で回してから GPU フル学習に進む順序を確立する
 
 ---
 
-## 7.12 ワーク・まとめ・参考資料
+## 7.12 本章のまとめ
 
-### 演習
+- 教師あり深層 Agentic Skill 3 種（**1D CNN / 2D CNN / FT-Transformer**）を、第5章の 7 セクション仕様書 + 第6章の 2 contract の上に構築した
+- 各 Skill で **「エージェントが判断する場面（10）」と「Human 固定の場面（3）」を明示的に分けた**
+- **1D CNN vs GBM** の判断は n・特徴量エンジニアリングの質・装置間差で決まる。**n < 500 の tabular では深層は GBM に負ける**
+- 学習ループの契約 assert は **Skill 起動直後**に走らせ、fatal 違反は学習開始前に停止させる
+- `training_config.yaml` の `agent_authorization` フィールドで、L2 権限の具体化（`approved_hp_range` / `training_job_approval_id`）を実装可能な形にした
 
-1. **戦略選択の判断練習**：ARIM 風合成 IR スペクトルで、n = 80 / n = 500 / n = 3000 の 3 ケースについて、`spectrum_transfer_1d` で選ぶべき戦略（A/B/C/D）を §7.3 の選択マップから決めよ。domain gap は 0.3 とする。
-2. **判断表の作成**：あなたが実際に使っている装置（または想像上の 3 装置）について、`instrument_finetune_decision_table.yaml` の 3 エントリを書け。校正状態・想定サンプル数・想定 domain gap を仮置きし、`recommended_strategy` を決めよ。
-3. **承認ゲートのシミュレーション**：`daily_refinetune_gate` の `triggers_required_all` について、以下のシナリオで gate が pass / block のどちらか判定せよ。
-   - シナリオ A：n_new=60, gap_change=0.20, val_drop=0.03, days_since=10, approval_age=12h
-   - シナリオ B：n_new=80, gap_change=0.18, val_drop=0.06, days_since=8, approval なし
-   - シナリオ C：n_new=100, gap_change=0.25, val_drop=0.08, days_since=8, approval_age=30h
-4. **provenance レビュー**：仮の `provenance.yaml` を作り、`base_weights_hash_before == base_weights_hash_after` になるべき戦略（LoRA）と、変わって良い戦略（full fine-tune）を書き分けよ。
-5. **catastrophic forgetting の検出**：`pretrain_task_score_before = 0.92`, `pretrain_task_score_after = 0.75` のとき、`threshold_for_warning: 0.10` の設定でどの status になるか、また改善策を 3 つ挙げよ。
+第8章では、この 3 Skill を **転移学習・fine-tuning** に拡張し、事前学習重みを扱うときの追加契約（装置別 fine-tune 判断表、`domain_gap` early warning）を設計します。
 
-### まとめ
+---
 
-- 転移学習 4 戦略（**frozen / partial / LoRA / full**）は、`n × domain_gap` の 2 軸で機械的に選べる。full fine-tune は L3 でも Human sign-off 必須
-- **事前学習重みの provenance は最も厳しく**：`revision` は commit hash、`weights_sha256` は事前計算、`NOT_intended_for` を明記
-- **`domain_gap_gate`** は feature-level（penultimate layer）で計算し、`warn / review / stop` の 3 段階アクション
-- **装置別判断表**（`instrument_finetune_decision_table.yaml`）は Human が四半期ごとに更新
-- **日次 re-fine-tune 承認ゲート**は `triggers_required_all` の 5 条件（新サンプル数 / gap 変化 / val 低下 / 日数 / 24h 以内 human approval）
-- **少データ評価**は grouped × few-shot × 事前学習 leakage check の 3 軸
-- **provenance に `transfer_learning` セクション（Layer 4）** を追加。`refinetune_history` で日次履歴を蓄積
+## 参考資料
 
-### 参考資料
+### 本書内
 
-**本書内**：
-- 第4章 §4.4-4.10（provenance 3 レイヤ、Agentic 学習権限 L1-L3、4 承認ゲート）
-- 第5章 §5.5-5.7（augmentation プリミティブと L1-L3 権限）
-- 第6章 §6.3, §6.9（`training_config.yaml`、10 判断場面）
-- 第8章（不確かさと OOD の本格実装、`val_ood_score` の実装候補）
-- 第11章（Foundation Model 章、事前学習の内部構造）
-- 第14章（深層 × Agentic 特有の失敗、fine-tune のデータリーク）
+- **第5章 §5.7, §5.9, §5.10**：Agentic 権限設計、Skill 仕様書テンプレート、provenance スキーマ
+- **第5章 §5.5**：CI CPU smoke test
+- **第6章 §6.3, §6.5**：`deep_split_contract` と `augmentation_contract`
+- **第6章 §6.7**：L1/L2/L3 augmentation 権限
+- **第8章**：この 3 Skill の転移学習拡張、装置別 fine-tune 判断
+- **第8-9章**：不確かさ推定（この章の `uncertainty_stop_gate` の実装）
+- **第11章**：Grad-CAM / attribution（1D CNN・2D CNN の解釈）
+- **第15章**：教師あり深層の失敗パターン（agent-side augmentation 強化、GPU 非決定性の見落とし）
 
-**vol-01/02**：
-- vol-01 第6章（Human-in-the-loop の設計原則）
-- vol-02 第7章（CV 設計とデータリーク検知）
-- vol-02 第10章（Skill 仕様書 7 セクション）
+### vol-02 / vol-01 参照
 
-**外部**：
-- LoRA — Hu et al., 2021 [https://arxiv.org/abs/2106.09685](https://arxiv.org/abs/2106.09685)
-- PEFT ライブラリ — Hugging Face [https://github.com/huggingface/peft](https://github.com/huggingface/peft)
-- Mahalanobis distance for OOD detection — Lee et al., 2018 [https://arxiv.org/abs/1807.03888](https://arxiv.org/abs/1807.03888)
-- Catastrophic forgetting — Kirkpatrick et al., 2017 (EWC) [https://arxiv.org/abs/1612.00796](https://arxiv.org/abs/1612.00796)
-- Foundation Model 転移学習の展望 — Bommasani et al., 2021 [https://arxiv.org/abs/2108.07258](https://arxiv.org/abs/2108.07258)
-- torch.load `weights_only=True` の重要性 — PyTorch security advisory [https://pytorch.org/docs/stable/notes/serialization.html](https://pytorch.org/docs/stable/notes/serialization.html)
-- safetensors 仕様 — Hugging Face [https://github.com/huggingface/safetensors](https://github.com/huggingface/safetensors)
+- **vol-02 第6章**：教師あり ML Skill の共通構造、ハンズオン A/B/C
+- **vol-02 第5.8 節**：スペクトル分類 Skill（PLS + GBM）— この章のハンズオン A と並置比較
+- **vol-02 第8章**：grouped CV / applicability domain（この章の split_contract に継承）
+- **vol-01 第7章**：Skill 設計原則（仕様書 6 要素 → vol-02 で 6、vol-03 で 7）
+- **vol-01 第13章**：6 データ型テンプレート
+
+### 外部資料
+
+- PyTorch 公式 CNN チュートリアル — [https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html](https://pytorch.org/tutorials/beginner/blitz/cifar10_tutorial.html)
+- FT-Transformer 論文（Gorishniy et al., 2021）— [https://arxiv.org/abs/2106.11959](https://arxiv.org/abs/2106.11959)
+- TabNet 論文（Arik & Pfister, 2019）— [https://arxiv.org/abs/1908.07442](https://arxiv.org/abs/1908.07442)
+- 「Tabular deep learning が GBM に勝てるか」の議論 — Shwartz-Ziv & Armon (2022) [https://arxiv.org/abs/2106.03253](https://arxiv.org/abs/2106.03253)
+- PyTorch determinism — [https://pytorch.org/docs/stable/notes/randomness.html](https://pytorch.org/docs/stable/notes/randomness.html)

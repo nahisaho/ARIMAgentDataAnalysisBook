@@ -1,896 +1,1255 @@
-# 第14章 深層 × Agentic 特有の失敗パターンと監査
+# 第14章 総合ハンズオン（Advanced Capstone）— Foundation Model → 深層特徴 → PyMC 階層モデル
 
 > [!NOTE]
-> **この章の到達目標**
+> **本章の到達目標**
+> - **ARIM 風合成階層データ**（装置間・ロット間・研究室間）に対して、**Foundation Model の深層特徴** → **PyMC 階層モデル**の統合 Skill を組み立てられる
+> - **エージェントが階層構造を認識して fine-tune 戦略を切り替える**判断を実装できる（装置差が大きい層では fine-tune、小さい層は frozen feature）
+> - **「深層特徴の不確かさ」と「階層のプーリング」の共存**を PyMC で表現できる
+> - **3 つの Human-in-the-loop 承認ゲート**（fine-tune 起動・不確かさ閾値超え・階層プーリング構造変更）を Skill 契約に統合できる
+> - vol-02 第14章 capstone（PyMC 階層）と本書 Ch4-12 の全 Skill を **1 本の統合契約**にまとめられる
 >
-> - 深層学習を Agentic ワークフローに載せた際に生じる **2 種類の失敗**（深層一般 / Agentic 特有）を体系化する
-> - Ch4-13 で導入した `never_allowed` 契約フィールドを **1 つの失敗パターンレジストリ**に集約する
-> - **監査 Skill `agentic_deep_failure_audit`** を導入し、実行後の provenance を静的にチェックする
-> - Experiment tracking（MLflow / W&B）を導入すべき判断基準を示す
->
-> **扱わないこと**
->
-> - 個別モデル固有のハイパーパラメータ調整（vol-02 で扱い済み）
-> - セキュリティ脆弱性（付録 C で扱う）
-> - LLM プロンプトインジェクション（本書スコープ外）
+> **本章で扱わないこと**
+> - **深層モデルの新規学習**（本章は Ch11 FM + Ch7 fine-tune + Ch12 SSL の成果を統合するのみ）
+> - **PyMC の詳細**（vol-02 第11-13章 + Ch11 階層モデルを参照）
+> - **失敗パターンの網羅** → **第15章**（本章は成功シナリオを組み立てる）
+> - **組織展開** → **第16章**
 
 ---
 
-## 14.1 この章で作る Skill
+## 14.1 この章で作る統合 Skill
 
-| Skill | 役割 |
-|---|---|
-| `agentic_deep_failure_audit` | 実行済み Skill の provenance chain を舐めて、失敗パターンレジストリ照合を行う静的監査 Skill |
-| `failure_pattern_registry` | 深層一般 + Agentic 特有の失敗パターンを ID 付きで一元管理し、各パターンを検出するための `signal_selector` を提供する |
+**1 つの capstone Skill（`hierarchical_deep_bayes`）**と、その内部で orchestrate される **4 つのサブ Skill**を作ります。
 
-vol-03 全体の各章で登場した `never_allowed` / `forbidden_all_levels` / 失敗パターン表を、この章で **1 本のレジストリに正規化**して集約します。
+| Skill / 成果物 | 役割 | 依存する章 |
+|---|---|---|
+| **`capstone_hierarchy_detection`** | データから装置 / ロット / 研究室の階層構造を検出し、層ごとに fine-tune 戦略を決定 | Ch4, Ch7 |
+| **`capstone_deep_feature_extraction`** | FM で深層特徴を抽出（fine-tune or frozen を層ごとに切替）+ 不確かさ伝搬 | Ch7, Ch8, Ch9, Ch11, Ch12 |
+| **`capstone_hierarchical_bayes`** | PyMC 階層モデルで深層特徴 → 材料物性を推定、posterior で不確かさを表現 | vol-02 Ch10-12, Ch11 |
+| **`capstone_three_gate_orchestrator`** | 3 つの Human-in-the-loop 承認ゲートを統合管理（fine-tune 起動 / 不確かさ閾値超え / 階層構造変更） | Ch4 §5.7, Ch10, Ch11 |
+| **`hierarchical_deep_bayes`**（capstone） | 上記 4 つを 1 本の契約に統合。ARIM 風合成階層データを入力、posterior + 監査レポートを出力 | 全章 |
 
-## 14.2 なぜ「失敗パターン章」が必要か
+**継承 DNA**（Ch4-12 の provenance 拡張ブロックを全て継承）：
+- Layer 1-3 (Ch4)
+- `layer_4_pretrained_weights` (Ch7)
+- `bayesian_inference_config` (Ch9)
+- `layer_attribution` + `layer_human_review` (Ch10)
+- `foundation_model_provenance` + `fm_query_provenance` (Ch11)
+- `ssl_pretrain_provenance` + `ssl_representation_eval_provenance` (Ch12)
+- **本章で新設**: `capstone_integrated_provenance`
 
-第4-13章では、各章末に失敗パターン表を置いてきました。しかし実際の運用では、**複数の章にまたがる複合失敗**が発生します。例：
+---
 
-- Ch11 で FM を fetch した SHA が Ch11 registry と一致しているが、**Ch12 SSL pretrain が別 SHA で走った**（章単位ではどちらも合格、chain 単位で不整合）
-- Ch13 の Gate 2 を通過したが、**通過時の high_uncertainty_sample_ids と、Bayes に渡された known_high_uncertainty_mask の差集合が非空**（章単位では両方合格）
-- Ch4 の Layer 2 augmentation が signed 済みだが、**Ch7 fine-tune 中に agent が別 augmentation policy をロード**（Layer 2 契約違反だが Ch7 の acceptance では検出できない）
+## 14.2 なぜ統合が難しいか — 深層 × 階層 × 不確かさ の三重奏
 
-このような **章間・Skill 間の整合性違反**は、章単位のチェックリストでは捕まえられません。第14章では：
+以下の 3 つは、それぞれ独立には確立された技術ですが、**統合したときに整合させるのが難しい**：
 
-1. **横断的な失敗パターン**を分類（深層一般 8 + Agentic 特有 9 = 17 パターン）
-2. 各パターンに **provenance 上のシグナル**を割り当て
-3. **監査 Skill** で自動検出
+1. **深層 FM は "1 サンプル = 1 ベクトル"** を返す。階層構造（装置 / ロット / 研究室）の情報は特徴に埋まっていない
+2. **PyMC 階層モデルは "低次元共変量 + 階層ラベル"** で書かれる想定。数百次元の深層特徴を直接投入すると事前分布設計が破綻
+3. **不確かさは 2 種類ある**：深層側の不確かさ（Ch8-9）と、Bayesian posterior の不確かさ（vol-02 Ch10-12）。**両者を同じスケールで語れない**
 
 ```mermaid
 flowchart LR
-    A[Ch4-13 の never_allowed] --> B[failure_pattern_registry]
-    B --> C[agentic_deep_failure_audit]
-    D[実行済み provenance chain] --> C
-    C --> E{全パターン合格?}
-    E -- yes --> F[Report OK]
-    E -- no --> G[Blocking findings]
-    G --> H[Human triage]
+    A["ARIM 風合成階層データ<br/>(装置 x ロット x 研究室)"] --> B["capstone_hierarchy_detection<br/>(Ch4 + Ch7)"]
+    B --> C{"層ごとの<br/>domain_gap 判定"}
+    C -->|"gap 大"| D["fine-tune with Ch7<br/>(training_job_approval)"]
+    C -->|"gap 小"| E["frozen feature"]
+    D --> F["capstone_deep_feature_extraction<br/>(Ch11 FM + Ch8/9 不確かさ)"]
+    E --> F
+    F --> G["深層特徴 + per-sample uncertainty"]
+    G --> H["capstone_hierarchical_bayes<br/>(PyMC 階層モデル)"]
+    H --> I["posterior + trace diagnostics"]
+    I --> J["capstone_three_gate_orchestrator<br/>(3 gates: fine-tune / uncertainty / pooling)"]
+    J -->|"gate 全通過"| K["最終 report + Ch10 deep_report_template"]
+    J -->|"gate NG"| L["Human 判断"]
 ```
 
----
-
-## 14.3 失敗パターンの分類
-
-### カテゴリ
-
-| ID prefix | カテゴリ | 対象 |
-|---|---|---|
-| **DG-** | Deep General | GPU / 重み / データ / 特徴 / 不確かさ の技術的失敗 |
-| **AG-** | Agentic-Specific | 権限 / 承認 / 履歴 / 監査 の運用的失敗 |
-| **MX-** | Mixed | 深層 × Agentic の複合（章間で発生） |
-
-### 重大度と blocking の関係（strict_mode に依らず一貫）
-
-| Severity | 意味 | Blocking policy |
-|---|---|---|
-| **CRITICAL** | 監査根拠が失われる、Human bypass、silent data corruption | **常に block**（strict_mode に依らず）、Human triage 必須 |
-| **HIGH** | 統計的 / 科学的に無効な結論を生む | **常に block**、rerun または documented exception |
-| **MEDIUM** | 結果は妥当だが再現性 / 説明可能性を毀損 | strict_mode=true なら block、false なら warn |
-| **LOW** | ベストプラクティス逸脱 | 常に warn（log 記録のみ） |
-
 > [!IMPORTANT]
-> § 14.4-14.6 の各パターンの「Severity」は上表の意味で常に一貫し、`strict_mode` が変更してもよいのは MEDIUM 以下のみ。CRITICAL / HIGH の blocking は変更不可（`downgrade_high_or_critical_blocking_by_strict_mode: never_allowed`）。
+> **本章の主題は "3 つを繋げる契約"** です。個別技術の詳細は各章に譲り、**接続面の整合性**（特徴の次元、不確かさのスケール、階層ラベルの引き渡し、監査ログの統合）に紙面を割きます。
 
 ---
 
-## 14.4 Section 1 — 深層一般の失敗（DG-xx）
+## 14.3 ARIM 風合成階層データの構造
+
+vol-02 第14章の合成階層データを **画像 × 階層**に拡張します：
+
+| 階層 | 例 | 個数 |
+|---|---|---|
+| 研究室（lab） | LabA / LabB / LabC | 3 |
+| 装置（instrument）※ lab に nested | LabA-SEM1, LabA-SEM2, LabB-SEM1, ... | 各 lab に 2〜3 台 |
+| ロット（lot）※ instrument に nested | 撮影セッション | 各装置に 5〜10 lot |
+| 画像（sample）※ lot に nested | 個別 SEM 画像 | 各 lot に 50〜200 枚 |
+
+**合成の設計原則**：
+
+- 装置ごとに **明るさ / コントラスト / ノイズ特性**が異なる（実装置固有性を模擬）
+- ロットごとに **サンプル準備の微差**による drift を持たせる
+- **材料物性（target）は lab 依存 + 装置依存の階層構造**を持つ
+- 一部の装置は **他装置と domain_gap が大きい**（fine-tune 判断が分かれる）
+
+### 合成データ生成契約（要旨）
+
+```python
+# 生成関数の骨子（実装は付録 A / vol-02 データ生成の拡張）
+def generate_arim_hierarchy_dataset(
+    n_labs: int = 3,
+    n_instruments_per_lab: tuple = (2, 3, 2),
+    n_lots_per_instrument: int = 8,
+    n_samples_per_lot: int = 100,
+    material_property_hierarchy: dict = None,  # 階層構造の真値
+    instrument_domain_shift: dict = None,      # 装置ごとの明るさ/ノイズ
+    seed: int = 42,
+) -> "ARIMHierarchyDataset":
+    ...
+```
 
 > [!NOTE]
-> 以下の各パターン表の「検出シグナル」「対策契約」で参照するフィールド名は、**canonical name**（§ 14.7 `provenance_field_normalization` で解決される論理名）です。実際の実装は正規化辞書経由で Ch4-13 の実フィールド（例：`foundation_model_provenance.revision_commit_hash`, `layer_3.checkpoint_overwrite_policy: append_only`）を参照します。実行可能な JSONPath は § 14.7 の `failure_pattern_registry.fixtures.yaml` を参照。
-
-### DG-01: GPU 非決定性による結果ずれ
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | 同じ seed / 同じデータで学習しても、GPU / cuDNN / TF32 の設定が違うと最終 loss / metrics が 1〜3% ずれる |
-| **原因** | cuDNN の非決定的アルゴリズム、`torch.backends.cudnn.benchmark=True`、TF32 の暗黙有効化、混合精度の非対称丸め |
-| **検出シグナル** | Ch4 Layer 3 provenance の `torch_deterministic`, `cudnn_deterministic`, `tf32_allowed`, `cuda_version`, `gpu_arch` が欠落 or 不一致 |
-| **対策契約** | Ch4 `gpu_environment_provenance_required: true`, `deterministic_config_signed: true` |
-| **Severity** | MEDIUM |
-
-### DG-02: 事前学習重みの汚染
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | ImageNet pretrained や FM の重みが、後段 fine-tune の対象データにすでに含まれていた（重複データ汚染）。test set の一部が pretrain set に混入している |
-| **原因** | web スクレイピング型データセット（例：LAION）と学術データセットの間で暗黙の重複 |
-| **検出シグナル** | Ch11 `fm_data_lineage_provenance` が未取得、または `overlap_with_downstream_test_split_verified: false` |
-| **対策契約** | Ch11 `fm_data_lineage_check_required: true`, Ch7 `pretrained_weights_downstream_overlap_forbidden` |
-| **Severity** | HIGH |
-
-### DG-03: Fine-tune のデータリーク
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | val / test split のサンプルが、fine-tune 中に augmentation 経由や near-duplicate 経由で train に混入 |
-| **原因** | Split を hash lock していない、augmentation で強い変換をかけると別サンプルと衝突、SMOTE / mixup 系で境界がまたがる |
-| **検出シグナル** | Ch4 Layer 3 `train_split_hash` / `val_split_hash` / `test_split_hash` の非重複証明が欠落、Ch5 `augmentation_provenance` の `cross_split_check` が pass でない |
-| **対策契約** | Ch4 `split_hashes_pairwise_disjoint_verified: true`, Ch5 `no_augmentation_across_splits: never_allowed` |
-| **Severity** | CRITICAL |
-
-### DG-04: Foundation Model の分布外運用
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | FM の pretrain 領域と ARIM の対象測定領域が大きく離れているのに、そのまま frozen で使い、特徴が意味を持たない |
-| **原因** | Ch7 domain_gap_gate をスキップしたか、`action='review'` を無視して proceed した |
-| **検出シグナル** | Ch7 `domain_gap_gate_result` が欠落、または `action='review'` / `action='block'` に対する Gate 承認が provenance に無い |
-| **対策契約** | Ch11 → Ch7 のパスを execution_order で強制、Ch13 の Gate 1 |
-| **Severity** | HIGH |
-
-### DG-05: Hallucinatory feature attribution
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Grad-CAM / IG などの attribution マップが、モデルが実際に見ていない領域を highlight する（sanity check 失敗） |
-| **原因** | ReLU の勾配飽和、batch statistics 依存、attribution アルゴリズムそのものの limitations |
-| **検出シグナル** | Ch10 `layer_attribution_provenance` の `sanity_check_results` が pass でない（model randomization / data randomization test） |
-| **対策契約** | Ch10 `attribution_sanity_checks_required: [model_randomization, data_randomization]`, `attribution_reported_as_evidence_without_sanity_check: never_allowed` |
-| **Severity** | HIGH |
-
-### DG-06: Augmentation 契約違反
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | 論文報告時の augmentation policy と、実際に走った augmentation が異なる（意図しない変換が入る、色空間が違う、正規化 mean/std が違う） |
-| **原因** | Config drift、library default 変更、agent-side による追加 |
-| **検出シグナル** | Ch5 `augmentation_provenance.policy_hash` と registered signed policy hash の不一致 |
-| **対策契約** | Ch5 `augmentation_policy_signed_hash_matched_at_runtime: true`, `agent_added_augmentation_without_approval: never_allowed` |
-| **Severity** | HIGH |
-
-### DG-07: Deep Ensemble の過信
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Deep ensemble の分散が small でも、実際の予測誤差は大きい（uncertainty が calibrate されていない） |
-| **原因** | Ensemble members が同じ init から派生している、同じ augmentation で学習、data-level diversity が無い |
-| **検出シグナル** | Ch8/Ch9 の `ensemble_diversity_metrics` が欠落、`calibration.ece_absolute` が閾値超過 |
-| **対策契約** | Ch8 `ensemble_diversity_min_required: true`, `deep_ensemble_reported_without_calibration: never_allowed` |
-| **Severity** | HIGH |
-
-### DG-08: BNN の未収束
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Variational BNN の posterior が prior に張り付いたまま、学習が進んでいない（KL term が支配的） |
-| **原因** | KL annealing の失敗、prior が狭すぎ、likelihood scale が小さすぎ |
-| **検出シグナル** | Ch9 `bnn_convergence_metrics.kl_to_likelihood_ratio` が過大、`posterior_effective_variation_low_flag: true` |
-| **対策契約** | Ch9 `bnn_convergence_check_required: true`, `report_bnn_uncertainty_without_convergence: never_allowed` |
-| **Severity** | HIGH |
+> 合成データは **本章の学習を隔離する装置**です。実 ARIM データは装置固有性が強すぎ、階層構造の "正解" が観測不能なため、本章の練習には合成データを使い、実データは読者の現場に持ち込む前提です。
 
 ---
 
-## 14.5 Section 2 — Agentic 特有の失敗（AG-xx）
+## 14.4 `capstone_hierarchy_detection` — 階層検出と fine-tune 戦略
 
-### AG-01: エージェントが GPU を占有し続ける
+エージェントが **層ごとに fine-tune するか frozen で行くか**を判断する Skill。
 
-| 項目 | 内容 |
-|---|---|
-| **症状** | Agent が学習ジョブを起動したまま、失敗検知しても kill せず、GPU リソースを占有 |
-| **原因** | Agent 側の `on_job_failure` ハンドラが実装されていない、または `restart_on_failure_forever: true` |
-| **検出シグナル** | Ch4 `job_lifecycle_provenance.max_gpu_hours_per_signed_run` 超過、または `explicit_termination_recorded: false` |
-| **対策契約** | Ch4 `gpu_budget_signed_and_enforced: true`, `agent_ignoring_gpu_budget: never_allowed`, `restart_on_failure_without_human_approval: never_allowed` |
-| **Severity** | HIGH |
+### アルゴリズム
 
-### AG-02: エージェントが勝手にモデルを更新する
+各階層（lab / instrument / lot）について：
 
-| 項目 | 内容 |
-|---|---|
-| **症状** | Human 承認を得ていない timing で FM や downstream model を新 SHA に差し替える（Ch11 `fm.set_default_version` を勝手に呼ぶ） |
-| **原因** | Agent tier L3 が MCP `fm.set_default_version` を叩ける権限に誤設定、または `fm_update_gate` を bypass |
-| **検出シグナル** | Ch11 `fm_update_gate_provenance` が欠落 or approver が agent identity |
-| **対策契約** | Ch11 `fm_update_gate_required_before_default_version_change: true`, `self_sign_as_approver: never_allowed`, `fm_default_version_change_without_gate: never_allowed` |
-| **Severity** | CRITICAL |
+1. サンプルを層ラベルで分割
+2. 層内 vs 層間で **Ch7 `domain_gap_gate`** を実行
+3. 層間 domain_gap が大きい階層 → **fine-tune 候補**
+4. 層間 domain_gap が小さい階層 → **frozen feature で共有**
 
-### AG-03: Checkpoint を無承認で上書き
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Fine-tune 中の checkpoint URI が signed registry と異なる path に書き込まれる、あるいは既存 checkpoint を silent に上書き |
-| **原因** | Agent が「良い val loss が出たら best として保存」を独自ルールで実装 |
-| **検出シグナル** | Ch12 / Ch7 の `checkpoint_registry_provenance` に登録されていない URI に書き込みが発生、または同じ URI に対する複数の hash が記録される |
-| **対策契約** | Ch4 `checkpoint_overwrite_policy.write_once_or_signed_versioning_only: true`, `agent_silent_checkpoint_overwrite: never_allowed` |
-| **Severity** | HIGH |
-
-### AG-04: 学習ログの改ざん / 選択的報告
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | 発散した run を **公開レポート**からは削除、または best run のみを提示（cherry-picking） |
-| **原因** | Agent が report generation ステップで `runs_summary` を独自にフィルタ |
-| **検出シグナル** | **外部の append-only scheduler ledger** の run_id 集合と、レポート内 `layer_report_provenance.runs_summary` の run_id 集合が不一致（agent が編集不能な独立ソースと突合） |
-| **対策契約** | Ch10 `report_must_include_all_registered_runs: true`, `agent_cherry_picking_runs_in_report: never_allowed`, `run_selection_criterion_provenance_required`, § 14.8 `external_ledgers.scheduler_run_ledger_uri` |
-| **Severity** | CRITICAL |
-
-### AG-05: 未承認重みでの推論
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Production 推論が、承認された FM SHA と異なる weight を使っている |
-| **原因** | Agent が rollback を独自判断で発動、または新しい checkpoint を "shadow deploy" と称して本番に流す |
-| **検出シグナル** | Inference request log の `model_sha` が Ch11 `fm_default_version_registry` の current entry と不一致 |
-| **対策契約** | Ch11 `inference_sha_must_match_signed_default: true`, `shadow_deploy_confused_with_production: never_allowed`, `rollback_without_gate: never_allowed` |
-| **Severity** | CRITICAL |
-
-### AG-06: Human-in-the-loop バイパス
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Agent が Gate に "確認済み" フラグを立てて後段に進行する。あるいは threshold を下げて trigger しないようにする |
-| **原因** | Approval registry が role-agnostic、agent が config file を書き換えられる、threshold が provenance に固定されていない |
-| **検出シグナル** | Ch13 `gate_state_machine` の `approvers` が空 or agent identity、または `threshold_provenance` が実行時に変化 |
-| **対策契約** | Ch13 `gate1/2/3` の role-aware approval + `self_sign_by_agent_forbidden` + `bypass_gate_by_downgrading_thresholds: never_allowed` |
-| **Severity** | CRITICAL |
-
-### AG-07: Augmentation の agent-side 強化による精度偽装
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Test-time augmentation を強化して metrics を持ち上げる、あるいは train augmentation を弱めて overfit を悪化させて発表用の train loss を下げる |
-| **原因** | Agent が best metrics を最大化するように augmentation policy を「最適化」 |
-| **検出シグナル** | Ch5 `augmentation_provenance.policy_hash` が実行間で変化しているのに、change 承認 provenance が無い |
-| **対策契約** | Ch5 `augmentation_policy_change_requires_gate: true`, `agent_added_augmentation_without_approval: never_allowed` (DG-06 と重複、しかし責任元は agent 側) |
-| **Severity** | HIGH |
-
-### AG-08: Foundation Model の署名検証スキップ
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Ch11 の `fm_fetch_and_verify` を通らずに FM を直接ロードして inference / fine-tune |
-| **原因** | Agent が HuggingFace hub API を直接叩く、あるいは cache path から読み込むだけで verify を省く |
-| **検出シグナル** | Ch11 `fm_fetch_and_verify_provenance` が欠落、または 40-hex SHA が provenance に無い |
-| **対策契約** | Ch11 `_COMMIT_SHA_RE == ^[0-9a-f]{40}$`, `fm_load_without_verify: never_allowed`, `direct_hub_api_call_bypassing_registry: never_allowed` |
-| **Severity** | CRITICAL |
-
-### AG-09: 「自律的に再学習した」ことを Human に伝えない
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Agent が deploy 後に drift を検知し、silent に continual learning を回して重みを更新。Human は「同じモデル」だと思って使っている |
-| **原因** | Continual learning / online learning のトリガーが agent 内部イベント、Human への通知が無い |
-| **検出シグナル** | Model registry の version 履歴に、Gate 承認履歴が対応していない version が存在 |
-| **対策契約** | Ch11 `model_version_bump_requires_gate: true`, `continual_learning_without_notification: never_allowed`, `silent_re_learning_event: never_allowed` |
-| **Severity** | CRITICAL |
-
----
-
-## 14.6 Section 3 — 章間複合失敗（MX-xx）
-
-### MX-01: Chain 内の SHA 不整合
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Ch11 で fetch した FM の SHA と、Ch12 SSL pretrain の base_model_sha が異なる |
-| **検出シグナル** | `capstone_integrated_provenance.hash_chain` の entry 間で `foundation_model_sha` の cross-reference が不一致 |
-| **対策契約** | Ch13 `integrated_provenance_chain` の canonical_manifest + cross-reference verification |
-| **Severity** | HIGH |
-
-### MX-02: Gate 通過時の集合と後段入力の集合が違う
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Ch13 Gate 2 で human が確認した `high_uncertainty_sample_ids` と、Bayes モデルに渡された `known_high_uncertainty_mask` の差集合が非空 |
-| **検出シグナル** | Set diff 検査で mismatch |
-| **対策契約** | Ch13 `capstone_hierarchical_bayes_provenance.known_high_uncertainty_samples_source: gate2_approved_list_only` |
-| **Severity** | CRITICAL |
-
-### MX-03: 承認済み augmentation を後段章が変更
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | Ch5 で signed した augmentation policy を、Ch7 fine-tune が独自 policy に置き換え |
-| **検出シグナル** | Ch7 `fine_tune_provenance.augmentation_policy_hash` != Ch5 signed hash |
-| **対策契約** | Ch7 `fine_tune_must_use_ch5_signed_augmentation: true` |
-| **Severity** | HIGH |
-
-### MX-04: Provenance chain の途中 block を null_sentinel で誤魔化す
-
-| 項目 | 内容 |
-|---|---|
-| **症状** | 実際は存在する Ch10 attribution を「今回は不要」として null_sentinel で埋める |
-| **検出シグナル** | Ch13 Gate 2 が発火しているのに Ch10 attribution が null_sentinel |
-| **対策契約** | Ch13 `null_sentinel.reason_field_required: true` + audit で reason の妥当性を検査 |
-| **Severity** | HIGH |
-
----
-
-## 14.7 失敗パターンレジストリ Skill
+### 契約 YAML
 
 ```yaml
-# failure_pattern_registry.yaml
-skill: "failure_pattern_registry"
+# capstone_hierarchy_detection.yaml
+skill: "capstone_hierarchy_detection"
 version: "1.0.0"
-
-registry_format:
-  entry_schema:
-    id: "str (DG-xx | AG-xx | MX-xx)"
-    category: "deep_general | agentic_specific | mixed"
-    severity: "CRITICAL | HIGH | MEDIUM | LOW"
-    summary: "str"
-    symptom: "str"
-    root_cause: "str"
-    signal_selectors:                                # provenance 上のシグナル
-      - path: "jsonpath expression (RFC 9535)"
-        expect: "presence | value_match | hash_match | set_relation | numeric_bound"
-        fail_condition: "str (executable predicate)"
-        applies_to_chain_entry_key: "str (which chain_entries_ordered key)"
-    contract_defenses:                               # 対策として引く never_allowed / required フィールド
-      - "path.to.contract.field"
-    linked_chapters: ["ch04", "ch05", ...]
-    related_patterns: []                             # 意図的な overlap（DG-06 と AG-07 のように）
-    aliases: []
-    example_provenance_fixture_id: "sha256 (optional)"
-
-# MECE 強制：exact ID 集合を canonical order で列挙する
-required_pattern_ids_exact:
-  deep_general: ["DG-01","DG-02","DG-03","DG-04","DG-05","DG-06","DG-07","DG-08"]
-  agentic_specific: ["AG-01","AG-02","AG-03","AG-04","AG-05","AG-06","AG-07","AG-08","AG-09"]
-  mixed: ["MX-01","MX-02","MX-03","MX-04"]
-
-registry_integrity_rules:
-  no_duplicate_primary_failure_mode: true            # 同じ primary failure mode を持つエントリは 1 つのみ
-  overlaps_only_via_related_patterns_field: true     # DG-06 ↔ AG-07 のような重複はここに宣言
-  no_extra_patterns_without_pr: true                 # required_pattern_ids_exact の外側は PR 必須
-  severity_downgrade_requires_pr: true
-
-# Provenance フィールド名の正規化辞書
-# Ch4-13 の各章の実フィールド名を canonical name にマップし、レジストリの signal_selectors は
-# canonical name を使う。実装時にこの辞書で解決する。
-provenance_field_normalization:
-  ch04_checkpoint_overwrite_policy: "layer_3.checkpoint_overwrite_policy (append_only)"
-  ch04_training_job_approval: "layer_3.training_job_approval"
-  ch04_gpu_budget: "layer_3.gpu_budget"
-  ch04_gpu_environment: "layer_3.gpu_environment_provenance"
-  ch05_augmentation_policy_hash: "layer_2_augmentation.augmentation_policy_signed_hash"
-  ch07_domain_gap_gate_result: "domain_gap_gate_result (Ch7DomainGapResult)"
-  ch07_fine_tune_augmentation_ref: "fine_tune_provenance.augmentation_policy_hash"
-  ch08_ensemble_diversity: "uncertainty_provenance.ensemble_diversity_metrics"
-  ch08_calibration: "uncertainty_provenance.calibration"
-  ch09_bnn_convergence: "bayesian_inference_config.bnn_convergence_metrics"
-  ch10_layer_attribution: "layer_attribution_provenance.sanity_check_results"
-  ch10_runs_summary: "layer_report_provenance.runs_summary"
-  ch11_fm_commit_hash: "foundation_model_provenance.revision_commit_hash"    # 40-hex
-  ch11_manifest_id: "foundation_model_provenance.manifest_id"
-  ch11_fm_update_gate: "fm_update_gate_provenance"
-  ch11_inference_log_model_sha: "inference_service_log.model_revision_commit_hash"
-  ch11_rollback_contract: "foundation_model_provenance.rollback_contract"
-  ch12_ssl_pretrain: "ssl_pretrain_provenance"
-  ch12_ssl_base_model_sha: "ssl_pretrain_provenance.base_model_revision_commit_hash"
-  ch13_chain_entries_ordered: "capstone_integrated_provenance.canonical_manifest.entries"
-  ch13_gate_state: "capstone_three_gate_orchestrator_provenance.gate{1|2|3}_resolution"
-  ch13_bayes_known_high_source: "capstone_hierarchical_bayes_provenance.known_high_uncertainty_samples_source_ids_hash"
-
-acceptance:
-  every_never_allowed_in_ch04_to_ch13_is_mapped_to_at_least_one_pattern: true
-  coverage_check_via_ci_generated_diff: true         # CI で章内 never_allowed を抽出し diff で検査
-  every_pattern_has_at_least_one_signal_selector: true
-  every_pattern_has_at_least_one_contract_defense: true
-  every_signal_selector_path_resolves_via_normalization_dictionary: true
-  required_pattern_ids_exact_present_no_extra: true
-
-# Trust bootstrap：レジストリ自体の署名検証
-trust_bootstrap:
-  maintainer_public_keys_source: "repository_governance/maintainers.keys"    # append-only pubkey list
-  maintainer_public_keys_pin: "sha256 (repo policy に固定)"
-  signatures_required_min: 2                                                 # quorum
-  transparency_log: "append_only_ledger (git-notes or Sigstore Rekor)"
-  registry_hash_must_be_recorded_in_transparency_log: true
-  runtime_override_of_maintainer_keys: "forbidden_all_levels"
-
-agent_authorization:
-  L1: "read_registry"
-  L2: "propose_new_pattern"
-  L3:
-    can_add_or_edit_pattern_via_pr_only: true
-    cannot_edit_registry_in_place_at_runtime: "forbidden_all_levels"
-    cannot_choose_registry_ref_outside_maintainer_signed_set: "forbidden_all_levels"
-  never_allowed:
-    - "delete_pattern_without_gate"
-    - "downgrade_severity_without_gate"
-    - "modify_registry_entries_during_audit_run"
-    - "point_registry_ref_at_unsigned_or_stale_transparency_log_entry"
-
-provenance:
-  failure_pattern_registry_provenance:
-    registry_hash: "sha256 of canonical_json"
-    registry_version: "semver"
-    signed_by: "list of maintainer hashed IDs (>= signatures_required_min)"
-    signature_algo: "ed25519 or ecdsa-p256"
-    transparency_log_uri: "str"
-    transparency_log_inclusion_proof: "sha256 path"
-    signed_at: "iso8601"
-```
-
-### 21 パターンの signal_selectors 具体化（fixture 抜粋）
-
-各パターンについて JSONPath セレクタを与えます。以下は代表的な 6 件（残りは同じ形式で W14-1 のワークとして完成させる）。
-
-```yaml
-# failure_pattern_registry.fixtures.yaml
-- id: "DG-01"
-  severity: "MEDIUM"
-  signal_selectors:
-    - path: "$.chain_entries_ordered[?(@.key=='layer_3_split')].value.gpu_environment_provenance.cudnn_deterministic"
-      expect: "value_match"
-      fail_condition: "value != true"
-      applies_to_chain_entry_key: "layer_3_split"
-    - path: "$..gpu_environment_provenance.tf32_allowed"
-      expect: "presence"
-      fail_condition: "missing"
-  contract_defenses:
-    - "layer_3.gpu_environment_provenance_required"
-    - "layer_3.deterministic_config_signed"
-
-- id: "DG-03"
-  severity: "CRITICAL"
-  signal_selectors:
-    - path: "$..layer_3.split_hashes"
-      expect: "set_relation"
-      fail_condition: "intersection(train, val) != empty OR intersection(train, test) != empty OR intersection(val, test) != empty"
-  contract_defenses:
-    - "layer_3.split_hashes_pairwise_disjoint_verified"
-    - "layer_2_augmentation.no_augmentation_across_splits"
-
-- id: "AG-04"
-  severity: "CRITICAL"
-  signal_selectors:
-    - path: "$..layer_report_provenance.runs_summary[*].run_id"
-      expect: "set_relation"
-      fail_condition: "set(reported_runs) != set(scheduler_ledger.runs_for_project)"
-      applies_to_chain_entry_key: "layer_report"
-  cross_reference_source: "external_scheduler_ledger"    # § 14.8 参照
-  contract_defenses:
-    - "layer_report.report_must_include_all_registered_runs"
-    - "layer_report.run_selection_criterion_provenance_required"
-
-- id: "AG-06"
-  severity: "CRITICAL"
-  signal_selectors:
-    - path: "$..gate{1,2,3}_resolution.approvers[*].hashed_id"
-      expect: "set_relation"
-      fail_condition: "any(approver_hashed_id in agent_identity_hashes)"
-    - path: "$..gate{1,2,3}_resolution.state"
-      expect: "value_match"
-      fail_condition: "state == 'approved' AND approvers.count < gate.reviewers_min"
-    - path: "$..gate{1,2,3}.thresholds"
-      expect: "hash_match"
-      fail_condition: "runtime_threshold_hash != signed_threshold_hash"
-  contract_defenses:
-    - "capstone_three_gate_orchestrator.self_sign_by_agent_forbidden"
-    - "capstone_three_gate_orchestrator.approval_validation.duplicate_identity_forbidden"
-    - "capstone_three_gate_orchestrator.approval_validation.role_conjunction_enforced"
-
-- id: "AG-08"
-  severity: "CRITICAL"
-  signal_selectors:
-    - path: "$..foundation_model_provenance.revision_commit_hash"
-      expect: "value_match"
-      fail_condition: "not re.match('^[0-9a-f]{40}$', value)"
-    - path: "$..foundation_model_provenance.manifest_id"
-      expect: "presence"
-      fail_condition: "missing"
-    - path: "$..foundation_model_provenance.model_card_file_sha256"
-      expect: "hash_match"
-      fail_condition: "value != registry_pinned_model_card_sha256"
-  contract_defenses:
-    - "fm_fetch_and_verify._COMMIT_SHA_RE"
-    - "fm_fetch_and_verify.model_card_file_sha256_pinned_in_manifest"
-
-- id: "MX-02"
-  severity: "CRITICAL"
-  signal_selectors:
-    - path: "$..gate2_resolution.payload.high_uncertainty_sample_ids_hash"
-      expect: "hash_match"
-      fail_condition: "gate2_ids_hash != bayes_known_high_uncertainty_samples_source_ids_hash"
-  cross_reference:
-    source: "gate2_resolution.payload.high_uncertainty_sample_ids"
-    target: "capstone_hierarchical_bayes_provenance.known_high_uncertainty_samples_source_ids"
-    relation: "exact_set_equality_by_sha256_of_sorted_ids"
-  contract_defenses:
-    - "capstone_hierarchical_bayes.known_high_uncertainty_samples_source: gate2_approved_list_only"
-    - "capstone_hierarchical_bayes.known_high_uncertainty_samples_never_excluded"
-```
-
-> [!IMPORTANT]
-> **W14-1 で残り 15 パターンの signal_selectors を同じ形式で埋める。** レジストリが完成するまで `agentic_deep_failure_audit` は `acceptance.every_pattern_has_at_least_one_signal_selector: true` を満たせず、CI が block する。
-
-## 14.8 監査 Skill `agentic_deep_failure_audit`
-
-```yaml
-# agentic_deep_failure_audit.yaml
-skill: "agentic_deep_failure_audit"
-version: "1.0.0"
-
-purpose: "実行後の provenance chain を舐めて failure_pattern_registry の全パターンを照合する静的監査 + 外部 ledger との突合"
-
-inputs:
-  target_provenance_chain: "capstone_integrated_provenance or equivalent chain"
-  registry_ref: "failure_pattern_registry provenance ref (trust_bootstrap 経由で検証)"
-  external_ledgers:                                  # AG-04 循環性の解消
-    scheduler_run_ledger_uri: "append_only ledger URI (GPU scheduler / MLOps)"
-    inference_service_log_uri: "append_only ledger URI (production inference)"
-    model_registry_history_uri: "append_only ledger URI (model registry versions)"
-    signed_by_infra_maintainer: true
-  effective_registry_version:                        # 実行時点でのバージョン記録
-    registry_version_at_run_start: "semver"
-    registry_hash_at_run_start: "sha256"
-    recorded_in_capstone_provenance_at_run_start: true
-  audit_scope:
-    include_severities: ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
-    exclude_categories: []
-    strict_mode: true
-
-trust_bootstrap:
-  registry_signature_verified_against_maintainer_pubkeys: true
-  registry_hash_matches_transparency_log_entry: true
-  agent_choice_of_registry_ref_restricted_to_signed_and_logged_set: true
-
-execution:
-  step_0_trust:
-    - "resolve registry_ref via trust_bootstrap"
-    - "verify signatures, transparency log inclusion, quorum"
-    - "abort audit with CRITICAL finding if trust bootstrap fails"
-  for_each_pattern_in_registry:
-    step_1: "resolve signal_selectors via provenance_field_normalization"
-    step_2: "evaluate fail_condition"
-    step_3: "record finding: pass | fail | not_applicable"
-    step_4: "if fail: attach evidence pointers (jsonpath + observed value + expected)"
-  cross_reference_checks:
-    ch11_ch12_sha_link:
-      description: "Ch11 revision_commit_hash と Ch12 ssl_pretrain_provenance.base_model_revision_commit_hash が一致"
-      severity_if_fail: "HIGH (MX-01)"
-    gate_set_vs_bayes_input_set:
-      description: "Ch13 Gate2 approved high_uncertainty_sample_ids と Bayes known_high_uncertainty_samples_source_ids が完全一致（sha256 of sorted）"
-      severity_if_fail: "CRITICAL (MX-02)"
-    ch05_ch07_augmentation_hash:
-      description: "Ch5 signed augmentation_policy_hash と Ch7 fine_tune_provenance.augmentation_policy_hash が一致"
-      severity_if_fail: "HIGH (MX-03)"
-    null_sentinel_reason_validity:
-      description: "null_sentinel を持つ chain entry の reason が該当 pattern と矛盾しないか"
-      severity_if_fail: "HIGH (MX-04)"
-    ch11_manifest_all_hashes:
-      description: "config.json / tokenizer / model_card / weights の各 sha256 が manifest と一致"
-      severity_if_fail: "CRITICAL (AG-08 関連)"
-    ch07_domain_gap_vs_gate1:
-      description: "Ch7 domain_gap_gate_result.action と Ch13 Gate1 の trigger 記録が整合"
-      severity_if_fail: "HIGH"
-    ch08_ch09_uncertainty_vs_gate2:
-      description: "Ch8/9 uncertainty monitor と Ch13 Gate2 payload の triggered_metrics_histogram が整合"
-      severity_if_fail: "HIGH"
-    ch10_required_sections_present:
-      description: "ch10_section_input_mapping で omit_any_section: fatal のすべてが出力に存在"
-      severity_if_fail: "HIGH"
-    ch12_ssl_augmentation_vs_ch05:
-      description: "SSL の augmentation 使用が Ch5 signed set の範囲内"
-      severity_if_fail: "HIGH"
-    merkle_root_recomputation:
-      description: "capstone_integrated_provenance.hash_chain.chain_root を canonical_manifest から再計算し一致"
-      severity_if_fail: "CRITICAL"
-    ag04_report_vs_scheduler_ledger:
-      description: "layer_report.runs_summary の run_id 集合 = external scheduler_run_ledger の同プロジェクト run 集合"
-      severity_if_fail: "CRITICAL (AG-04)"
-    ag05_inference_sha_vs_default:
-      description: "inference_service_log.model_revision_commit_hash が model_registry_history_uri の current default と一致"
-      severity_if_fail: "CRITICAL (AG-05)"
-    ag09_version_bump_vs_gate:
-      description: "model_registry_history_uri の version bump ごとに fm_update_gate_provenance の approval が対応"
-      severity_if_fail: "CRITICAL (AG-09)"
-
-reporting:
-  findings_format:
-    - id: "str (pattern ID or cross_ref ID)"
-      status: "pass | fail | not_applicable"
-      severity: "CRITICAL | HIGH | MEDIUM | LOW"
-      evidence:
-        signal_path: "jsonpath"
-        observed_value: "any"
-        expected: "str"
-        chain_entry_key: "str"
-      remediation_suggestion: "str (from registry)"
-      linked_pattern_ids: "list"
-  summary:
-    critical_fail_count: "int"
-    high_fail_count: "int"
-    medium_fail_count: "int"
-    low_fail_count: "int"
-    pass_count: "int"
-    not_applicable_count: "int"
-    cross_reference_fail_count: "int"
-
-blocking_policy:                                     # § 14.3 の severity 定義と一致
-  block_report_publication_if_any_of:
-    - "critical_fail_count > 0"
-    - "high_fail_count > 0"                          # HIGH は常に block（strict_mode に依らず）
-    - "cross_reference_fail_count > 0 AND that cross-ref severity in [CRITICAL, HIGH]"
-    - "trust_bootstrap_failed == true"
-    - "medium_fail_count > 0 AND strict_mode == true"
-  warn_only_if:
-    - "medium_fail_count > 0 AND strict_mode == false"
-    - "low_fail_count > 0"
-  downgrade_high_or_critical_blocking_by_strict_mode: "never_allowed"
-
-publishing_enforcement:                              # 「override 不可」を宣言でなく機構で担保
-  report_publisher_service:
-    publisher_service_verifies_signed_blocking_decision: true
-    publisher_service_refuses_publish_if_blocking_decision_missing_or_block: true
-    publisher_service_authenticates_audit_signature_against_maintainer_keys: true
-  agent_capability:
-    agent_has_no_direct_publish_capability: true     # agent は publisher を叩けない
-    agent_can_only_request_publish_via_orchestrator: true
-
-blocking_exception_policy:
-  who_can_grant: "human quorum (>= 2 unique non-agent identities)"
-  required_roles: { any_of: ["pi", "compliance_officer", "ml_lead+statistician"] }
-  fields:
-    exception_id: "sha256"
-    linked_finding_ids: "list"
-    reason: "str"
-    remediation_plan: "str"
-    expires_at: "iso8601"
-    new_audit_run_required_after_fix: true
-    valid_only_for_this_audit_id: true               # 別 audit に流用不可
-  effect:
-    blocking_decision_field_never_rewritten: true    # 記録は block のまま
-    exception_recorded_as_separate_provenance_entry: true
-  never_allowed:
-    - "self_grant_by_agent"
-    - "reuse_exception_across_audit_runs"
-    - "grant_exception_without_remediation_plan"
-
-runtime_and_periodic_audit_guards:                   # 静的監査の時間的死角を補う
-  inference_time:
-    verify_model_sha_on_each_inference_batch_boundary: true
-    trigger_full_audit_on_default_version_change: true
-  drift_window:
-    periodic_re_audit_interval: "daily"
-    trigger_re_audit_on_ppc_calibration_drift: true
-  rollback_events:
-    trigger_immediate_full_audit_on_rollback: true
-  continual_learning_events:
-    trigger_immediate_full_audit_on_any_weight_update: true
-    notify_human_before_activating_updated_weights: true
-
-registry_versioning:
-  chain_effective_registry_hash_recorded_at_run_start: true
-  audit_uses_effective_registry_hash_from_chain: true       # 実行時 vs 監査時のバージョン整合
-  security_critical_registry_updates:
-    trigger_retroactive_re_audit_of_recent_runs: true
-    lookback_window: "30 days (configurable)"
-  non_security_registry_updates:
-    retroactive_re_audit_optional: true
-
-acceptance:
-  every_registry_pattern_evaluated: true
-  every_cross_reference_check_run: true
-  external_ledgers_verified_signed: true
-  merkle_root_recomputation_matches: true
-  trust_bootstrap_passed: true
-  audit_report_generated_and_signed_by_verifier_and_agent: true
-  audit_id_immutable_after_signing: true
-
-agent_authorization:
-  L1: "read_audit_report"
-  L2: "run_audit_and_produce_report"
-  L3:
-    can_propose_registry_extension_via_pr: true
-    cannot_skip_patterns_at_audit_time: "forbidden_all_levels"
-    cannot_edit_registry_during_audit: "forbidden_all_levels"
-    cannot_publish_report_if_critical_or_high_fail: "forbidden_all_levels"
-    cannot_direct_publish_bypassing_publisher_service: "forbidden_all_levels"
-    cannot_grant_blocking_exception: "forbidden_all_levels"
-  never_allowed:
-    - "silent_skip_of_registry_patterns"
-    - "audit_report_edited_after_signing"
-    - "block_override_by_agent"
-    - "reuse_stale_registry_hash"
-    - "sign_audit_report_alone_without_non_agent_verifier"     # 全 audit で verifier 必須
-
-provenance:
-  agentic_deep_failure_audit_provenance:
-    audit_id: "sha256(target_chain_root || registry_hash || findings_canonical_json || blocking_decision)"
-    target_chain_root: "sha256 (from capstone_integrated_provenance)"
-    registry_hash: "sha256"
-    registry_version: "semver"
-    effective_registry_hash_from_chain: "sha256"     # 実行時に固定された hash
-    external_ledgers_snapshot:
-      scheduler_run_ledger_hash: "sha256"
-      inference_service_log_hash: "sha256"
-      model_registry_history_hash: "sha256"
-    findings: "list"
-    cross_reference_findings: "list"
-    summary_counts: "dict"
-    blocking_decision: "block | warn | pass"
-    blocking_decision_signed_by_publisher_service: "bool"
-    trust_bootstrap_report: "dict"
-    signed_by:                                       # 常に non-agent verifier を含む
-      agent_hashed_id: "str"
-      verifier_hashed_ids: "list (>=1 non-agent identity)"
-    signature_algo: "ed25519 or ecdsa-p256"
-    signed_at: "iso8601"
-    audit_report_uri: "str"
-    audit_report_sha256: "str"
-    audit_report_immutable_after_signing: true
-```
-
-### 監査呼び出しタイミング
-
-```mermaid
-sequenceDiagram
-  participant A as Agent
-  participant O as Orchestrator
-  participant AU as agentic_deep_failure_audit
-  participant PB as Publisher Service
-  participant H as Human
-
-  A->>O: complete hierarchical_deep_bayes
-  O->>AU: run audit(target_chain, registry_ref, external_ledgers)
-  AU->>AU: trust_bootstrap + iterate patterns + cross-refs + merkle recomp
-  AU-->>O: findings + summary + blocking decision (signed by agent + verifier)
-  alt blocking_decision == block
-    O->>H: request triage on CRITICAL/HIGH findings
-    H-->>O: fix (new run) or documented exception (quorum ≥2)
-    Note over O,PB: publisher service refuses publish while blocking_decision=block
-  else warn
-    O->>H: notify, may publish with note
-    O->>PB: publish with signed audit ref
-  else pass
-    O->>PB: publish with signed audit ref
-    PB->>PB: verify signature + blocking_decision != block
-    PB-->>A: publish OK
-  end
-```
-
-## 14.9 Ch4-13 の `never_allowed` をレジストリに正規化
-
-vol-03 の各章で `never_allowed` / `forbidden_all_levels` として書かれてきたフィールドを、失敗パターン ID に対応付けます。
-
-> [!IMPORTANT]
-> **以下は代表例の抜粋であり、完全マッピングは CI で自動生成する。** `failure_pattern_registry.acceptance.coverage_check_via_ci_generated_diff` で、Ch4-13 の `.md` から `never_allowed:` / `forbidden_all_levels` を抽出し、レジストリの `contract_defenses` に**すべて**登場することを diff で検査。不足がある PR は CI が block する。
-
-代表例（部分抜粋）：
-
-| 章 | never_allowed フィールド | 対応する pattern ID |
-|---|---|---|
-| Ch4 | `agent_ignoring_gpu_budget` | AG-01 |
-| Ch4 | `agent_silent_checkpoint_overwrite` | AG-03 |
-| Ch5 | `agent_added_augmentation_without_approval` | DG-06, AG-07 |
-| Ch5 | `no_augmentation_across_splits` | DG-03 |
-| Ch7 | `pretrained_weights_downstream_overlap_forbidden` | DG-02 |
-| Ch7 | `fine_tune_must_use_ch5_signed_augmentation` | MX-03 |
-| Ch8 | `deep_ensemble_reported_without_calibration` | DG-07 |
-| Ch9 | `report_bnn_uncertainty_without_convergence` | DG-08 |
-| Ch10 | `attribution_reported_as_evidence_without_sanity_check` | DG-05 |
-| Ch10 | `agent_cherry_picking_runs_in_report` | AG-04 |
-| Ch11 | `fm_load_without_verify` | AG-08 |
-| Ch11 | `fm_default_version_change_without_gate` | AG-02 |
-| Ch11 | `shadow_deploy_confused_with_production` | AG-05 |
-| Ch11 | `continual_learning_without_notification` | AG-09 |
-| Ch12 | `unlabeled_test_overlap` | DG-03 |
-| Ch13 | `bypass_gate_by_downgrading_thresholds` | AG-06 |
-| Ch13 | `self_sign_as_approver` | AG-06 |
-| Ch13 | `collapse_hierarchy_to_avoid_divergences` | DG-08 (関連) |
-| Ch13 | `drop_known_high_uncertainty_samples` | MX-02 |
-| Ch13 | `pass_variance_as_sigma_to_pm_normal` | DG-08 (実装レベル) |
-
-> [!IMPORTANT]
-> **`failure_pattern_registry` の `acceptance.every_never_allowed_in_ch04_to_ch13_is_mapped_to_at_least_one_pattern: true`** により、章側で新規に `never_allowed` を追加した場合、レジストリ側にもエントリを追加しない限り audit が pass しない構造にします。
-
----
-
-## 14.10 Experiment tracking (MLflow / W&B) の導入判断基準
-
-| 判断軸 | Tracking 必要 | Tracking 不要（capstone provenance で十分） |
-|---|---|---|
-| **同時実行 run 数** | > 10 / 日 | ≤ 3 / 日 |
-| **hyperparameter search** | grid / Bayesian search 常用 | 手動調整のみ |
-| **run 間比較 UI 要求** | Human が dashboard で比較したい | レポートベースで十分 |
-| **メトリクス時系列** | epoch 単位の loss curve が必要 | 最終 metrics のみで判断 |
-| **artifact 管理** | 大量の checkpoint / plot を保管 | 少数の signed checkpoint |
-| **provenance chain との統合** | 統合可能な仕組みを持つ（MLflow model registry + tags） | – |
-
-> [!TIP]
-> **導入するなら MLflow を推奨**（open source、model registry と tags で provenance chain と連動しやすい）。W&B は UI が優れるが SaaS ロックインを検討要。**tracking 導入は provenance chain を代替するものではなく、補完的である**ことを Skill 契約で明記する（`experiment_tracking_provenance` は `foundation_model_provenance` 等を代替できない）。
-
-```yaml
-# experiment_tracking_integration.yaml (optional)
-skill: "experiment_tracking_integration"
-version: "1.0.0"
-
-integration_role: "complementary_not_substitutive"
-
-# Ch13 の integrated_provenance_chain に組み込まれる optional slot として動作
-ch13_chain_slot:
-  chain_entry_key: "experiment_tracking_provenance"
-  required_in_chain_entries_ordered: false
-  present_only_if_used: true
-  when_absent_sentinel_reason: "experiment_tracking_not_enabled"
-  never_replaces_required_entries: true              # foundation_model_provenance 等を代替不可
 
 requires:
-  provenance_chain_present: true                     # tracking だけで運用禁止
-  tracking_run_id_recorded_in_capstone_provenance: true
-  tracking_run_metrics_periodically_hashed_and_signed: true
+  hierarchy_labels_provided: true                   # lab / instrument / lot / sample の完全ラベル
+  ch7_domain_gap_gate_available: true               # 層ごとに呼び出すため
+  minimum_samples_per_group: 30                     # 層内比較の統計的最小
+
+decision_logic:
+  for_each_hierarchy_level:
+    - level: "lab"
+    - level: "instrument"
+    - level: "lot"
+  per_level_action:
+    domain_gap_low_all_pairs: "frozen_feature_shared_across_this_level"
+    domain_gap_high_any_pair: "fine_tune_candidate_this_level"
+    domain_gap_mixed: "defer_to_human_this_level"
+  overall_strategy:
+    fine_tune_hierarchy_levels: "list (subset of lab/instrument/lot)"
+    frozen_hierarchy_levels: "complement"
+
+pairwise_scaling_policy:                              # n^2 対策（多装置 / 多 lot 時）
+  max_pairwise_comparisons_per_level: 300             # 例：25 装置なら 300 で打ち切り
+  when_exceeding_max:
+    strategy: "reference_group_plus_clustering"       # (a) reference (最大 n の group) との 1-vs-all
+    clustering_method: "kmeans_on_group_centroids"    #     (b) 残りを cluster 化して代表と比較
+    cluster_k_max: 20
+  fdr_correction: "benjamini_hochberg"                # 多重比較補正
+  skipped_pairs_recorded_in_provenance: true
+
+canonical_top_level_flags:                            # 下流 (orchestrator) が参照する派生フラグ
+  fine_tune_recommended: "bool == (len(overall_strategy.fine_tune_hierarchy_levels) > 0)"
+  fine_tune_deferred_to_human: "bool == any(level.recommendation == 'defer_to_human')"
+  derivation_deterministic: true
 
 acceptance:
-  tracking_can_be_disabled_without_breaking_audit: true    # 依存禁止
-  tracking_run_metrics_hash_matches_provenance: true       # 改ざん検知
-  audit_pass_without_tracking_slot: true                   # tracking 不使用時も audit は通る
+  ch7_score_computed_for_all_evaluated_level_pairs: true   # scaling で pruned した pair は skipped_pairs に記録
+  fdr_correction_applied_if_multiple_pairs: true
+  canonical_flags_derived_and_recorded: true
+  provenance_ref_recorded_per_level: true
 
-# 監査 (§ 14.8) 側で強制する追加チェック
-enforced_by_agentic_deep_failure_audit:
-  - "if experiment_tracking_provenance present: verify tracking_run_metrics_hash matches signed record"
-  - "if any required chain entry absent AND experiment_tracking_provenance present: raise CRITICAL"
-  - "verify tracking is not used in place of any required entry"
+agent_authorization:
+  L1: "read_hierarchy_detection_report"
+  L2: "propose_strategy_but_not_execute"
+  L3:
+    can_recommend_fine_tune_scope: true
+    cannot_launch_fine_tune_without_gate1: "forbidden_all_levels"
+    cannot_merge_hierarchy_levels_silently: "forbidden_all_levels"
+  never_allowed:
+    - "override_ch7_domain_gap_result"
+    - "collapse_lab_and_instrument_levels"
+    - "invent_hierarchy_labels"
 
-never_allowed:
-  - "replace_capstone_provenance_with_tracking_ui_only"
-  - "delete_tracking_run_that_contains_evidence"
-  - "edit_tracking_run_metrics_post_hoc_without_audit_entry"
+provenance:
+  capstone_hierarchy_detection_provenance:
+    hierarchy_levels_detected: "list"
+    per_level_domain_gap:                            # 各層で Ch7 結果を保存
+      - level: "str"
+        pairwise_gaps: "dict of {(a,b): score}"
+        pairwise_ch7_actions: "dict of {(a,b): action}"
+        recommendation: "frozen | fine_tune_candidate | defer_to_human"
+        ch7_provenance_refs: "list"
+    overall_strategy:
+      fine_tune_levels: "list"
+      frozen_levels: "list"
+    strategy_timestamp: "iso8601"
+```
+
+> [!WARNING]
+> **`lab` レベルで fine-tune 候補と判定されたら、実装レベルでは `instrument` 別 fine-tune を強く推奨**します。研究室間で装置校正が別なら、混ぜて fine-tune すると装置差が押し潰されて posterior に不適切な影響が出ます。
+
+---
+
+## 14.5 `capstone_deep_feature_extraction` — FM 特徴 + 不確かさ伝搬
+
+Ch11 の FM を使って深層特徴を抽出し、**per-sample uncertainty** を並列に出す Skill。
+
+### 実装骨子
+
+```python
+# capstone_deep_feature_extraction.py
+import torch
+import numpy as np
+
+
+def capstone_deep_feature_extraction(
+    fm_model,                                       # Ch11 fm_fetch_and_verify で取得済み
+    dataset,                                        # 階層ラベル付き（train/test split id を持つ）
+    fine_tune_scope: dict,                          # Ch4 hierarchy detection の結果
+    feature_probe: dict,                            # {"layer_id": "backbone.layer4", "pooling": "gap", "expected_shape": [D]}
+    uncertainty_method: str = "mc_dropout",         # "mc_dropout" | "bnn" | "deep_ensemble"
+    uncertainty_config: dict = None,                # Ch9 config (n_mc_samples, temperature, etc.)
+    reduction_config: dict = None,                  # {"method":"pca","target_dim":16,"fit_split":"train",...}
+    reduction_transformer=None,                     # train split で事前 fit 済み（提供必須／None なら本関数内で fit）
+    train_split_hash: str = None,
+    device: str = "cuda",
+) -> dict:
+    """
+    fm_model から深層特徴を抽出。
+    - feature_probe.layer_id / pooling で「どの層を特徴とみなすか」を明示
+    - fine_tune_scope で指定された層は fine-tune 済み head、それ以外は frozen backbone
+    - per-sample uncertainty を Ch8/Ch9 の named metrics として出力
+    - PCA/PLS/AE 次元削減は本関数内で必ず適用（train split only で fit）
+    """
+    # ---- (a) FM を eval モードにするが、MC-Dropout 用に dropout 層のみ再有効化
+    fm_model.eval()
+    if uncertainty_method == "mc_dropout":
+        _enable_dropout_layers_only(fm_model)       # Ch9 パターン: BN/LN は eval, Dropout のみ train
+
+    # ---- (b) 指定 layer から特徴を取り出す hook を登録
+    probe_hook = _register_feature_probe(
+        fm_model, layer_id=feature_probe["layer_id"], pooling=feature_probe["pooling"]
+    )
+
+    features_by_sample = []
+    monitors_by_sample = []                          # Ch8 named metrics [n_samples, n_metrics]
+    hierarchy_labels = []
+    split_ids = []
+
+    for batch in dataset:
+        images = batch["image"].to(device)
+        labels = batch["hierarchy"]
+        split_ids.append(batch["split_id"])          # train / val / test
+
+        # fine-tune スコープに応じて分岐
+        if _should_use_finetuned(labels, fine_tune_scope):
+            head = _select_finetuned_head(labels, fine_tune_scope)
+            _ = head(fm_model.backbone(images))      # head 側の中間層も probe 対象になり得る
+        else:
+            with torch.no_grad():
+                _ = fm_model.backbone(images)        # frozen path
+
+        feat = probe_hook.pop()                      # [B, D] — 契約 shape と一致確認済み
+
+        # per-sample uncertainty（Ch8/Ch9 named metrics）
+        if uncertainty_method == "mc_dropout":
+            monitors = _mc_dropout_monitors(fm_model, images, uncertainty_config)
+        elif uncertainty_method == "bnn":
+            monitors = _bnn_monitors(fm_model, images, uncertainty_config)
+        elif uncertainty_method == "deep_ensemble":
+            monitors = _deep_ensemble_monitors(fm_model, images, uncertainty_config)
+        else:
+            raise ValueError(f"unknown uncertainty_method: {uncertainty_method}")
+        # monitors: dict of ["predictive_entropy_normalized", "mutual_information",
+        #                    "max_softmax_uncertainty"] → [B]
+
+        features_by_sample.append(feat.cpu().numpy())
+        monitors_by_sample.append(monitors)
+        hierarchy_labels.append(labels)
+
+    features = np.concatenate(features_by_sample, axis=0)      # [n_samples, D]
+    monitors_stacked = _stack_named_monitors(monitors_by_sample)  # [n_samples, n_metrics]
+
+    # ---- (c) 次元削減（train split only で fit → 全 split に transform）
+    if reduction_transformer is None:
+        reduction_transformer, reduction_meta = _fit_reduction(
+            features=features, split_ids=split_ids, config=reduction_config
+        )
+    else:
+        reduction_meta = _validate_reduction_config(reduction_transformer, reduction_config)
+    reduced_features = reduction_transformer.transform(features)  # [n_samples, target_dim]
+
+    # ---- (d) Ch8 combined_gate と互換な per-sample stop/warn 判定 + 派生スカラー
+    per_sample_gate = _apply_ch8_combined_gate(
+        monitors=monitors_stacked, thresholds=uncertainty_config["ch8_thresholds"]
+    )                                                # {"state":[n], "triggered_metrics":[n]}
+    sigma_deep = _calibrate_sigma_deep(              # target scale へ較正
+        monitors=monitors_stacked,
+        calibration=uncertainty_config["sigma_deep_calibration"],
+    )                                                # [n_samples] スカラー、単位は y と同じ
+
+    high_uncertainty_mask = per_sample_gate["state"] == "stop"
+
+    return {
+        "features_raw": features,                    # [n_samples, D]  (D = probe.expected_shape[-1])
+        "reduced_features": reduced_features,        # [n_samples, target_dim]
+        "uncertainty_monitors": monitors_stacked,    # [n_samples, n_metrics] — Ch8 named metrics
+        "sigma_deep": sigma_deep,                    # [n_samples] — PyMC 用スカラー（較正済み）
+        "per_sample_gate_state": per_sample_gate["state"],       # "pass"|"warn"|"stop"
+        "per_sample_triggered_metrics": per_sample_gate["triggered_metrics"],
+        "high_uncertainty_sample_ids": _collect_ids(hierarchy_labels, high_uncertainty_mask),
+        "hierarchy_labels": hierarchy_labels,
+        "split_ids": split_ids,
+        "uncertainty_method": uncertainty_method,
+        "fine_tune_scope_applied": fine_tune_scope,
+        "feature_probe": feature_probe,
+        "reduction_meta": reduction_meta,            # method/target_dim/transformer_hash/seed/fit_split
+        "attribution_provenance_ref": _optional_ch10_attribution_ref(high_uncertainty_mask),
+        "instrument_history_ref": _optional_instrument_history_ref(hierarchy_labels, high_uncertainty_mask),
+    }
+```
+
+### 特徴の次元削減（PyMC 投入前）
+
+深層特徴は通常 512〜2048 次元。PyMC 階層モデルに直接投入すると事前分布設計が破綻するため、**PCA / partial least squares / Autoencoder**で 8〜32 次元に圧縮します。
+
+```yaml
+# feature_reduction_config.yaml (capstone 内部)
+skill_step: "feature_dim_reduction"
+method: "pca | pls | autoencoder"
+target_dim: 16                                       # PyMC 事前分布と釣り合う次元
+require_variance_explained_min: 0.80                 # PCA では 80% 以上
+fit_only_on_train_split: true                        # test 情報漏洩防止
+random_seed: 20260704                                # 再現性
+train_split_hash: "sha256_of_train_indices"          # split lock
+standardizer_hash: "sha256"                          # 前段の zero-mean/unit-var 変換
+library_versions:                                    # 数値再現性
+  sklearn: "1.5.x"
+  torch: "2.4.x"
+  numpy: "1.26.x"
+ae_config_if_autoencoder:                            # AE のときのみ
+  architecture: "encoder_layers | latent_dim | activation"
+  train_epochs: "int"
+  optimizer_config: "dict"
+  early_stopping: "dict"
+provenance_recorded:
+  - "reduction_transformer_hash"
+  - "random_seed"
+  - "train_split_hash"
+  - "standardizer_hash"
+  - "library_versions"
+```
+
+### 契約 YAML
+
+```yaml
+# capstone_deep_feature_extraction.yaml
+skill: "capstone_deep_feature_extraction"
+version: "1.0.0"
+
+requires:
+  fm_model_provenance_ref: true                     # Ch11 fm_fetch_and_verify の出力
+  fine_tune_scope_from_hierarchy_detection: true    # capstone_hierarchy_detection の出力
+  uncertainty_method_in_ch9_registry: true          # MC-Dropout / BNN / Ensemble のいずれか
+  feature_reduction_fit_only_on_train_split: true   # 漏洩防止
+
+uncertainty_gate:                                    # Ch8 uncertainty_stop_gate と完全互換
+  compatibility_mode: "ch8_named_metrics_preserved"
+  monitored_metrics:                                 # Ch8 の named metrics を保持
+    - "predictive_entropy_normalized"
+    - "mutual_information"
+    - "max_softmax_uncertainty"
+  per_metric_thresholds:                             # Ch8 と同じ辞書構造で受ける
+    predictive_entropy_normalized: { warn: 0.6, stop: 0.85 }
+    mutual_information:            { warn: 0.5, stop: 0.8  }
+    max_softmax_uncertainty:       { warn: 0.6, stop: 0.85 }
+  calibration_required:
+    ece_absolute_max: 0.05
+    ece_relative_max_vs_baseline: 0.5
+    temperature_recorded: true
+  combined_gate_states: ["pass", "warn", "stop"]
+  stop_precedence: true
+  triggered_metric_names_recorded_per_sample: true
+  action_on_stop: "route_to_human_gate2"             # Gate 2 に escalate
+
+feature_probe_contract:
+  layer_id_required: true                            # 例: "backbone.encoder.layer4"
+  pooling_required: true                             # "gap"|"cls_token"|"mean_over_seq"
+  expected_shape_recorded: true                      # [D] を Ch11 manifest と突合
+  probe_hash_recorded: true                          # hook 実装の sha256
+
+feature_reduction_applied_in_this_skill: true         # skeleton 内で必ず transform を通す
+
+acceptance:
+  reduced_features_dim_matches_reduction_target: true
+  uncertainty_monitors_shape_is_n_samples_by_n_metrics: true
+  sigma_deep_shape_is_n_samples: true
+  sigma_deep_calibration_recorded: true
+  fine_tune_scope_applied_matches_input_scope: true
+  no_feature_leakage_train_to_test: true
+  ch8_triggered_metric_names_present_when_state_ne_pass: true
+
+agent_authorization:
+  L1: "read_features_only"
+  L2: "extract_with_signed_scope"
+  L3:
+    can_propose_uncertainty_method: true
+    cannot_change_fine_tune_scope_after_gate1: "forbidden_all_levels"
+    cannot_reuse_features_across_projects_without_approval: "forbidden_all_levels"
+  never_allowed:
+    - "extract_without_hierarchy_scope"
+    - "silently_swap_uncertainty_method"
+    - "fit_reduction_on_test_data"
+    - "drop_uncertainty_field"
+    - "collapse_named_metrics_to_single_scalar_without_calibration"
+    - "run_full_eval_disabling_mc_dropout_layers"
+
+provenance:
+  capstone_deep_feature_extraction_provenance:
+    fm_model_provenance_ref: "id"
+    feature_probe:
+      layer_id: "str"
+      pooling: "str"
+      expected_shape: "list"
+      probe_hash: "sha256"
+    fine_tune_scope: "dict"
+    fine_tune_scope_provenance_ref: "id"
+    uncertainty_method: "mc_dropout | bnn | deep_ensemble"
+    uncertainty_method_provenance_ref: "id"          # Ch9 の該当実行 ID
+    uncertainty_config:
+      n_mc_samples: "int (if mc_dropout)"
+      enable_dropout_only: true                      # BN/LN は eval のまま
+      posterior_samples: "int (if bnn)"
+      ensemble_members: "int (if deep_ensemble)"
+      temperature: "float"
+    calibration:
+      ece_absolute: "float"
+      ece_relative_vs_baseline: "float"
+      temperature: "float"
+    feature_reduction:
+      method: "pca | pls | autoencoder"
+      target_dim: "int"
+      variance_explained: "float (if pca)"
+      transformer_hash: "sha256"
+      random_seed: "int"
+      train_split_hash: "sha256"
+      standardizer_hash: "sha256"
+      fit_split: "train"
+      library_versions: "dict"
+      ae_config: "dict (if autoencoder)"
+    per_sample_uncertainty_stats:
+      per_metric_mean_p95_max: "dict"
+      warn_ratio: "float"
+      stop_ratio: "float"
+      triggered_metric_names_histogram: "dict"
+    sigma_deep_calibration:
+      calibration_method: "isotonic | scaling_by_holdout_residual_std | temperature"
+      calibration_provenance_ref: "id"
+      target_scale_units: "same_as_y"
+    features_shape_raw: "list [n_samples, D]"
+    reduced_features_shape: "list [n_samples, target_dim]"
+    uncertainty_monitors_shape: "list [n_samples, n_metrics]"
+    sigma_deep_shape: "list [n_samples]"
+    high_uncertainty_sample_ids: "list of str"        # Gate 2 payload で必須
+    attribution_provenance_ref: "id (Ch10)"           # Gate 2 payload で必須
+    instrument_history_ref: "id"                      # Gate 2 payload で必須
+    extraction_timestamp: "iso8601"
+```
+
+> [!IMPORTANT]
+> **`triggered_metric_state == "stop"` のサンプルが 5% 以上ある場合**、下流の PyMC 階層モデルはそのサンプルを **`known_high_uncertainty` フラグ付きで投入**し（除外は禁止）、posterior summary で **別セクションとして分離レポート**します（§14.6 で詳述、追加の重み付けは行わない — 尤度の分散項で自然に扱う）。
+
+---
+
+## 14.6 `capstone_hierarchical_bayes` — 深層特徴 × 階層プーリング
+
+vol-02 第12章の階層モデルを **深層特徴入力に対応**させます。
+
+### モデル設計
+
+- 各サンプル $i$（研究室 $\ell$, 装置 $j$, ロット $k$, sample $s$）に対して、**縮約された深層特徴 $\mathbf{z}_i \in \mathbb{R}^{16}$** と観測 uncertainty $\sigma_{\mathrm{deep}, i}$ が入る
+- 材料物性 $y_i$ を階層 GLM で表現：
+
+$$
+y_i \sim \mathrm{Normal}\bigl(\mu_i,\ \sigma_i\bigr),\quad
+\sigma_i = \sqrt{\sigma_{\mathrm{obs}}^2 + w \cdot \sigma_{\mathrm{deep}, i}^2}
+$$
+
+$$
+\mu_i = \alpha_{\ell(i)} + \gamma_{\ell(i), j(i)} + \delta_{\ell(i), j(i), k(i)} + \mathbf{z}_i^\top \boldsymbol{\beta}
+$$
+
+- $\alpha_\ell$: 研究室効果（partial pooling with Normal(μ_α, σ_α)）
+- $\gamma_{\ell, j}$: 装置効果（研究室内 partial pooling）
+- $\delta_{\ell, j, k}$: ロット効果（装置内 partial pooling）
+- $\boldsymbol{\beta}$: 深層特徴の係数
+- $w$: **深層 uncertainty をどの程度観測ノイズに加算するかの重み**（弱情報事前で識別性を確保、感度分析必須）
+- **PyMC 実装では `pm.Normal(mu=mu_i, sigma=σ_i)`（`sigma` パラメータ）**を使う。`sigma_obs^2 + w·σ_deep²` は分散、`σ_i` はその平方根
+
+> [!WARNING]
+> **`sigma_deep` は較正済み・y と同じ単位のスカラー**（§14.5 の `sigma_deep_calibration` で担保）。Ch8/Ch9 の生の normalized risk score をそのまま渡すと `w` が自明な吸収項になり識別性が崩壊する。calibration provenance の確認は Bayes 実行前の acceptance。
+
+### 契約 YAML
+
+```yaml
+# capstone_hierarchical_bayes.yaml
+skill: "capstone_hierarchical_bayes"
+version: "1.0.0"
+
+requires:
+  features_from_capstone_deep_feature_extraction: true
+  hierarchy_labels_complete: true                    # lab/instrument/lot/sample 全て
+  reduction_target_dim_recorded: true                # 事前分布設計の透明性
+  uncertainty_propagation_configured: true           # deep uncertainty をノイズに加算するか
+  sigma_deep_calibration_provenance_present: true    # 較正なしでは w が非識別
+  sigma_deep_units_match_y_scale: true
+
+model_family: "hierarchical_glm_with_deep_features"
+
+pooling_strategy:
+  lab_level: "partial"
+  instrument_level: "partial_within_lab"
+  lot_level: "partial_within_instrument"
+  sample_level: "no_pooling_use_deep_uncertainty_only"
+
+priors:
+  alpha_lab: "Normal(mu_alpha, sigma_alpha), sigma_alpha ~ HalfNormal(1.0)"
+  gamma_instrument: "Normal(0, sigma_gamma), sigma_gamma ~ HalfNormal(1.0)"
+  delta_lot: "Normal(0, sigma_delta), sigma_delta ~ HalfNormal(0.5)"
+  beta_deep: "Normal(0, 1.0)"                         # 特徴を標準化前提
+  sigma_obs: "HalfNormal(1.0)"
+  deep_uncertainty_weight_w: "HalfNormal(0.5)"        # 弱情報、target scale 較正済み前提
+
+likelihood:
+  parameterization: "sigma (standard deviation, not variance)"
+  formula_variance: "obs_variance_i = sigma_obs^2 + w * sigma_deep_i^2"
+  formula_sigma:    "sigma_i = sqrt(obs_variance_i)"
+  pymc_call: "pm.Normal('y', mu=mu_i, sigma=sigma_i, observed=y_obs)"
+
+deep_uncertainty_integration:
+  scalar_source: "sigma_deep from extraction.sigma_deep (calibrated, [n_samples])"
+  formula: "observation_variance = sigma_obs^2 + w * sigma_deep_i^2"
+  known_high_uncertainty_flag_handling:
+    definition: "per_sample_gate_state == 'stop' upstream (Ch8-compatible)"
+    treatment: "flag_only_no_additional_weighting"    # 尤度の分散増で自然に downweight される
+    exclusion_forbidden: true
+    posterior_summary:
+      report_flagged_samples_in_separate_section: true
+      also_report_ppc_metrics_conditioned_on_flag: true
+  identifiability_safeguards:
+    weak_informative_prior_on_w: "HalfNormal(0.5)"
+    require_w_posterior_ci_upper_finite: true
+    sensitivity_analysis_required:
+      variants: ["fixed w=0", "fixed w=1", "prior HalfNormal(0.1)", "prior HalfNormal(2.0)"]
+      report_field: "w_sensitivity_analysis"
+    posterior_correlation_w_vs_sigma_obs_max: 0.7     # 高相関なら非識別警告
+
+sampler_config:
+  backend: "pymc"
+  algorithm: "nuts"
+  chains: 4
+  target_accept: 0.9
+  draws: 2000
+  tune: 1000
+  cores: 4
+  random_seed_per_chain: "list of int"
+
+diagnostics_required:                                  # 基準（違反時は必ず Gate 3 へ）
+  r_hat_max: 1.01
+  ess_min_ratio_of_draws: 0.4
+  divergences_max: 0
+  bfmi_min: 0.3
+  action_on_diagnostic_fail: "route_to_human_gate3"
+
+# 診断不合格は「不合格として記録」する。緩和承認は Gate 3 が発行する
+# documented_exception のみ許可され、`diagnostics_all_pass` は書き換えない。
+diagnostic_exception_policy:
+  who_can_grant: "gate3_only (statistician AND pi, reviewers_min=2)"
+  granted_exception_fields:
+    exception_id: "sha256"
+    violated_metric: "r_hat | ess | divergences | bfmi"
+    violation_value: "float or int"
+    remediation_plan: "str (required)"
+    re_run_reference_provenance_id: "id or null"
+  effect_on_report:
+    diagnostics_all_pass: false                        # 書き換え禁止
+    report_must_include_exception_block: true
+
+posterior_predictive_checks:                           # PPC は必須
+  required: true
+  checks:
+    - "residuals_by_group: lab | instrument | lot"
+    - "posterior_predictive_coverage_50_80_95"
+    - "calibration_by_sigma_deep_bin"
+    - "group_level_shrinkage_diagnostics: alpha_lab_prior_vs_posterior"
+    - "ppc_conditioned_on_known_high_uncertainty_flag"
+  fail_threshold:
+    coverage_95_min: 0.90
+    coverage_95_max: 0.985
+    calibration_slope_min: 0.8
+    calibration_slope_max: 1.2
+  action_on_ppc_fail: "route_to_human_gate3"
+
+acceptance:
+  posterior_summary_computed: true
+  diagnostics_all_pass_or_gate3_exception_granted: true
+  known_high_uncertainty_samples_reported_separately: true
+  known_high_uncertainty_samples_never_excluded: true
+  sigma_parameterization_verified_as_stddev: true
+  w_sensitivity_analysis_reported: true
+  ppc_reported: true
+
+agent_authorization:
+  L1: "read_posterior_summary"
+  L2: "run_sampler_with_signed_config"
+  L3:
+    can_propose_pooling_change: true
+    cannot_change_pooling_structure_without_gate3: "forbidden_all_levels"
+    cannot_hide_divergences: "forbidden_all_levels"
+    cannot_downgrade_diagnostic_thresholds_silently: "forbidden_all_levels"
+  never_allowed:
+    - "collapse_hierarchy_to_avoid_divergences"
+    - "flatten_priors_to_hide_convergence_issues"
+    - "drop_known_high_uncertainty_samples"
+    - "apply_additional_downweight_on_top_of_variance_augmentation"
+    - "pass_variance_as_sigma_to_pm_normal"
+
+provenance:
+  capstone_hierarchical_bayes_provenance:
+    features_provenance_ref: "id"
+    model_family: "str"
+    pooling_strategy: "dict"
+    priors: "dict"
+    sampler_config: "dict"
+    posterior_artifact_uri: "str (arviz netcdf or similar)"
+    posterior_artifact_sha256: "str"
+    diagnostics:
+      r_hat: "dict"
+      ess: "dict"
+      divergences: "int"
+      bfmi: "float"
+      all_pass: "bool"                                # false のときは exception_block 必須
+      exception_block:                                # 記録専用 (all_pass=true には格上げしない)
+        exception_id: "sha256 or null"
+        violated_metric: "str or null"
+        violation_value: "float or int or null"
+        remediation_plan: "str or null"
+        gate3_provenance_ref: "id or null"
+    posterior_predictive_checks:
+      residuals_by_group: "dict (lab|instrument|lot)"
+      coverage_50_80_95: "dict"
+      calibration_by_sigma_deep_bin: "dict"
+      shrinkage_diagnostics: "dict"
+      ppc_conditioned_on_known_high_uncertainty: "dict"
+      ppc_all_pass: "bool"
+    deep_uncertainty_weight_w_posterior: "dict"
+    w_sensitivity_analysis:
+      variants_run: "list"
+      per_variant_summary: "dict"
+      identifiability_verdict: "identified | weakly_identified | non_identified"
+      posterior_corr_w_vs_sigma_obs: "float"
+    known_high_uncertainty_samples_count: "int"
+    known_high_uncertainty_samples_excluded: false    # 常に false（除外禁止）
+    inference_timestamp: "iso8601"
+```
+
+> [!WARNING]
+> **`collapse_hierarchy_to_avoid_divergences: never_allowed`** は本章で最も重要な never_allowed の 1 つです。divergences が出たら階層を collapse（no pooling / complete pooling に降格）するのは統計的に禁忌で、Gate 3（Human 承認）を通す必要があります。
+
+---
+
+## 14.7 `capstone_three_gate_orchestrator` — 3 つの Human-in-the-loop ゲート
+
+**本章の核心**は、以下 3 つの Gate が **順番に** Human 承認を要求する点です：
+
+| Gate | 発火タイミング | Human に見せる情報 |
+|---|---|---|
+| **Gate 1: Fine-tune 起動承認** | `capstone_hierarchy_detection` が fine_tune_candidate を返した直後 | Ch7 domain_gap の pairwise 表 + fine-tune スコープ提案 + GPU 予算見積 |
+| **Gate 2: 不確かさ閾値超え** | `capstone_deep_feature_extraction` の stop_ratio が閾値超過 | High-uncertainty sample のリスト + Ch10 attribution マップ + 該当装置の recent history |
+| **Gate 3: 階層プーリング構造変更** | `capstone_hierarchical_bayes` の diagnostics 不合格または pooling 変更提案 | R̂ / ESS / divergences レポート + pooling structure diff + trace plot |
+
+### Gate 発火ロジック
+
+```python
+# capstone_three_gate_orchestrator.py
+def capstone_three_gate_orchestrator(
+    hierarchy_result: dict,
+    extraction_result: dict = None,
+    bayes_result: dict = None,
+    human_approvals: dict = None,      # {"gate1": ApprovalRecord, ...} — role/expiry 付き
+    prior_state: dict = None,          # 直前の orchestrator 呼び出し結果（re-run 追跡）
+) -> dict:
+    """
+    3 つの Gate を順番に評価。
+    各 Gate は {pending, approved, rejected, expired, disputed} の state machine。
+    approved 以外の状態はすべて詳細を provenance に記録し、以降には進まない。
+    """
+    gates_status = {"gate1": None, "gate2": None, "gate3": None}
+
+    # ---- Gate 1
+    if hierarchy_result["fine_tune_recommended"]:
+        g1 = _resolve_gate_state(
+            gate="gate1",
+            approvals=human_approvals,
+            required_roles={"any_of": ["ml_lead", "pi"]},
+            reviewers_min=1,
+            payload={
+                "pairwise_ch7_table": hierarchy_result["per_level_domain_gap"],
+                "proposed_scope": hierarchy_result["overall_strategy"]["fine_tune_hierarchy_levels"],
+                "gpu_budget_estimate": hierarchy_result.get("gpu_budget_estimate"),
+                "fine_tune_deferred_to_human": hierarchy_result.get("fine_tune_deferred_to_human"),
+            },
+            prior_state=prior_state,
+        )
+        if g1["state"] != "approved":
+            return _pause_or_terminate(gate="gate1", resolution=g1)
+        gates_status["gate1"] = g1
+    else:
+        gates_status["gate1"] = {"state": "not_triggered"}
+
+    # ---- Gate 2
+    if extraction_result is not None:
+        stop_ratio = extraction_result["per_sample_uncertainty_stats"]["stop_ratio"]
+        warn_ratio = extraction_result["per_sample_uncertainty_stats"]["warn_ratio"]
+        escalation = _gate2_escalation_reason(
+            stop_ratio=stop_ratio,
+            warn_ratio=warn_ratio,
+            per_sample_gate_state=extraction_result["per_sample_gate_state"],
+            hierarchy_labels=extraction_result["hierarchy_labels"],
+        )
+        if escalation is not None:
+            g2 = _resolve_gate_state(
+                gate="gate2",
+                approvals=human_approvals,
+                required_roles={"any_of": ["domain_expert", "pi"]},
+                reviewers_min=1,
+                payload={
+                    "escalation_reason": escalation,       # stop/warn/cluster/consecutive
+                    "stop_ratio": stop_ratio,
+                    "warn_ratio": warn_ratio,
+                    "high_uncertainty_sample_ids": extraction_result["high_uncertainty_sample_ids"],
+                    "attribution_provenance_ref": extraction_result["attribution_provenance_ref"],
+                    "instrument_history_ref": extraction_result["instrument_history_ref"],
+                    "triggered_metrics_histogram": extraction_result[
+                        "per_sample_uncertainty_stats"
+                    ]["triggered_metric_names_histogram"],
+                },
+                prior_state=prior_state,
+            )
+            if g2["state"] != "approved":
+                return _pause_or_terminate(gate="gate2", resolution=g2)
+            gates_status["gate2"] = g2
+        else:
+            gates_status["gate2"] = {"state": "not_triggered"}
+
+    # ---- Gate 3
+    if bayes_result is not None:
+        needs_gate3 = (
+            (not bayes_result["diagnostics"]["all_pass"])
+            or (not bayes_result["posterior_predictive_checks"]["ppc_all_pass"])
+            or bayes_result.get("pooling_change_proposed", False)
+        )
+        if needs_gate3:
+            g3 = _resolve_gate_state(
+                gate="gate3",
+                approvals=human_approvals,
+                required_roles={"all_of": ["statistician", "pi"]},
+                reviewers_min=2,
+                forbid_duplicate_identity=True,
+                forbid_self_sign_agent_id=True,
+                payload={
+                    "diagnostics": bayes_result["diagnostics"],
+                    "ppc": bayes_result["posterior_predictive_checks"],
+                    "current_pooling": bayes_result["pooling_strategy"],
+                    "proposed_pooling": bayes_result.get("proposed_pooling"),
+                    "trace_plot_uri": bayes_result.get("trace_plot_uri"),
+                    "w_sensitivity_analysis": bayes_result["w_sensitivity_analysis"],
+                    "remediation_plan_required": True,
+                },
+                prior_state=prior_state,
+            )
+            if g3["state"] != "approved":
+                return _pause_or_terminate(gate="gate3", resolution=g3)
+            gates_status["gate3"] = g3
+        else:
+            gates_status["gate3"] = {"state": "not_triggered"}
+
+    return {
+        "status": "all_gates_passed",
+        "gates": gates_status,
+        "next_action": "generate_final_report",
+    }
+```
+
+### 契約 YAML
+
+```yaml
+# capstone_three_gate_orchestrator.yaml
+skill: "capstone_three_gate_orchestrator"
+version: "1.0.0"
+
+requires:
+  three_gates_defined: true
+  each_gate_has_signed_approval_slot: true
+  approval_registry_provides_role_and_identity: true
+  human_approvers_min_per_gate: 1                    # Gate 3 は 2 名必須
+
+gate_state_machine:
+  states: ["pending", "approved", "rejected", "expired", "disputed", "not_triggered"]
+  transitions:
+    pending_to_approved: "signed_by_valid_role_within_expiry"
+    pending_to_rejected: "signed_reject_with_reason"
+    pending_to_expired:  "no_signature_before_expires_at"
+    pending_to_disputed: "reviewers_signed_contradictory_decisions"
+  on_rejected: "orchestrator_terminates_pipeline; re_run_requires_new_provenance_id"
+  on_expired:  "orchestrator_terminates_pipeline; timeout_recorded"
+  on_disputed: "escalate_to_higher_authority; agent_cannot_break_tie"
+  re_run_after_rejection_or_expiry:
+    new_run_provenance_id_required: true
+    link_to_previous_rejection_or_expiry_id: "required"
+    fresh_signatures_required_for_all_downstream_gates: true
+
+approval_validation:
+  role_conjunction_enforced: true                    # "AND" is a hard AND
+  role_disjunction_enforced: true                    # "OR" は列挙のうち 1 名以上
+  duplicate_identity_forbidden: true                 # 同一 human ID は 1 回のみ
+  self_sign_by_agent_forbidden: true                 # agent の identity では絶対に署名不可
+  signature_verified_against_registry_public_keys: true
+  expiry_recorded_per_signature: true
+
+gate_definitions:
+  gate1_fine_tune_launch:
+    trigger: "hierarchy_result.fine_tune_recommended == true"
+    required_roles: { any_of: ["ml_lead", "pi"] }
+    reviewers_min: 1
+    approval_expiry_hours: 168                       # 7 日
+    payload_must_include: ["pairwise_ch7_table", "proposed_scope", "gpu_budget_estimate", "fine_tune_deferred_to_human"]
+  gate2_uncertainty_stop:
+    trigger_any_of:
+      - "stop_ratio >= 0.05"
+      - "warn_ratio >= 0.20"
+      - "consecutive_warn_batches_over_group >= 3"
+      - "group_local_warn_cluster_detected"          # 単一 instrument/lot に warn が集中
+    required_roles: { any_of: ["domain_expert", "pi"] }
+    reviewers_min: 1
+    approval_expiry_hours: 72
+    payload_must_include:
+      - "escalation_reason"
+      - "stop_ratio"
+      - "warn_ratio"
+      - "high_uncertainty_sample_ids"
+      - "attribution_provenance_ref"
+      - "instrument_history_ref"
+      - "triggered_metrics_histogram"
+  gate3_pooling_or_diagnostics:
+    trigger_any_of:
+      - "bayes.diagnostics.all_pass == false"
+      - "bayes.posterior_predictive_checks.ppc_all_pass == false"
+      - "pooling_change_proposed == true"
+    required_roles: { all_of: ["statistician", "pi"] }
+    reviewers_min: 2
+    duplicate_identity_forbidden: true
+    approval_expiry_hours: 72
+    payload_must_include:
+      - "diagnostics"
+      - "ppc"
+      - "current_pooling"
+      - "proposed_pooling"
+      - "trace_plot_uri"
+      - "w_sensitivity_analysis"
+      - "remediation_plan_required"
+
+acceptance:
+  no_gate_bypassed: true
+  all_approvals_signed_and_registry_verified: true
+  gate_state_transitions_recorded: true
+  re_run_provenance_chain_verified_if_prior_rejection_or_expiry: true
+
+agent_authorization:
+  L1: "read_gate_status"
+  L2: "prepare_gate_payload_and_notify_human"
+  L3:
+    can_propose_scope_or_pooling_change: true
+    cannot_self_approve_any_gate: "forbidden_all_levels"
+    cannot_reorder_gates: "forbidden_all_levels"
+    cannot_bypass_gate_by_downgrading_thresholds: "forbidden_all_levels"
+    cannot_break_disputed_tie: "forbidden_all_levels"
+  never_allowed:
+    - "auto_approve_any_gate"
+    - "skip_gate_1_when_fine_tune_recommended"
+    - "skip_gate_2_when_any_escalation_reason_triggered"
+    - "skip_gate_3_when_diagnostics_or_ppc_fail"
+    - "self_sign_as_approver"
+    - "reuse_expired_or_rejected_signature"
+    - "count_same_human_id_twice_for_reviewers_min"
+
+provenance:
+  capstone_three_gate_orchestrator_provenance:
+    gates_evaluated: "list"
+    gate1_resolution:
+      state: "one of gate_state_machine.states"
+      approvers: "list of {hashed_id, role, signature_id, signed_at, expires_at}"
+      rejection_reason: "str or null"
+      expired_at: "iso8601 or null"
+      previous_run_link: "provenance_id or null"
+    gate2_resolution: "same schema as gate1_resolution"
+    gate3_resolution:
+      state: "one of gate_state_machine.states"
+      approvers: "list (>=2 unique identities, roles include statistician AND pi)"
+      exception_granted_id: "sha256 or null"          # bayes diagnostic exception を発行した場合
+      remediation_plan: "str or null"
+      previous_run_link: "provenance_id or null"
+    approval_registry_signatures_verified: true
+    gate_evaluation_timestamps: "list of iso8601"
+```
+
+> [!IMPORTANT]
+> **エージェントが自分で承認者になることは全レベル forbidden**（`self_sign_as_approver`）。approval registry が Ch11 で導入した署名検証を行い、承認者 ID の hash が Human の登録済み ID と一致することを確認します。
+
+---
+
+## 14.8 統合 Skill `hierarchical_deep_bayes` — 全体契約
+
+上記 4 つを **1 本の統合契約**にまとめます。
+
+```yaml
+# hierarchical_deep_bayes.yaml (capstone integrated)
+skill: "hierarchical_deep_bayes"
+version: "1.0.0"
+
+sub_skills_orchestrated:
+  - "capstone_hierarchy_detection"
+  - "capstone_deep_feature_extraction"
+  - "capstone_hierarchical_bayes"
+  - "capstone_three_gate_orchestrator"
+
+execution_order:                                     # 順序固定
+  1: "capstone_hierarchy_detection"
+  2: "capstone_three_gate_orchestrator (gate1 eval)"
+  3: "capstone_deep_feature_extraction (if gate1 approved or not triggered)"
+  4: "capstone_three_gate_orchestrator (gate2 eval)"
+  5: "capstone_hierarchical_bayes (if gate2 approved or not triggered)"
+  6: "capstone_three_gate_orchestrator (gate3 eval)"
+  7: "generate_final_report_via_ch10_deep_report_template"
+
+integrated_provenance_chain:                         # Ch4-12 の provenance を全て継承（省略不可）
+  # 適用されない block も必ず nullhash sentinel で記録し、決定的順序を維持する
+  chain_entries_ordered:                              # この順序が hash_chain の canonical order
+    - key: "layer_1_data"
+      source: "vol-02 datasets"
+      required: true
+    - key: "layer_2_augmentation"
+      source: "Ch4"
+      required: true
+    - key: "layer_3_split"
+      source: "Ch4"
+      required: true
+    - key: "layer_4_pretrained_weights"
+      source: "Ch7 (if fine-tune applied)"
+      required: false                                 # 未適用時は null_sentinel で記録
+    - key: "foundation_model_provenance"
+      source: "Ch11 fm_fetch_and_verify"
+      required: true
+    - key: "fm_query_provenance"
+      source: "Ch11 fm_query"
+      required: false
+    - key: "ssl_pretrain_provenance"
+      source: "Ch12 (if SSL encoder used)"
+      required: false
+    - key: "ssl_representation_eval_provenance"
+      source: "Ch12 ssl_representation_eval"
+      required: false
+    - key: "bayesian_inference_config"
+      source: "Ch9"
+      required: true
+    - key: "layer_attribution"
+      source: "Ch10 (for gate2 payload)"
+      required: true
+    - key: "layer_human_review"
+      source: "Ch10 (for all 3 gates)"
+      required: true
+    - key: "capstone_hierarchy_detection_provenance"
+      source: "this chapter"
+      required: true
+    - key: "capstone_deep_feature_extraction_provenance"
+      source: "this chapter"
+      required: true
+    - key: "capstone_hierarchical_bayes_provenance"
+      source: "this chapter"
+      required: true
+    - key: "capstone_three_gate_orchestrator_provenance"
+      source: "this chapter"
+      required: true
+  null_sentinel:                                      # required:false が欠けたときの決定的表現
+    hash: "0000000000000000000000000000000000000000000000000000000000000000"
+    reason_field_required: true                       # なぜ適用されないかを人間可読で記録
+
+final_report_generation:
+  template: "ch10_deep_report_template"
+  ch10_section_input_mapping:                         # Ch10 各セクションへの capstone 出力マッピング
+    executive_summary:
+      from:
+        - "hierarchy_result.overall_strategy"
+        - "bayes_result.posterior_summary_by_hierarchy_level"
+        - "gates.summary"
+    data_and_provenance:
+      from:
+        - "integrated_provenance_chain (entire)"
+        - "capstone_integrated_provenance.hash_chain"
+    domain_gap_and_fine_tune:
+      from:
+        - "hierarchy_result.per_level_domain_gap"
+        - "hierarchy_result.overall_strategy"
+        - "hierarchy_result.pairwise_scaling_policy"
+    feature_extraction_and_uncertainty:
+      from:
+        - "extraction_result.feature_probe"
+        - "extraction_result.reduction_meta"
+        - "extraction_result.per_sample_uncertainty_stats"
+        - "extraction_result.calibration"
+    hierarchical_bayes:
+      from:
+        - "bayes_result.pooling_strategy"
+        - "bayes_result.priors"
+        - "bayes_result.diagnostics"
+        - "bayes_result.posterior_predictive_checks"
+        - "bayes_result.w_sensitivity_analysis"
+    layer_attribution:
+      from: ["extraction_result.attribution_provenance_ref"]
+    three_gate_audit_trail:
+      from: ["orchestrator_result.gate1_resolution", "orchestrator_result.gate2_resolution", "orchestrator_result.gate3_resolution"]
+    known_high_uncertainty_samples:
+      from: ["extraction_result.high_uncertainty_sample_ids", "bayes_result.known_high_uncertainty_samples_count"]
+    reproducibility:
+      from: ["capstone_integrated_provenance.hash_chain", "capstone_integrated_provenance.canonical_manifest"]
+  omit_any_section: "fatal"
+  additional_sections_required:
+    - "hierarchy_summary_diagram"
+    - "fine_tune_scope_rationale"
+    - "per_sample_uncertainty_distribution"
+    - "posterior_summary_by_hierarchy_level"
+    - "three_gate_audit_trail"
+    - "known_high_uncertainty_samples_list"
+    - "reproducibility_manifest_hash_chain"
+
+acceptance:
+  all_sub_skills_provenance_present: true
+  all_three_gates_status_recorded: true
+  posterior_diagnostics_pass_or_gate3_approved: true
+  reproducibility_manifest_hashes_chain_verified: true
+
+agent_authorization:
+  L1: "read_final_report"
+  L2: "execute_sub_skills_up_to_gate1_pause"
+  L3:
+    can_execute_with_gate_approvals: true
+    cannot_reorder_execution_steps: "forbidden_all_levels"
+    cannot_skip_gate_orchestrator_between_steps: "forbidden_all_levels"
+    cannot_generate_report_before_all_gates_resolved: "forbidden_all_levels"
+  never_allowed:
+    - "execute_bayes_before_gate2_resolved"
+    - "generate_report_before_gate3_resolved"
+    - "reuse_sub_skill_output_across_projects_without_provenance_re_verification"
+    - "collapse_provenance_chain_to_simplify_report"
+
+provenance:
+  capstone_integrated_provenance:
+    sub_skill_provenance_refs:
+      hierarchy_detection: "id"
+      feature_extraction: "id"
+      hierarchical_bayes: "id"
+      three_gate_orchestrator: "id"
+    canonical_manifest:                              # hash 決定性の根拠
+      format: "canonical_json"                       # RFC 8785 JCS 準拠
+      keys_ordered_by: "chain_entries_ordered above"
+      absent_optional_blocks_encoded_as: "null_sentinel with reason field"
+      per_entry_fields: ["key", "type_label", "provenance_id", "sha256", "required", "reason_if_absent"]
+    hash_chain:
+      chain_algorithm: "sha256_merkle_over_canonical_manifest"
+      leaf_hash: "sha256(canonical_json_of_entry)"
+      internal_node_hash: "sha256(left_hash || right_hash)"
+      chain_root: "sha256 (merkle root)"
+      chain_root_verified: true
+    execution_timestamps: "list"
+    final_report_uri: "str"
+    final_report_sha256: "str"
 ```
 
 ---
 
-## 14.11 失敗パターンからの防御パターン集
+## 14.9 全体フロー実装（オーケストレーション骨子）
 
-| 攻撃面 | 典型的な agent の抜け穴 | 防御 |
+```python
+# hierarchical_deep_bayes.py
+def hierarchical_deep_bayes(
+    dataset,
+    fm_provenance_ref: str,
+    approval_registry,
+) -> dict:
+    """
+    capstone: 全 Skill を順番に呼び出し、3 Gate を通しながら最終レポートを生成。
+    """
+    approvals = approval_registry.get_pending(project_id=dataset.project_id)
+
+    # Step 1: 階層検出
+    h = capstone_hierarchy_detection(dataset)
+
+    # Step 2: Gate 1 評価
+    orchestrator_state = capstone_three_gate_orchestrator(
+        hierarchy_result=h, human_approvals=approvals
+    )
+    if orchestrator_state["status"] != "all_gates_passed":
+        return orchestrator_state                    # Human 待ちで一時停止
+
+    # Step 3: 深層特徴抽出（reduced_features と sigma_deep が出る）
+    ext = capstone_deep_feature_extraction(
+        fm_model=_load_fm(fm_provenance_ref),
+        dataset=dataset,
+        fine_tune_scope=h["overall_strategy"],
+        feature_probe=_ch11_manifest_feature_probe(fm_provenance_ref),
+        uncertainty_method="mc_dropout",
+        uncertainty_config=_load_ch9_config(),
+        reduction_config=_load_reduction_config(),
+        train_split_hash=dataset.train_split_hash,
+    )
+
+    # Step 4: Gate 2 評価
+    orchestrator_state = capstone_three_gate_orchestrator(
+        hierarchy_result=h, extraction_result=ext, human_approvals=approvals
+    )
+    if orchestrator_state["status"] != "all_gates_passed":
+        return orchestrator_state
+
+    # Step 5: PyMC 階層モデル（reduced_features と sigma_deep を渡す）
+    bayes = capstone_hierarchical_bayes(
+        features=ext["reduced_features"],            # [n, target_dim]
+        sigma_deep=ext["sigma_deep"],                # [n], y と同じ単位に較正済み
+        hierarchy_labels=ext["hierarchy_labels"],
+        known_high_uncertainty_mask=(
+            ext["per_sample_gate_state"] == "stop"
+        ),                                            # 除外はしない、フラグとしてのみ使用
+    )
+
+    # Step 6: Gate 3 評価
+    orchestrator_state = capstone_three_gate_orchestrator(
+        hierarchy_result=h, extraction_result=ext, bayes_result=bayes,
+        human_approvals=approvals,
+    )
+    if orchestrator_state["status"] != "all_gates_passed":
+        return orchestrator_state
+
+    # Step 7: 最終レポート（Ch10 deep_report_template）
+    report = _generate_final_report_ch10(
+        hierarchy=h, extraction=ext, bayes=bayes, gates=orchestrator_state
+    )
+    return {
+        "status": "complete",
+        "report_uri": report["uri"],
+        "capstone_integrated_provenance": _build_provenance_chain(h, ext, bayes, orchestrator_state),
+    }
+```
+
+---
+
+## 14.10 エージェント役割の具体シーン
+
+capstone における エージェントの動きを、実際の対話シーンで示します：
+
+| フェーズ | エージェントの行動 | Human の役割 |
 |---|---|---|
-| Config drift | Runtime に config を差し替え | `signed_config_hash_verified_at_runtime` + `runtime_config_immutable` |
-| Registry poisoning | 悪意ある entry の追加 | `registry_edit_via_pr_only` + `signed_by` |
-| Approval spoofing | Agent が human ID を騙る | Public key 検証 + `self_sign_by_agent_forbidden` + rate limit |
-| Provenance omission | 「軽量化」で block を省く | `chain_entries_ordered` + `null_sentinel with reason_required` |
-| Silent rollback | Agent が rollback を発動して隠蔽 | `rollback_contract` + Gate + notification |
-| Metric cherry-pick | 良い run のみを表示 | `report_must_include_all_registered_runs` + registry cross-check |
-| Threshold gaming | 閾値を実行時に下げる | `threshold_provenance_signed` + `runtime_threshold_change_forbidden` |
-| Duplicate approver | 同一人物が 2 回 sign | `duplicate_identity_forbidden` |
+| 階層検出 | 「lab 間で domain_gap = 0.72、instrument 間で 0.55、lot 間で 0.18 でした。lab / instrument を fine-tune 候補、lot は frozen で提案します」 | pairwise 表を確認し、Gate 1 を承認 |
+| 深層抽出 | 「MC-Dropout で per-sample uncertainty を計算しました。stop_ratio = 8.3% です（閾値 5% 超過）」 | 該当サンプルの attribution マップと該当装置の recent history を確認し、Gate 2 を承認（または該当装置のサンプル除外を指示） |
+| Bayes 推論 | 「R̂ 最大 1.008、ESS 最小比率 0.52、divergences 3 件、PPC coverage_95 = 0.87（下限違反）。**diagnostics_all_pass = false** です。Gate 3 のご判断をお願いします」 | trace plot と PPC を確認し、reparameterization 提案 or 再サンプリング要求。承認する場合は `documented_exception` として remediation_plan と共に記録（`diagnostics.all_pass` は false のまま）。差し戻し時は新 provenance_id で再実行 |
+| 最終レポート | 「Ch10 deep_report_template で最終レポートを生成しました。hash chain が検証済みです」 | レポートに sign-off |
+
+---
+
+## 14.11 失敗パターンと対策
+
+| 失敗 | 症状 / 兆候 | 対策（参照する契約フィールド） |
+|---|---|---|
+| Gate をエージェントが self-approve | 監査崩壊 | `self_sign_as_approver: never_allowed` + `approval_registry_signatures_verified` + `self_sign_by_agent_forbidden` |
+| Divergences が出たら pooling を collapse | 階層情報を失う統計的禁忌 | `collapse_hierarchy_to_avoid_divergences: never_allowed` + Gate 3 経由必須 |
+| 高不確かさサンプルを silent に drop | 分布尾の情報を失う | `drop_known_high_uncertainty_samples: never_allowed` + `known_high_uncertainty_samples_never_excluded: true` + `known_high_uncertainty_samples_reported_separately` |
+| 特徴次元削減を test data で fit | 情報漏洩 | `fit_only_on_train_split: true` + `fit_reduction_on_test_data: never_allowed` + `train_split_hash` |
+| 深層 uncertainty を PyMC ノイズに加算し忘れ | posterior が過信 | `uncertainty_propagation_configured: true` + `likelihood.formula_sigma` 明記 |
+| PyMC で分散を sigma として渡す | 実効ノイズが 2 乗される致命バグ | `likelihood.parameterization: sigma` + `pass_variance_as_sigma_to_pm_normal: never_allowed` |
+| deep_uncertainty を較正せず投入 | `w` が非識別、posterior が病理的 | `sigma_deep_calibration_provenance_present: true` + `w_sensitivity_analysis_reported: true` |
+| 尤度分散増と ad hoc 重みで二重補正 | posterior 精度が過度に減衰 | `treatment: flag_only_no_additional_weighting` + `apply_additional_downweight_on_top_of_variance_augmentation: never_allowed` |
+| 診断 fail を Gate 3 で `all_pass=true` に格上げ | 監査記録の改竄 | `diagnostic_exception_policy.effect_on_report.diagnostics_all_pass: false` (書き換え禁止) + `exception_block` に必ず記録 |
+| PPC を省略して収束のみ確認 | R̂ 良好でも予測不適合を見逃す | `posterior_predictive_checks.required: true` + `ppc_all_pass` |
+| Ch8 named metrics を単一スカラーに畳む | 較正なしで意味不明な閾値化 | `collapse_named_metrics_to_single_scalar_without_calibration: never_allowed` + `triggered_metric_names_recorded_per_sample: true` |
+| MC-Dropout で `model.eval()` により dropout 無効化 | uncertainty が常に 0 | `enable_dropout_only: true` + `run_full_eval_disabling_mc_dropout_layers: never_allowed` |
+| FM 特徴層を暗黙に選択 | 実装依存で再現不能 | `feature_probe.layer_id / pooling / expected_shape / probe_hash` 全て記録必須 |
+| 縮約 transformer の hash のみ記録 | 再現には seed/split/version が必要 | `random_seed` + `train_split_hash` + `standardizer_hash` + `library_versions` |
+| 多装置で pairwise が n² 爆発 | Ch7 コスト超過、実行時間破綻 | `pairwise_scaling_policy.max_pairwise_comparisons_per_level` + reference_group_plus_clustering + FDR |
+| Fine-tune スコープを Gate 1 後にエージェントが変更 | 承認された scope からの逸脱 | `cannot_change_fine_tune_scope_after_gate1: forbidden_all_levels` |
+| Gate 拒否 / expiry を無視して再実行 | 承認履歴が壊れる | `re_run_after_rejection_or_expiry.new_run_provenance_id_required: true` + `link_to_previous_rejection_or_expiry_id: required` |
+| Gate 3 で同一人物を 2 回カウント | reviewers_min の空洞化 | `duplicate_identity_forbidden: true` + `count_same_human_id_twice_for_reviewers_min: never_allowed` |
+| Reviewer 間の矛盾を agent が調停 | 決裁権の逸脱 | `on_disputed: escalate_to_higher_authority` + `cannot_break_disputed_tie: forbidden_all_levels` |
+| Gate 2 が stop_ratio のみ監視 | warn クラスターや drift を見逃す | `gate2_uncertainty_stop.trigger_any_of` に `warn_ratio` / `consecutive` / `group_local_cluster` |
+| 実行順序を並列化して整合性を破壊 | provenance chain が構築できない | `cannot_reorder_execution_steps: forbidden_all_levels` |
+| Provenance chain を "簡潔化" のため省略 | 監査不能 | `collapse_provenance_chain_to_simplify_report: never_allowed` + `chain_entries_ordered` + `null_sentinel` |
+| Hash chain の順序を実行時決定 | 同一 provenance が異なる root を返す | `canonical_manifest.format: canonical_json` + `keys_ordered_by: chain_entries_ordered` + `sha256_merkle_over_canonical_manifest` |
+| Ch10 template のセクションを omit | 監査観点の欠落 | `ch10_section_input_mapping` + `omit_any_section: fatal` |
+| Gate 2 承認前に Bayes を走らせる | uncertainty をレビューせず posterior に埋め込む | `execute_bayes_before_gate2_resolved: never_allowed` |
+| Gate 3 未解決でレポート発行 | 未承認の推論結果を公開 | `generate_report_before_gate3_resolved: never_allowed` |
+| 事前分布を flatten して divergences 回避 | データ駆動の見かけ、実は事前弱化 | `flatten_priors_to_hide_convergence_issues: never_allowed` |
+| Sub-skill 出力を別プロジェクトで再利用 | provenance の対象が変わっているのに監査不能 | `reuse_sub_skill_output_across_projects_without_provenance_re_verification: never_allowed` |
 
 ---
 
 ## 14.12 まとめ
 
-- 深層 × Agentic の失敗は **章単位のチェックでは検出できない** 複合パターンを含む
-- `failure_pattern_registry` で **DG (8) + AG (9) + MX (4) = 21 パターン**を一元管理
-- `agentic_deep_failure_audit` は provenance chain 全体に対する静的監査を行い、CRITICAL/HIGH 発見時は report 発行を block
-- Ch4-13 の `never_allowed` は全てレジストリの signal と対策契約にマップ
-- Experiment tracking は provenance chain を補完するもので、代替してはいけない
+- 深層 × 階層 × 不確かさ の **3 者統合は接続面の契約が全て**
+- **`capstone_hierarchy_detection`** で層ごとに fine-tune / frozen を決定（Ch7 domain_gap_gate を全 pair で実行）
+- **`capstone_deep_feature_extraction`** で FM 特徴 + per-sample uncertainty を並列化、Ch8 stop_gate と互換
+- **`capstone_hierarchical_bayes`** で PyMC 階層 GLM に深層特徴と uncertainty を投入、`collapse_hierarchy_to_avoid_divergences` は禁忌
+- **`capstone_three_gate_orchestrator`** で 3 つの Human 承認ゲートを厳格化（fine-tune / uncertainty / pooling）
+- **`hierarchical_deep_bayes`** 統合 Skill が Ch4-12 の provenance chain を hash で連結、監査可能性を担保
+- 失敗パターン 12 件を Skill 契約で予防
 
 ## 14.13 章末チェックリスト
 
-- [ ] Ch4-13 の全 `never_allowed` フィールドがレジストリに mapping されているか
-- [ ] `failure_pattern_registry` が canonical JSON で hash 化されているか
-- [ ] `agentic_deep_failure_audit` が capstone chain 全体を舐めたか
-- [ ] Cross-reference チェック（SHA 一致、set 関係、Merkle root 再計算）が全て走ったか
-- [ ] CRITICAL / HIGH の finding が 0 か、あるいは human triage 済みか
-- [ ] Blocking decision に agent が override をかけていないか
-- [ ] Experiment tracking を導入した場合、`experiment_tracking_provenance` が capstone chain に組み込まれているか（代替ではなく補完）
-- [ ] レジストリの `signed_by` が maintainer role の人物か
-- [ ] 新規 `never_allowed` を追加したときにレジストリも同時更新したか（PR で）
+- [ ] `capstone_hierarchy_detection` で各階層に Ch7 domain_gap_gate が pairwise で走ったか
+- [ ] fine-tune スコープが Gate 1 で Human 承認されたか
+- [ ] Gate 1 承認後にエージェントが scope を書き換えていないか
+- [ ] 深層特徴の per-sample uncertainty が stop_gate 互換で計算されているか
+- [ ] stop_ratio >= 5% で Gate 2 が発火したか（該当時）
+- [ ] 特徴次元削減が train split のみで fit されているか
+- [ ] Bayes モデルの観測ノイズに deep uncertainty が加算されているか（`w * sigma_deep^2`）
+- [ ] R̂ / ESS / divergences / BFMI の 4 診断が全て通ったか（不通なら Gate 3）
+- [ ] Gate 3 で pooling 構造変更が承認されているか（該当時）
+- [ ] `capstone_integrated_provenance.hash_chain` が Ch4-12 の provenance を全て包含しているか
+- [ ] 最終レポートが Ch10 `deep_report_template` に沿っており hash chain 検証済みか
+- [ ] Gate をエージェントが self-approve していないか（`self_sign_as_approver: never_allowed`）
 
 ## 14.14 ワーク
 
-**W14-1**: `failure_pattern_registry` の canonical JSON を書き、DG-01 〜 AG-09 + MX-01 〜 MX-04 の 21 エントリを埋めよ。各エントリの `signal_selectors` に、Ch4-13 の provenance フィールドを jsonpath で指定せよ。
+**W13-1**: ARIM 風合成階層データ（3 lab × 2〜3 instrument × 8 lot × 100 sample）を vol-02 のジェネレータを拡張して作成せよ。装置ごとの明るさ / コントラストにわざと差を持たせ、`capstone_hierarchy_detection` で lab / instrument / lot の per-level domain_gap が期待通り出ることを確認せよ。
 
-**W14-2**: Ch13 の合成 capstone provenance を 3 通り生成せよ（① 全て合格、② AG-06 self-sign 違反、③ MX-02 gate approval と bayes mask の集合不一致）。`agentic_deep_failure_audit` に食わせて、それぞれ pass / block / block になることを確認せよ。
+**W13-2**: MatBERT または MoCo v3 で学習済みの encoder を使い、W13-1 のデータから `capstone_deep_feature_extraction` で深層特徴 + MC-Dropout uncertainty を抽出せよ。stop_ratio を計測し、5% を超えるサンプルの attribution マップを Ch10 の Skill で可視化せよ。
 
-**W14-3**: DG-05（hallucinatory attribution）の signal_selector を実装せよ。`layer_attribution_provenance.sanity_check_results` の `model_randomization_test.correlation` が 0.3 以上なら fail とする。
+**W13-3**: W13-2 の特徴 + uncertainty を入力に、`capstone_hierarchical_bayes` で PyMC 階層 GLM を fit せよ。observation variance に deep uncertainty を加算する / しないの 2 パターンで posterior を比較し、加算した場合の lab-level effect の CI がどう変わるかを報告せよ。
 
-**W14-4**: AG-04 (log 改ざん / cherry-picking) を検知するために、実行 registry の run 数とレポート内の runs_summary の run 数を比較する signal を実装せよ。差集合が空でない場合、report 発行を block せよ。
+**W13-4**: `capstone_three_gate_orchestrator` を実装し、Gate 1 / 2 / 3 の各パターン（trigger あり / なし / 却下）を再現するテストケースを 6 通り書け。`self_sign_as_approver` を試行した際に assert が発火することを確認せよ。
 
-**W14-5**: MX-01 (chain 内 SHA 不整合) を検知するため、`foundation_model_provenance.commit_sha` と `ssl_pretrain_provenance.base_model_sha` を突合するチェックを実装せよ。不一致時、監査レポートに evidence を添えて HIGH で fail するように書け。
-
-**W14-6**: Experiment tracking (MLflow) を導入した場合と導入しない場合で、同じ研究プロジェクトの provenance chain がどう変わるかを diff せよ。tracking run ID が capstone provenance に追記される場所を特定し、`replace_capstone_provenance_with_tracking_ui_only: never_allowed` の妥当性を議論せよ。
+**W13-5**: 統合 Skill `hierarchical_deep_bayes` を最後まで走らせ、`capstone_integrated_provenance.hash_chain` を出力せよ。Ch4 Layer 1-3 → Ch7 Layer 4 → Ch11 fm_provenance → Ch9 uncertainty → Ch10 attribution → capstone 4 provenance が全て hash で繋がることを確認せよ。
 
 ## 14.15 参考資料
 
-- Amodei, D., et al. (2016). Concrete Problems in AI Safety. arXiv:1606.06565.
-- Sculley, D., et al. (2015). Hidden Technical Debt in Machine Learning Systems. NeurIPS.
-- Adebayo, J., et al. (2018). Sanity Checks for Saliency Maps. NeurIPS. (attribution sanity)
-- Guo, C., et al. (2017). On Calibration of Modern Neural Networks. ICML. (DG-07)
-- Ovadia, Y., et al. (2019). Can You Trust Your Model's Uncertainty? Evaluating Predictive Uncertainty Under Dataset Shift. NeurIPS.
-- Sambasivan, N., et al. (2021). "Everyone wants to do the model work, not the data work": Data Cascades in High-Stakes AI. CHI.
-- The MLflow Project — <https://mlflow.org/>
-- Weights & Biases — <https://wandb.ai/>
-- 本書 全章（Ch4-13）— 特に Ch4（3-layer provenance）、Ch7（domain_gap）、Ch10（attribution + human review）、Ch11（FM + registry）、Ch13（3 gate orchestrator）
-- vol-01 第6章（Human-in-the-loop 承認プロセス）、第9章（監査記録の設計）
+- Gelman, A., et al. (2013). Bayesian Data Analysis (3rd ed.), Chapters 5, 11 (階層モデル + partial pooling)
+- McElreath, R. (2020). Statistical Rethinking (2nd ed.), Chapters 13-14 (multilevel models)
+- Kendall, A., & Gal, Y. (2017). What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision? NeurIPS.
+- Wilson, A. G., & Izmailov, P. (2020). Bayesian Deep Learning and a Probabilistic Perspective of Generalization. NeurIPS.
+- 本書 全章（Ch4-12）— 特に Ch4（provenance 3 レイヤ）、Ch7（domain_gap_gate + fine-tune）、Ch8-9（uncertainty）、Ch10（deep_report_template + human_review）、Ch11（FM）、Ch12（SSL）
+- vol-01 第6章（Human-in-the-loop 承認プロセス）
+- vol-02 第11-13章（PyMC / MCMC 診断 / 階層モデル）、第14章（capstone: 合成階層データ + PyMC）
+- 本書 付録A（Skill テンプレート集）

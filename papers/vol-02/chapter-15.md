@@ -1,414 +1,345 @@
-# 第15章　組織展開と終章 — Skill 共有・監査ログ・次巻への道しるべ
+# 第15章　統計/ML 特有の失敗パターン
 
 > [!IMPORTANT]
 > **本章の到達目標**
 >
-> - Ch4-14 で作った統計/ML Skill を **個人の道具**から **組織の共通言語**へ引き上げる 3 つの展開パターン（Skill 共有・専用 MCP 化・テンプレ配布）の判断基準を得る
-> - **監査ログ**の最小要件（誰が・いつ・どの Skill バージョン・どの provenance で動かしたか）を Ch4-14 の provenance 拡張と接続する
-> - vol-01（データ整備）と vol-02（統計/ML）の**到達点**を、6 データ型 × 統計/ML 手法の完成マップとして振り返る
-> - **vol-03（深層 × エージェント）・vol-04（因果・実験計画）**への道しるべを、なぜ vol-02 の枠組みでは扱えなかったか（=前提となる別軸）とともに示す
+> - 統計/ML Skill を壊す **代表的な失敗パターン**を、症状 → 原因 → 予防策 → 検知方法の順に把握する
+> - **リーク・p-hacking・過学習・prior 暴走・MCMC 未収束・多重比較・バックエンド差**を、Ch4-13 の設計原則がどこで守っているかで整理する
+> - 「動いてしまう」失敗（沈黙する誤りやすい signal）を区別し、**必ず検知できる provenance ゲート**を設計する
+> - 発生時の**復旧手順**（rollback / re-fit / Skill バージョンアップ）を運用パターンとして持ち帰る
 
 ## 本章で扱わないこと
 
-- **具体的な MCP 実装**：Python SDK による MCP サーバ実装は vol-03 の付録候補（本章は「作るべきかどうか」の判断基準まで）
-- **組織の権限管理・監査対応**：ISO/IEC 27001, SOC 2 等の適合作業は vol-04 以降
-- **人事・評価制度**：Skill 作成者を評価する仕組みは組織固有
-- **法務・契約**：外部共有時のライセンス設計は付録の参考リンクへ
+- **新しいモデル種類**：本章は Ch4-13 の裏返し。新規手法は導入しない
+- **セキュリティ**：モデル抽出攻撃・データ毒入れは vol-04 以降
+- **人的組織要因**：責任分界・レビュー体制は第16章
+- **失敗の統計的検定理論**：Type I/II の理論展開は他書に委ねる
 
 ---
 
-## 15.1 個人 Skill から組織 Skill へ
+## 15.1 失敗パターン俯瞰
 
-Ch4-14 の Skill は基本的に「1 人の研究者が 1 テーマで作る」前提でした。組織展開とは、**同じ Skill を複数人が同じ結果で使える**状態にすることです。
+vol-02 で導入した Skill が壊れるとき、症状は 7 種類に集約できます。
 
-以下 3 段階で成熟度が上がります。
-
-| 段階 | 状態 | 典型的な利用者数 | 主な課題 |
+| 分類 | 主な失敗 | 主に守る章 | 検知の難しさ |
 |---|---|---|---|
-| **L0: 個人 Skill** | 作った本人だけが使う | 1 | 再現性・provenance の自己管理 |
-| **L1: チーム Skill** | 数人の同僚が同じ Skill を呼び出す | 2〜10 | バージョン統一、命名衝突、依存環境 |
-| **L2: 組織 Skill** | 部門横断で使う。第三者が監査する | 10〜100+ | 監査ログ、責任分界、廃止手続き |
-
-> [!TIP]
-> **早すぎる L2 化は失敗しやすい**：L0 で作った直後に組織展開すると、Ch14 の失敗パターン（特にリーク・チェイン切れ）が発見前に伝播します。**L1 で最低 3 プロジェクト分の再利用実績**を経てから L2 を検討するのが安全です。
-
----
-
-## 15.2 展開パターン A：Skill 共有
-
-**もっとも軽量**な展開。Ch4-14 で作った Skill ディレクトリ（`SKILL.md` + `references/` + `assets/`）を Git リポジトリに置き、利用者に「clone して `.github/skills/` 配下に置いてください」と伝えるだけ。
-
-### A-1. 適する条件
-
-- 手法が**まだ流動的**（改訂頻度が月次以上）
-- 利用者が Skill の中身（プロンプト・スクリプト）を**読んで理解する**ことを許容できる
-- 監査要件が低い（社内実験・PoC）
-
-### A-2. 最低限そろえるもの
-
-| 要素 | 内容 |
-|---|---|
-| `README.md` | 目的・対象データ型・前提バージョン（Python, sklearn, PyMC, ArviZ, NumPyro） |
-| `SKILL.md` の frontmatter | `version: X.Y.Z`（Ch14 §14.9 のバージョニング原則） |
-| `CHANGELOG.md` | Major / Minor / Patch の変更履歴 |
-| `known_issues.yaml` | Ch14 §14.9 で追加した schema |
-| ライセンス | 内部利用範囲・再配布可否を明示 |
-
-### A-3. 落とし穴
-
-- **依存バージョン未固定**：sklearn 1.4 → 1.5 で挙動が変わる箇所がある。`requirements.txt` または `environment.yml` を Skill 同梱
-- **サンプルデータの二重管理**：合成データを Skill 内に埋め込むと、Ch13 §13.5 の `synthetic_dataset.generator_script_sha256` が壊れる。**別リポジトリ or Git LFS に切り分け**
-- **プロンプト依存の暗黙前提**：作者の頭にあった「常識」（例：`log10` を取る前提）が SKILL.md に書かれていない
-
----
-
-## 15.3 展開パターン B：専用 MCP 化
-
-Skill を **MCP サーバ（scikit-learn-mcp / pymc-mcp）**として実装し、ツールとして呼び出す形。エージェントは自然言語で `train_ridge_pipeline` `run_calibration_curve` `run_hierarchical_model` 等の関数を呼ぶ。
-
-### B-1. 適する条件
-
-- 手法が**安定**（Ch14 §14.9 でいう Major バージョンが 3 か月以上不変）
-- API・入出力 schema・データ contract が**固定できている**
-- 利用者に**中身を読ませたくない**（誤改変防止 / IP 保護 / 監査要件）
-- **固定サーバ環境での再現可能性**が要る（同じコンテナ・依存・seed で **exact hash 一致は決定的アルゴリズムに限る**。MCMC・BLAS スレッド並列・GPU 系は Ch12 §12.7 の sd 正規化 tolerance で扱う）
-- 監査ログを**サーバ側で一元管理**したい
-
-### B-2. Skill vs MCP の設計上の違い
-
-| 観点 | Skill（パターン A） | 専用 MCP（パターン B） |
-|---|---|---|
-| 実行主体 | エージェント（プロンプト解釈） | MCP サーバ（コード直接実行） |
-| 再現性 | プロンプト解釈の揺れが残る | 固定コンテナ内で決定的アルゴリズムは exact 一致、確率的アルゴリズムは tolerance 内一致（Ch12 §12.7） |
-| バージョン管理 | Git tag + SKILL.md frontmatter | MCP サーバの API バージョン + 内部モデル hash |
-| 監査 | エージェントのログを事後突合 | サーバ側の access log + input/output hash |
-| 変更コスト | 低（テキスト編集） | 中〜高（コード変更＋テスト） |
-| 誤用リスク | 中（プロンプトずれで別解釈） | 低（型で縛られる） |
-
-### B-3. 判断フローチャート（A / B / C 統合版）
-
-以下の 5 段で A / B / C（および複合）を決めます。**上から順に**判定してください。
-
-```
-Skill を組織展開したい
-├─ Q1. 同型の Skill を組織で複数本作る／教育・標準化目的か？
-│   ├─ Yes → C（テンプレ配布）を採用。個別 Skill は Q2 以降で判定して A/B に昇格
-│   └─ No ↓
-├─ Q2. 手法・API・入出力 schema は安定しているか？（Major 3か月以上不変・data contract 固定）
-│   ├─ No → A（Skill 共有）。安定後に Q3 で再判定
-│   └─ Yes ↓
-├─ Q3. 中央監査 / IP 保護 / 高リスク判断（品質・出荷・認証）のいずれかが必要か？
-│   ├─ No → A で十分。C との併用（A+C）も検討
-│   └─ Yes ↓
-├─ Q4. サーバ運用リソース（実装・テスト・SLA・保守・監視）を確保できるか？
-│   ├─ No → A + 定期監査で暫定運用。将来 B へ昇格を計画
-│   └─ Yes ↓
-└─ Q5. データ機密性・計算資源・モデル更新頻度が MCP 化と整合するか？
-    ├─ No → A + 定期監査に留める
-    └─ Yes → B（専用 MCP 化）
-```
-
-**判定軸まとめ**：
-- Q1: 教育・標準化目的（C 判定）
-- Q2: API/schema 安定性（A ↔ B 分岐の前提）
-- Q3: 監査・IP・業務影響（A → B 昇格の必要条件）
-- Q4: 実装・運用リソース（B の実装可能性）
-- Q5: データ機密性・計算資源・更新頻度（B の運用整合性）
-
-### B-4. 最小 MCP 化候補（vol-02 の Skill のうち MCP 化しやすい順）
-
-| 優先度 | Skill | 理由 |
-|---|---|---|
-| 1 | **Ch12 §14.6 診断チェック** | 入出力が単純（idata → dict）、決定的、依存が薄い。`check_diagnostics()` そのものをライブラリ化して MCP 経由で呼ぶだけ |
-| 2 | **Ch6 Pipeline + CV 評価** | 入出力が明確（X, y, cv_scheme → scores）、sklearn 前提で API 設計しやすい |
-| 3 | **Ch10 校正曲線推定** | `sampler_config` / `backend_config` / `posterior_artifact` schema が固定できてから。tolerance は Ch12 §12.7 に従う |
-| 4 | Ch11 階層モデル | 構造が多様で API 設計に工夫が要る。プロジェクト個別性が高い。C（テンプレ）が先 |
-| 5 | Ch13 Capstone 統合 | provenance チェイン管理が複雑。MCP 化より orchestration 側の責務 |
-
-> [!NOTE]
-> **MCP は「銀の弾丸」ではない**：MCP 化すれば安全になるわけではありません。Ch14 のリーク・prior 暴走・多重比較未補正は、**MCP の内部実装で守られていなければ**サーバ経由でも同じように起きます。**パターン B の実装段階で Ch14 のゲートを組み込む**ことが必須です。
-
----
-
-## 15.4 展開パターン C：テンプレ配布
-
-Skill そのものではなく、**Skill を作るためのテンプレート**（`cookiecutter` 相当）を配布するパターン。
-
-### C-1. 適する条件
-
-- 「同じ問題ではないが**同じ型**」の Skill を組織で何本も作る（例：物性ごとに校正曲線 Skill を独立で作る）
-- 標準化はしたいが**個別最適化の自由度**を残したい
-- 教育目的（新人がテンプレを埋めれば形になる）
-
-### C-2. テンプレに含めるもの
-
-- Ch4-14 の推奨構造（`data_split` / `provenance` / `check_diagnostics()` / `known_issues.yaml`）
-- 到達目標・扱わないことのスケルトン
-- 参考文献の書式（Ch12 §12.10 のスタイル）
-- **必ず埋めるべき TODO マーカー**（データ contract, applicability domain 等）
-
-### C-3. パターン A/B との組み合わせ
-
-多くの組織で最終形は **A + C**：テンプレでスキャフォールドし、成熟した Skill だけを A（共有）に昇格、さらに安定した数本を B（MCP）に昇格。
-
----
-
-## 15.5 監査ログの最小要件
-
-Ch4-14 で拡張してきた provenance を、**組織監査に耐える形**にまとめます。監査ログは 4 レイヤ（誰／何／どんな環境で／どの判断に）で構成します。
-
-### 15.5.1 誰が・いつ・どのバージョンで動かしたか
-
-以下 7 項目は監査の**最小共通項**です。
-
-| フィールド | 例 | 由来 |
-|---|---|---|
-| `run_id` | UUIDv7 | 実行ごと一意 |
-| `run_timestamp` | ISO 8601 | 実行時刻（UTC 推奨） |
-| `operator` | ORCID or 組織 ID | 実行者。エージェント経由でも人間を紐付ける |
-| `skill_id` | `capstone_l2_pymc_calibration` | Ch10 で導入した命名規約 |
-| `skill_version` | `1.2.0` | Ch14 §14.9 の SemVer |
-| `code_sha256` | Skill ディレクトリの hash | Skill 改変検知（ディレクトリ tree hash） |
-| `git_commit_sha` | `abc1234…` | リポジトリの commit（`git rev-parse HEAD`） |
-
-### 15.5.2 何を入力し・何を出力したか
-
-Ch13 §13.6 の `verify_provenance_chain()` を組織監査に拡張します。
-
-- `inputs.dataset_sha256` — 入力データの hash（Ch4 の data contract）
-- `inputs.data_contract_hash` — Ch4 の data contract 定義の hash（schema 変更検知）
-- `inputs.split_manifest_hash` — Ch7 の CV/split 定義の hash
-- `inputs.upstream_run_ids` — 依存する過去 run の `run_id`（チェイン検証）
-- `outputs.artifact_sha256` — 出力アーティファクト hash（Ch10 の `posterior_artifact` 相当）
-- `outputs.diagnostics_summary` — Ch10-12 の MCMC 診断（divergences / R-hat / ESS / BFMI / treedepth）
-- `outputs.checklist_results` — Ch12 §12.9 の 14 項目チェック個別結果（診断 10 + provenance 4）
-- `outputs.certification_pass` — Ch13 §13.7 の全ゲート合否（true/false）
-- `outputs.known_issues_snapshot_hash` — 実行時点の `known_issues.yaml` の hash
-- `outputs.acknowledged_known_issue_ids` — 該当した既知 issue の ID 列と `acknowledged_by`（Ch14 §14.9 schema）
-
-### 15.5.3 どんな環境で動かしたか（再現性の要）
-
-Ch10 §10.8 の `sampler_config` / `backend_config` を組織監査に拡張します。
-
-| フィールド | 例 |
-|---|---|
-| `environment.container_digest` | `sha256:...`（コンテナイメージ digest） |
-| `environment.python_version` | `3.11.7` |
-| `environment.package_versions` | sklearn / pymc / arviz / numpyro / jax の pin |
-| `environment.backend` | `pymc-nuts` / `numpyro-nuts-cpu` / `numpyro-nuts-gpu` |
-| `environment.hardware` | CPU モデル / GPU モデル / スレッド数 |
-| `run_config.random_seeds` | chain seed 列 + init seed |
-| `run_config.cv_scheme` | Ch7 の `cv_scheme`（`group_key` 含む） |
-| `run_config.thresholds` | R-hat / ESS / divergences の判定閾値 |
-| `run_config.checklist_version` | Ch12 §12.9 チェックリストのバージョン |
-| `arim_context.instrument_id` | 装置 ID（Ch11 の instrument 階層と紐付く） |
-| `arim_context.facility_id` | 実施拠点 ID |
-| `arim_context.sample_id` / `lot_id` | 試料 / ロット ID（Ch11 の階層メタ） |
-| `arim_context.measurement_protocol_id` | 測定プロトコル ID |
-| `arim_context.unit_schema_version` | Ch4 の単位 schema バージョン |
-
-### 15.5.4 どの決定を下したか
-
-**Skill を回した結果、業務上どの判断につながったか**を残します。ここが抜けると監査は「動かした記録」だけで終わり、影響追跡ができません。
-
-| フィールド | 例 |
-|---|---|
-| `decision.type` | `pilot_go_nogo` / `lot_release` / `paper_submission` / `internal_report` |
-| `decision.value` | `go` / `hold` |
-| `decision.rationale_link` | 判断根拠のドキュメント URI |
-| `decision.reviewer` | レビュアー ORCID（研究者本人 ≠ レビュアーが原則） |
-
-### 15.5.5 ログ自体の完全性
-
-監査ログを**後から改変されない**仕組みも要件です。
-
-| フィールド | 例 |
-|---|---|
-| `integrity.log_sha256` | このログエントリ全体の hash |
-| `integrity.prev_log_sha256` | 直前ログの hash（hash chain / append-only store） |
-| `integrity.signature` | 組織署名（PKI / HSM） |
-| `access_policy_id` | 参照権限ポリシーの ID |
-| `retention_policy_id` | §15.5.6 の保存期間ポリシーの ID |
+| **データ準備** | データリーク（fit-time / feature-time / group-time） | Ch4, Ch5, Ch7 | 高（沈黙する） |
+| **評価** | p-hacking、多重比較未補正 | Ch7, Ch8 | 中 |
+| **モデル** | 過学習、正則化不足 | Ch5, Ch7 | 低（CV で気づく） |
+| **Bayesian** | prior 暴走（データ無視 or データ丸乗り） | Ch9, Ch10 | 中（PPC で見える） |
+| **MCMC** | 収束不良、divergences 常態化 | Ch10, Ch12 | 低（診断で気づく） |
+| **バックエンド** | PyMC ↔ NumPyro 差、GPU 差、乱数実装差 | Ch10, Ch12 | 高（気づきにくい） |
+| **統合** | provenance チェイン切れ、合成→実データ誤運用 | Ch13 | 高（hash 検証がないと通る） |
 
 > [!IMPORTANT]
-> **「実行 → 判断」を切らない**：Ch14 のチェイン切れ（provenance 側）と同様、**実行と業務判断を紐付ける ID**（`decision` セクション）がないと、後日「あの判断は何を根拠にしたか」を追跡できなくなります。加えて、`integrity` セクションがないと**「改変されていない」保証**ができません。
-
-### 15.5.6 保存期間と参照権限（例示レンジ）
-
-以下は**例示レンジ**であり、実際は業界規制・契約・研究費規定・関連規格（ISO 9001, ISO/IEC 17025, GLP, GMP 等）で決まります。`retention_policy_id` で組織のポリシー本体にリンクさせる設計が推奨です。
-
-| 種類 | 保存期間の例示レンジ | 参照権限 |
-|---|---|---|
-| 個人 PoC | 1 年 | 本人 + チームリーダー |
-| 内部レポート | 3〜5 年 | 部門内 |
-| 論文・特許 | 論文 5〜10 年 / 特許 存続期間+α | 共著者・法務 |
-| 認証系（品質判定・製造判定） | 業界規定に従う（5〜10 年以上が多い） | 品質保証部門・監査 |
-
-具体年数は組織のコンプライアンス方針・関連規制の適用範囲に従ってください。本書は**「保存する」こと自体の重要性**と、**組織ポリシーへの参照リンクを持つ設計**を示すに留めます。
+> **「沈黙する失敗」を最も警戒**：CV スコアが良く、$\hat{R}$ も PPC も通ってしまう失敗（リーク・多重比較・チェイン切れ）が最も危険です。**動いた** ≠ **正しい**。本章は「動いてしまう失敗」を優先します。
 
 ---
 
-## 15.6 廃止（deprecation）とロールバック
+## 15.2 データリーク
 
-組織展開すると **Skill を消す・古くする**手続きが必要になります。Ch14 §14.9 のバージョニングと連動します。
+### パターン A：fit-time leakage（scaler / feature 選択が CV の外で fit）
 
-### 15.6.1 廃止プロセス
+**症状**：CV RMSE が異常に良い、test でも大差ない、と思って本番投入したら性能が落ちる。
 
-1. `SKILL.md` frontmatter に `deprecated: true` と `deprecation_date: YYYY-MM-DD`
-2. `CHANGELOG.md` に「代替 Skill 名」と「移行期間」を明記
-3. 依存する下流 Skill（Ch13 の Layer 参照）に**警告**（`known_issues.yaml` に Ch14 §14.9 の schema で `category: deprecation`, `status: deprecated`, `severity: <影響度>`, `affected_versions`, `resolution: <代替 Skill と移行手順>` を追加）
-4. 移行期間中は **並行運用**（新旧の出力を Ch12 §12.7 の tolerance で比較）
-5. 移行期間終了後に**新規実行を禁止**（監査ログには残す）
+**原因**：`StandardScaler` や特徴量選択を **CV の外で `fit_transform` してから** `cross_val_score` に投入している：
 
-### 15.6.2 ロールバック条件
+```python
+# ❌ 悪い例
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_train)         # CV 各 fold の validation 情報が train fold に洩れる
+cross_val_score(Ridge(), X_scaled, y_train, cv=5)
+```
 
-- Ch14 で新規に検出された Blocking 級の failure が既存バージョンにも遡って影響する場合
-- ロールバック時は`decision.type = rollback` として、影響を受けた過去 run に対する再評価を記録
+`fit_transform` は全 X_train から mean/std を計算するため、CV で validation に回るサンプルの統計情報が train fold の scaling に混入します。さらに悪いバリエーションとして：
+
+- **train + test 結合後に前処理**（`fit_transform(np.concatenate([X_train, X_test]))`）：test 情報が train に混入
+- **Target encoding を全データで fit**：目的変数の情報が特徴量に混入（**TARGET-in-feature leakage**）
+- **Supervised feature selection を CV 外で実行**：validation 情報で選定された特徴量を使う
+
+**予防**：`Pipeline` に含める。target encoding や特徴量選択も Pipeline のステップにする：
+
+```python
+# ✅ 正しい例（Ch5-7 の標準）
+pipe = Pipeline([("scaler", StandardScaler()), ("model", Ridge())])
+cross_val_score(pipe, X_train, y_train, cv=5)   # fold ごとに scaler が fit
+```
+
+**検知**：CV スコアと **`Pipeline` 外で fit した scaler での CV スコアを比較**する監査テストを作り、両者の差が閾値以下（例えば 1% 以内）でないと fail にする。差が大きいときは Pipeline 外で fit している疑いが強い。
+
+### パターン B：group-time leakage（同一群が train と test に分かれる）
+
+**症状**：装置・ロット・患者などの群単位で予測すべきなのに、通常の `KFold` で分割し、同じ群のサンプルが両側に出る。
+
+**原因**：`GroupKFold` を使うべきところで `KFold` を使用。
+
+**予防**：Ch7 の CV 設計に従い、`group_key`（`inst_id` / `lot_id` / `subject_id` 等）を明示：
+
+```python
+from sklearn.model_selection import GroupKFold
+gkf = GroupKFold(n_splits=5)
+cross_val_score(pipe, X_train, y_train, cv=gkf, groups=inst_id_train)
+```
+
+**検知**：provenance の `cv_scheme.group_key` を、**タスクが群を持つ場合に限り**必須化する。`data_contract.split_unit in {instrument, lot, sample, subject, patient}` または `has_repeated_group == true` の Skill で `group_key` が null なら fail。真に iid なタスクでは group_key = null で正常。
+
+### パターン C：target-time leakage（未来情報が特徴量に混入）
+
+**症状**：時系列で「同じ日の別センサ値」など、予測時点で入手不可能な値が特徴量に紛れる。
+
+**予防**：Ch4 のデータ契約で `feature_availability_time <= prediction_time` を明示する。時系列は `TimeSeriesSplit` を使い、lookahead 特徴量・rolling window の扱い・必要なら purged / blocked CV（金融時系列で用いられる、target 期間の前後を train から purge する方式）を検討する。
+
+**検知**：特徴量の生成タイムスタンプを provenance に含める。データセット定義段階で feature の入手時刻をメタとして保持する。
 
 ---
 
-## 15.7 vol-01 + vol-02 到達点マップ
+## 15.3 p-hacking と多重比較
 
-vol-01（データ整備）と vol-02（統計/ML）の合算で、6 データ型 × 主要手法の**どこまで到達したか**を確認します。
+### 症状
 
-| データ型 | vol-01 で整えたもの | vol-02 で扱えるようになったもの | vol-03 以降で扱うもの |
-|---|---|---|---|
-| **スペクトル型** | 単位・波数校正・欠損補間・メタ | PCA, PLS, ピーク回帰, 校正曲線 (PyMC), 装置間階層 | 深層特徴抽出、自己教師あり |
-| **クロマトグラム・時系列** | 時刻同期・ベースライン | 分類、外れ試料検出、反応速度階層 | 動的因果・介入設計 |
-| **画像・顕微鏡** | メタ・解像度・キャリブレーション | 特徴量後の回帰/分類、粒径階層 | CNN・Foundation Model の転移 |
-| **回折・散乱** | 単位・角度校正 | パターンクラスタリング、格子定数事後分布 | Rietveld の end-to-end 微分 |
-| **表形式・プロセス条件** | データ contract・単位統一 | 物性予測、感度分析、ロット/オペレータ階層 | ベイズ最適化、逐次実験計画 |
-| **マルチモーダル統合** | ID キー・時刻同期 | 統合特徴量からの予測 | マルチモーダル生成・逆設計 |
+- 「特徴量選択 → CV → 良い組合せを採用」を繰り返して過学習
+- 「複数モデル × 複数ハイパラ」で総当たりして偶然の best を採用
+- p 値・R² を複数見て「有意」なものを事後選定
 
-> [!NOTE]
-> **到達点の言い換え**：vol-02 完了時点で、**「点推定 + 標準化された CI/CrI + 階層構造 + 診断チェック + provenance」**が組織的な共通語彙になります。これは vol-03/04 で扱う深層学習・因果推論の**入力側の品質**を担保する土台です。
+### 原因
+
+- 探索空間の広さに応じて **偶然の良い結果** が生まれる確率が上がる
+- CV スコアも「事後選定」の対象になれば信頼できない
+
+### 予防
+
+- **hold-out set を最終評価まで開封しない**（Ch13 の 3 分割・test は最後）
+- **nested CV** を導入：**内側 CV でハイパラ探索、外側 CV で汎化性能を評価**（外側の各 fold で hold-out が別に取られるので、探索履歴に依存しない評価が得られる）
+- 探索履歴を provenance に完全記録：`hyperparam_search.n_trials`, `search_space`, `selection_metric`, `test_set_access_count`, `selection_metric_changed`
+- 多重比較補正：**材料・ナノテク文脈では、多数の元素組成・処理条件・特徴量候補を同じデータでスクリーニングする場面**で必要になります。探索段階は BH / FDR（false discovery rate 制御）、確認段階は Holm / Bonferroni、最終判断は hold-out と併用します
+
+### 検知
+
+- `hyperparam_search.n_trials` が大きい（例：50 以上）のに hold-out 未使用 → 警告
+- `test_set_access_count` が 1 を超える → 「hold-out 汚染」ラベル
+- `selection_metric_changed: true`（途中で評価指標を変えた）→ p-hacking リスク高
+- 同一データセットに対する Skill バージョン累計と `test_set_access_count` を組み合わせた**プロジェクト設定**の閾値で警告（固定 5 バージョンなどの一律ルールは避け、プロジェクトごとに調整）
+
+> [!TIP]
+> **Bayesian は p-hacking の代替ではない**：ベイズ因子や事後確率を「有意っぽい閾値」で切って複数比較を繰り返すと同じ罠にはまります。Bayesian でも hold-out と探索履歴の記録は必要です。
 
 ---
 
-## 15.8 vol-03（深層 × エージェント）への道しるべ
+## 15.4 過学習と正則化不足
 
-vol-02 で扱わなかった深層学習は、**エージェント × 学習という別軸**が入るため独立巻としました。
+**vol-01 でも扱った古典的失敗**なので、統計/ML 特有の視点だけ再掲：
 
-### 15.8.1 なぜ vol-02 の枠で扱えなかったか
-
-| vol-02 の前提 | 深層学習で崩れるもの |
+| 症状 | 診断 |
 |---|---|
-| CPU で数分〜数十分の再現実行 | GPU 前提の学習時間（数時間〜数日） |
-| 決定的アルゴリズムでの exact hash 一致 | GPU 非決定性（cuDNN の非決定的畳み込み、atomic add、TF32 等） |
-| 特徴量エンジニアリングを人間が設計 | 表現学習が自動 → 解釈可能性の再定義 |
-| Skill = プロンプト + 少量スクリプト | 学習済み重み（数百 MB〜）の配布・バージョニング |
-| Bayesian workflow の MCMC 診断ゲート（Ch12 §12.9 の 14 項目） | 学習曲線・early stopping・LR schedule の判断論 |
+| 訓練スコア >> CV スコア | 明確な過学習 |
+| CV スコアは良いが test で悪化 | データリーク or CV 設計不良 |
+| ノイズ的特徴量が高重要度 | 特徴量選択の甘さ |
 
-### 15.8.2 vol-03 想定内容
+**予防**：Ch5-8 の設計（Pipeline、正則化、CV、feature importance の SHAP 等での安定性確認）。
 
-- **PyTorch / JAX** の Skill 化：訓練・推論・チェックポイント管理
-- **Hugging Face 等のモデルハブ連携 MCP**（既存があれば利用、なければ組織内実装）による事前学習モデル呼び出し
-- **転移学習・fine-tuning**：材料分野の少データ環境での実践
-- **不確実性のあるニューラルネット**：deep ensemble, MC-dropout, Bayesian Neural Nets
-- **Foundation Model の材料応用**：MatBERT, CrystaLLM 等の位置づけ
-- **provenance の GPU 拡張**：非決定性の許容 tolerance、reproducibility bundle（seed + backend + cuDNN flag）
-
-### 15.8.3 vol-02 とのブリッジ
-
-vol-03 の初章では、vol-02 の校正曲線・階層モデルを「事前学習モデルの上に載せる」ケースを扱う予定です。**深層特徴 + PyMC の階層**は、多くの材料実務で「両方いる」構成になります。
+**検知**：Skill 認定時に **sample-size learning curve**（訓練データサイズ vs スコア、epoch 曲線ではない）を出力し、右肩上がりで飽和していれば過学習リスク低。訓練スコアだけ天井、CV が伸び悩むなら過学習。
 
 ---
 
-## 15.9 vol-04（因果・実験計画）への道しるべ
+## 15.5 prior の暴走
 
-### 15.9.1 なぜ vol-02 の枠で扱えなかったか
+### パターン A：情報過多（データを無視する prior）
 
-vol-02 の Bayesian は**生成モデル**として構造仮定を表現できますが、**介入・識別仮定・DAG を明示していない**ため、得られた事後分布を**因果効果としては解釈しません**。以下は扱っていません。
+**症状**：事後平均が prior 平均にほぼ張り付き、データが変わっても事後がほとんど動かない。
 
-- **介入**：条件を変えたときに何が起きるかの予測
-- **交絡**：見えない変数の効果の分離
-- **反実仮想**：「もし別の温度で実験していたら」の推論
-- **実験計画**：次にどの試料を測るかの最適化
+**原因**：狭すぎる prior（例：`Normal(0, 0.01)` を弱情報として付けたつもりが実質固定）。
 
-これらは因果推論（DoWhy / EconML）と実験計画（BoTorch / GPyOpt）の別体系を必要とします。
+**予防**：Ch9 の prior sensitivity テスト（main / weaker / stronger の 3 分岐）。weaker 版で事後が prior 平均から離れれば prior 支配が確認できる。
 
-### 15.9.2 vol-04 想定内容
+**検知**：以下の**実装容易な指標**を主に使う（KL divergence は marginal integration の実装負荷が高いので補助扱い）：
 
-- **DAG による因果構造化**：材料プロセスの介入変数と観測変数
-- **反実仮想推論**：X-learner, T-learner, IV 法
-- **ベイズ最適化**：多目的（性能 × コスト）・制約付き（危険領域回避）
-- **Active Learning**：Ch7 の CV スコアではなく「情報獲得」で次を選ぶ
-- **実験倫理・研究計画**：pre-registration の実務
+- `posterior_sd / prior_sd`（shrinkage ratio）：0.9 以上なら prior 支配の疑い
+- `|posterior_mean - prior_mean| / prior_sd`（prior mean からの移動距離）：0.1 以下は prior 支配
+- Prior sensitivity（weaker / stronger）で意思決定閾値を跨ぐか
+- （可能なら補助）prior ↔ posterior の KL divergence
 
-### 15.9.3 vol-02 とのブリッジ
+### パターン B：情報不足（データに丸乗りされる prior）
 
-vol-04 は「vol-02 の階層モデルを介入モデルに拡張する」章から始まる想定です。**ロット効果を潜在変数として扱う**（vol-02）から**ロット条件を介入変数として設計する**（vol-04）への飛躍を、vol-02 の provenance 拡張と接続します。
+**症状**：少数群で `sigma_group` の事後が prior に強く依存する（第12章 §12.4、第14章 §14.5 の警告）。
+
+**予防**：group 数が少ないときは strong prior + 事前選定した理由を provenance に。
+
+**検知**：`hierarchical_structure.applicability_domain.inst_count < 5` のとき、`prior_specification.sigma_group.sensitivity_alternatives` が必須。null なら fail。
+
+### パターン C：Prior predictive がドメイン外
+
+**症状**：prior predictive check が非物理的な範囲（負の濃度、光速超え）を含む。
+
+**予防**：Ch10 §11.3 の prior predictive check を必ず実施し、`prior_predictive_range` を provenance に記録。
+
+**検知**：Prior predictive の 95% 区間が `applicability_domain.y_range` を大きく外れる、または**物理制約違反の確率**（例：負の濃度、光速超え）が閾値（例：5%）を超える場合に警告。「大きく外れる」の初期基準は覆う範囲差 20%（要校正）、プロジェクトごとに調整可能。
+
+---
+
+## 15.6 MCMC 未収束（動くけど正しくない）
+
+**症状**：Skill が結果を出す → 意思決定に使う → 数週間後に「別 seed で走らせたら結果が違う」判明。
+
+**原因**：`diagnostics_pass` を確認せずデプロイ、または閾値を緩めて通した（R-hat 1.05 とか、divergences 10 個くらい）。
+
+**予防**：Ch10-12 の診断ゲート。特に第13章 §13.9 の 14 項目チェックリストで**機械的に**判定。
+
+**検知**：
+
+- provenance の `diagnostics_summary` を必須化し、`diagnostics_pass: true` が false なら Skill 実行時に例外を投げる（`assert diag["diagnostics_pass"]`）
+- **seed ロバスト性テスト**：モデル複雑度に応じた chain 数（認定・階層モデルでは原則 8 chains）で、**独立 seed を 2〜3 回以上変えて** `diagnostics_pass` が安定していることを確認。全て true でない Skill は認定不可
+
+> [!IMPORTANT]
+> **`check_diagnostics()` を呼ぶタイミング**：新しいデータで**再サンプリング（refit）** するときは必須。既存の posterior に対して `pm.set_data` で新しい入力を渡し **posterior predictive のみ**する場合は、`diagnostics_summary.diagnostics_pass == true` が過去の認定時に取れていることを確認したうえで、入力ドメイン（`applicability_domain` 範囲内か）と PPC の sanity check を実行します。**「動くけど正しくない」を防ぐには、認定時の診断結果を毎実行時に verify するのが最小限の運用**です。
+
+---
+
+## 15.7 バックエンド差による結果ずれ
+
+### 症状
+
+「PyMC pytensor で通ったのに NumPyro に切り替えたら事後が違う」「開発マシンと本番で結果が違う」。
+
+### 原因
+
+- JIT の演算順序差
+- 乱数実装差（Threefry vs PCG）
+- FP32/FP64 の切替
+- CPU/GPU/TPU の並列化差
+
+### 予防（Ch10 §11.9 と Ch12 §13.7 の再掲）
+
+- **認定は CPU + 1 バックエンド固定**
+- `backend_reproducibility.tolerance` を **posterior sd 正規化**で設計
+- `jax_enable_x64=True` を強制
+- 参照バックエンドとの差分テストを CI に含める
+
+### 検知
+
+- `cross_backend_tested: true` が provenance にない Skill は不可
+- CI で PyMC / NumPyro 両方で走らせ、tolerance 内かを assert
+
+---
+
+## 15.8 provenance チェイン切れ・合成データ誤運用
+
+### パターン A：チェイン切れ
+
+**症状**：Layer 2 の下流で異常な予測。原因を追うと、Layer 1 のモデルアーティファクトが差し替わっていたが upstream ハッシュが更新されていなかった。
+
+**予防**：第14章 §14.6 の `verify_provenance_chain()` を **Skill 実行前の必須ゲート**にする。ハッシュ不一致で例外。
+
+**検知**：CI で `assert layer_2.inputs.y_pred.sha256 == layer_1.output_artifacts.y_pred_calib.sha256`。
+
+### パターン B：合成データを実データと誤認
+
+**症状**：第14章 §14.5 の Layer 3（合成階層データで fit）を、そのまま**実装置の判定 Skill** として使う。装置差 `sigma_inst` は合成データの真値であって、実装置間差ではない。
+
+**予防**：`data_source: synthetic` を provenance に必須で書き、これがある Skill は **production 実行からデフォルト除外**。デモ・検証・シミュレーション用途で実運用に持ち込むときは、**明示的な override + 使用目的の justification + 承認記録**を provenance の `synthetic_production_override` に記録することを必須とする。
+
+**検知**：Skill 検索インタフェース側で `data_source == "synthetic"` の Skill を production クエリからデフォルト除外し、override 時のみ warning とともに実行を許可する。
+
+---
+
+## 15.9 失敗検知の運用パターン
+
+### 3 層のゲート
+
+| 層 | 内容 | タイミング |
+|---|---|---|
+| **静的** | provenance schema 検証（フィールド存在、hash 形式、`known_issues` 確認） | Skill commit 時 |
+| **動的（refit 時）** | `check_diagnostics()`, `verify_provenance_chain()`, prior sensitivity | 再サンプリング / 再校正のたび |
+| **動的（予測のみ）** | `applicability_domain` 範囲チェック、PPC sanity、`diagnostics_summary.diagnostics_pass` の verify | 新しい入力の予測ごと |
+| **監査** | seed ロバスト性・バックエンド差テスト・`known_issues` 棚卸し | 週次 or 月次 |
+
+### 失敗発見時の復旧
+
+1. **即時停止**：Skill を disable にし、下流の意思決定を止める
+2. **原因の特定**：どのゲートが本来検知すべきだったかを分析
+3. **ゲート追加**：抜けた検知を CI に追加
+4. **Skill バージョンアップ**：修正版を新バージョンで公開
+5. **provenance に事故記録**：`known_issues` セクションを追記、過去の実行結果に警告を伝播
+
+### 失敗の型に応じた版数運用
+
+**判断原則**：**過去結果の解釈・互換性を壊すか**を軸に版数を決める。
+
+| 失敗の種類 | バージョン扱い | 判断根拠 |
+|---|---|---|
+| リーク発覚 → データ分割修正 | Major up（`2.0.0`） | 過去 metrics が無効化される |
+| Prior 変更 | Minor up（`1.1.0`） | 過去結果は残るが、意思決定閾値を跨ぐ変更は Major を検討 |
+| MCMC target_accept / tune 変更 | Patch（`1.0.1`） | `sampler_config` パッチ、posterior 分布が実質同じなら |
+| バックエンド tolerance 緩和 | Patch or Minor | 合否基準が変わるなら Minor 以上 |
+| provenance schema 拡張（後方互換） | Minor up（`1.1.0`） | 既存 Skill が読み書き可能 |
+| provenance schema 破壊的変更 | Major up | 過去 Skill の再認定が必要 |
+
+### `known_issues` フィールド（本章で追加提案）
+
+Ch4-13 では明示的に導入していないため、**本章で provenance schema への追加を推奨**します。最小 schema：
+
+```yaml
+known_issues:
+  - id: KI-001
+    discovered_at: 2026-05-10T09:00:00Z
+    severity: high | medium | low
+    category: leakage | prior | mcmc | backend | chain_break | other
+    description: "..."
+    affected_versions: ["1.0.0", "1.0.1"]
+    resolution:
+      resolved_in: "1.1.0"
+      action: "..."
+    downstream_impact: "..."
+```
+
+過去バージョンの実行結果には `known_issues` を伝播させ、意思決定に使う場合の警告表示に使います。
+
+> [!TIP]
+> **失敗を hide しない文化**：`known_issues` を書ける provenance schema を Ch4-13 の全 Skill に用意しておくと、事故が起きたときに「なかったこと」にできません。むしろ「早く見つけた Skill」を評価する運用に変えます。
 
 ---
 
 ## 15.10 章末ワーク
 
-### Workshop 1：あなたの Skill を A/B/C のどれで展開するか判定する
-
-Ch4-13 で作った Skill を 1 本選び、§15.3 のフローチャートに従ってパターン A/B/C を判定してください。判定結果を以下の表で書き出します。
-
-| 項目 | 記述 |
-|---|---|
-| Skill 名 | |
-| 手法の安定度（Major 不変月数） | |
-| 監査要件（低/中/高） | |
-| 誤用時の業務影響 | |
-| 判定 | A / B / C / A+C / A+B / … |
-| 判定根拠（3 行） | |
-
-### Workshop 2：監査ログの最小フィールドを YAML で書く
-
-§15.5.1 の 7 項目（`run_id` / `run_timestamp` / `operator` / `skill_id` / `skill_version` / `code_sha256` / `git_commit_sha`）に §15.5.4 の `decision` セクションを加えて、あなたの Ch13 Capstone の Layer 1 実行に対して埋めてください。`operator` は仮の ORCID を、`code_sha256` は Skill ディレクトリの tree hash（例：`find skills/<skill_id> -type f | sort | xargs sha256sum | sha256sum` の先頭）で、`git_commit_sha` は `git rev-parse HEAD` で作成します。
-
-### Workshop 3：廃止シナリオを 1 本設計する
-
-Ch14 で「Blocking 級 failure が既存 Skill にも遡って影響する」場合を仮定し、§15.6 の 5 ステップに沿って**移行期間・並行運用の tolerance・rollback 条件**を書き出してください。
-
-### Workshop 4：vol-03/04 で扱う予定のトピックを 1 つ選び、vol-02 の何が土台になるかを 5 行で説明
-
-例：「vol-03 の Foundation Model 転移学習では、vol-02 Ch7 の CV 設計と Ch11 の階層構造が、少データ材料タスクの汎化評価と装置間差の吸収に土台として使える。」
+1. **リーク検知テストの実装**：`Pipeline` 外で fit した scaler で cross_val_score を回し、`Pipeline` 内 fit との差が閾値超過で fail する pytest を書く
+2. **p-hacking シミュレーション**：ランダムに 20 個の特徴量から best 5 を選ぶ操作を 100 回繰り返し、hold-out RMSE の分布を可視化。**hold-out を触らない**運用の重要性を確認
+3. **Prior 暴走テスト**：Ch10 の校正モデルで `beta ~ Normal(1, 0.01)` にして事後が prior に張り付くことを確認
+4. **未収束 Skill の停止テスト**：poorly-scaled 入力または centered hierarchical で実際に divergences / R-hat fail を起こしたモデルを走らせ、Skill 実行時に例外が飛ぶことを確認（fake idata で単体テストする場合と、実モデルで壊す場合を分けて実装）
+5. **バックエンド差テスト**：同じ seed / 同じモデルを pytensor と numpyro で走らせ、事後平均を **Ch12 §13.7 の sd 正規化 tolerance** に収めるか確認
+6. **チェイン切れテスト**：Layer 1 の `y_pred_calib` を微改変して Layer 2 を走らせ、`verify_provenance_chain()` が assert で止まることを確認
+7. **合成→実運用ガード**：Skill 実行前に `provenance["data_source"] != "synthetic"` を assert する wrapper を書く
 
 ---
 
-## まとめ
+## 15.11 本章のまとめ
 
-- **展開パターン**：Skill 共有（A、軽量）／専用 MCP 化（B、堅牢）／テンプレ配布（C、標準化）。L0 → L1 → L2 の成熟度と一致させる
-- **判断フロー**：安定度・監査要件・誤用影響・実装リソースの 4 軸で A/B/C を決める
-- **監査ログ**：「誰が・いつ・どのバージョン」+「何を入力し・何を出力」+「どの判断につながったか」の 3 段で最小要件を満たす
-- **廃止手続き**：`deprecated: true` → 並行運用 → 新規実行禁止 の 3 段階。バージョニング（Ch14 §14.9）と連動
-- **vol-01 + vol-02 到達点**：6 データ型 × 統計/ML 手法のマップで、深層 (vol-03) と因果 (vol-04) の**入力側品質**が担保された
-- **次巻への道しるべ**：vol-03（深層 × エージェント）は GPU 非決定性・重み配布・表現学習が新軸。vol-04（因果・実験計画）は介入・反実仮想・実験選択が新軸。どちらも vol-02 の Skill 資産の上に載る
+- 統計/ML の失敗は **7 種類**：データリーク・p-hacking・過学習・prior 暴走・MCMC 未収束・バックエンド差・チェイン切れ / 合成データ誤運用
+- **「動いた」≠「正しい」**：CV スコアや $\hat{R}$ が良く見える失敗が最も危険
+- Ch4-13 の設計は各失敗を**予防的に**塞いでいるが、**運用ゲート**（静的・動的・監査の 3 層）で検知を強制しないと素通りする
+- **`known_issues` を書ける provenance schema** で失敗を隠さない
+- 失敗のタイプで **Skill 版数を差別化**（Major/Minor/Patch）
 
-vol-02 はここで一区切りです。**Ch4-14 で作った Skill 群と、Ch15 の展開パターン**が、あなたの組織で統計/ML 実務の共通言語になることを願っています。
+vol-02 の**壊れ方**の整理はここで完了です。第16章では、これらを組織で運用する方法と、vol-03 以降への道しるべを示します。
 
 ---
 
 ## 参考資料
 
-<a id="ref-15-1">[15-1]</a> Model Context Protocol 公式仕様: https://modelcontextprotocol.io/ - Anthropic, 参照 2026-07-05
+### 本書内の該当章
 
-<a id="ref-15-2">[15-2]</a> Sculley, D. et al. "Hidden Technical Debt in Machine Learning Systems." *NeurIPS 2015*. https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html - 参照 2026-07-05
+- 第5章：データ契約と anti-leakage（本章 §15.2 の予防）
+- 第5-7章：Pipeline・CV 設計（§15.2 パターン A/B）
+- 第9章：SHAP・permutation importance の安定性（§15.4）
+- 第9-10章：prior 設計と prior predictive check（§15.5）
+- 第11章 §11.4, 第13章 §13.2：診断（§15.6）
+- 第11章 §11.9, 第13章 §13.7：バックエンド設計（§15.7）
+- 第14章 §14.6：provenance チェイン検証（§15.8）
+- 第16章：組織で運用するゲート設計、監査文化
 
-<a id="ref-15-3">[15-3]</a> Semantic Versioning 2.0.0: https://semver.org/ - 参照 2026-07-05
+### 外部参考
 
-<a id="ref-15-4">[15-4]</a> ORCID: Open Researcher and Contributor ID: https://orcid.org/ - 参照 2026-07-05
-
-<a id="ref-15-5">[15-5]</a> Wilkinson, M. D. et al. "The FAIR Guiding Principles for scientific data management and stewardship." *Scientific Data*, 3, 160018 (2016). https://doi.org/10.1038/sdata.2016.18 - 参照 2026-07-05
-
-<a id="ref-15-6">[15-6]</a> Pearl, J. and Mackenzie, D. *The Book of Why: The New Science of Cause and Effect*. Basic Books, 2018.（vol-04 の理論的背景）
-
-<a id="ref-15-7">[15-7]</a> Frazier, P. I. "A Tutorial on Bayesian Optimization." arXiv:1807.02811 (2018). https://arxiv.org/abs/1807.02811 - vol-04 のベイズ最適化基礎
-
-<a id="ref-15-8">[15-8]</a> Nosek, B. A. et al. "The preregistration revolution." *PNAS*, 115(11), 2600-2606 (2018). https://doi.org/10.1073/pnas.1708274114 - vol-04 の pre-registration
-
-<a id="ref-15-9">[15-9]</a> W3C PROV Overview: https://www.w3.org/TR/prov-overview/ - 参照 2026-07-05（provenance モデルの標準）
-
-<a id="ref-15-10">[15-10]</a> NIST AI Risk Management Framework (AI RMF 1.0): https://www.nist.gov/itl/ai-risk-management-framework - 参照 2026-07-05
-
-<a id="ref-15-11">[15-11]</a> ISO/IEC 17025:2017 General requirements for the competence of testing and calibration laboratories: https://www.iso.org/standard/66912.html - 参照 2026-07-05（校正・試験ラボの品質要件）
-
-<a id="ref-15-12">[15-12]</a> DoWhy: https://www.pywhy.org/dowhy/ - vol-04 の因果推論ライブラリ
-
-<a id="ref-15-13">[15-13]</a> EconML: https://econml.azurewebsites.net/ - vol-04 の因果効果推定
-
-<a id="ref-15-14">[15-14]</a> BoTorch: https://botorch.org/ - vol-04 のベイズ最適化
+<a id="ref-14-1">[14-1]</a> Kaufman, S., Rosset, S., Perlich, C., & Stitelman, O. (2012). Leakage in data mining: Formulation, detection, and avoidance. *ACM TKDD*, 6(4). — データリークの体系化
+<a id="ref-14-2">[14-2]</a> Ioannidis, J. P. A. (2005). Why most published research findings are false. *PLOS Medicine*, 2(8), e124. — p-hacking と多重比較の危険性
+<a id="ref-14-3">[14-3]</a> Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., & Bürkner, P.-C. (2021). Rank-Normalization, Folding, and Localization: An Improved $\hat{R}$ for Assessing Convergence of MCMC. *Bayesian Analysis*, 16(2), 667–718. — $\hat{R}$ による未収束検知（§15.6）
+<a id="ref-14-4">[14-4]</a> Gabry, J., Simpson, D., Vehtari, A., Betancourt, M., & Gelman, A. (2019). Visualization in Bayesian workflow. *JRSS A*, 182(2), 389–402. — prior predictive check と PPC による誤モデル検知（§15.5）
+<a id="ref-14-5">[14-5]</a> Sculley, D., Holt, G., Golovin, D. et al. (2015). Hidden technical debt in machine learning systems. *NeurIPS 2015*. — ML システムの運用負債（§15.9）
+<a id="ref-14-6">[14-6]</a> Wasserstein, R. L., & Lazar, N. A. (2016). The ASA's Statement on p-Values: Context, Process, and Purpose. *The American Statistician*, 70(2), 129–133. — p 値の運用注意（§15.3）の公式声明

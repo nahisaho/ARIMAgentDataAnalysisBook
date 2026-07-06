@@ -1,550 +1,568 @@
-# 第11章　階層モデル：反復測定・ロット差・測定誤差
+# 第11章　PyMC 入門と Skill 化
 
 > [!IMPORTANT]
 > **本章の到達目標**
 >
-> - **完全プーリング / 完全非プーリング / 部分プーリング**の 3 体制を区別し、材料研究のどの場面でどれを選ぶかを説明できる
-> - **反復測定モデル**（試料 × 繰り返し）を PyMC で書ける
-> - **ロット差モデル**（試料 × ロット、切片ランダム効果）を書け、`sigma_lot` の事後分布から**「ロット差は無視できるか」**を判断できる
-> - **測定誤差モデル**（観測 = 真値 + 誤差）で、**真値を潜在変数**として扱える
-> - **中心化 vs 非中心化パラメータ化**の違いを理解し、divergences が出たときに reparameterize できる
-> - 階層モデルで **NumPyro/JAX を推奨バックエンドとして使う設定**を組める
-> - Advanced Capstone（第13章）に向けた **階層モデル Skill** の provenance テンプレを完成できる
+> - `pm.Model` の基本構文で、**prior → likelihood → posterior** の 3 層を書き分けられる
+> - **prior predictive check** で「観測前に prior が生む世界」を確認できる
+> - **posterior predictive check** で「事後がデータを再現できるか」を診断できる
+> - **収束診断の「見る場所」**（$\hat{R}$、ESS、divergences、tree depth、energy）を知り、警告に対処できる
+> - **校正曲線のベイズ版** を最小限の PyMC コードで組み立てられる
+> - PyMC Skill を、**`sampler_config` / `backend_config` / `posterior_artifact` / `diagnostics_summary`** を含む provenance と共に凍結できる
+> - 章末で **NumPyro/JAX に移る前の準備**（`jax_enable_x64`, 乱数キー, PyTensor fallback）を整える
 
 ## 本章で扱わないこと
 
-- **完全な混合効果モデル理論**（統計学教科書）：本書はエージェント時代の実装ワークフローに絞る
-- **多変量ランダム効果 / LKJ prior**：スカラのランダム効果に絞る（相関構造は付録の参考文献に委ねる）
-- **時系列の階層モデル / 状態空間**：本章のスコープ外
-- **カテゴリカル反応の階層モデル**：連続反応（回帰系）に絞る
-- **収束診断の判断論**：第12章
-- **失敗パターン集**：第14章
+- **階層モデル**：第12章で扱う（本章は非階層 = 完全プーリングまで）
+- **MCMC 実務の判断論**（chain 数打切り基準、reparameterization 選択、divergences の再パラメータ化）：第13章
+- **失敗パターン全般**：第15章
+- **Stan コードの併記**：付録 B の対応表のみ
+- **深層ベイズ（BNN、VI）**：本書のスコープ外
 
 ---
 
-## 11.1 なぜ階層モデルか：材料研究の 3 体制
+## 11.1 章の位置づけ
 
-材料研究のデータは、**ネストされた構造**を持つのが普通です：
+第10章で **CI vs CrI、事前分布、`uncertainty_scheme`** を言葉で整理しました。本章はそれを**動かす**回です。
 
-- 試料 → その中の繰り返し測定
-- 合成バッチ（ロット） → その中の試料
-- 装置 → その装置で測った試料
-- 研究室 → その研究室の装置
+- vol-01 の Skill 仕様書 6 要素はそのまま使う
+- Skill の**主成果物**は「点推定 + 頻度論 CI」から「事後分布 + CrI + 事後予測分布」に置き換わる
+- provenance には **`sampler_config` / `backend_config` / `posterior_artifact` / `diagnostics_summary`** が加わる（付録 A で正式化）
 
-このネスト構造を無視して**「独立同分布」として扱うと**、頻度論では標準誤差の過小推定、Bayesian では過信した CrI が出ます。
+### 5 ステップ・ワークフロー
 
-### 3 つの選択肢
+本章では以下の 5 ステップを 1 サイクルとして繰り返します：
 
-同じデータに対して、次の 3 つのモデリング体制があります。
-
-| 体制 | モデル | 情報の借用 | 使う場面 |
-|---|---|---|---|
-| **完全プーリング**（complete pooling） | グループを無視、全データを 1 つの母集団と仮定 | すべて共有 | ロット差・装置差が明確に無視できるとき |
-| **完全非プーリング**（no pooling） | グループごとに独立にモデル化 | しない | 各グループのデータが十分多く、共通の母構造がないとき |
-| **部分プーリング**（partial pooling） | グループ固有効果 + 母集団分布 | 母集団経由で借用 | データが不均等 or 少ないグループがあるとき（実務のデフォルト） |
-
-**部分プーリングは階層モデルの中核概念**です。データが少ないグループは全体平均に「縮む（shrinkage）」ため、極端な推定を避けられます。
-
-### 材料研究の判断表
-
-| 場面 | 推奨 | 理由 |
+| ステップ | 内容 | 対応節 |
 |---|---|---|
-| 単一装置・単一ロット・n=100+ | 完全プーリング | 階層構造がそもそもない |
-| 5 ロット × 20 試料/ロット、ロット差の分散に関心 | **部分プーリング** | `sigma_lot` の事後分布を意思決定に使える |
-| 3 装置 × 装置ごとに 200 試料 | 完全非プーリング or 部分プーリング | データが多ければ非プーリング、少ないなら部分プーリング |
-| 10 研究室 × 各研究室で 3 試料のみ | **部分プーリング** | データ少 + 情報借用が必要 |
+| 1. モデル記述 | `pm.Model` 内で prior と尤度を書く | §11.2 |
+| 2. Prior predictive check | 観測を使わず prior だけでデータを生成、物理的に妥当か目視 | §11.3 |
+| 3. サンプリング | NUTS で事後分布からサンプル | §11.4 |
+| 4. 収束診断 | $\hat{R}$、ESS、divergences、tree depth、energy | §11.4 |
+| 5. Posterior predictive check | 事後からデータを再生成、観測と比較 | §11.5 |
+
+> [!NOTE]
+> **順序は厳格**：ステップ 2 を飛ばしていきなり 3→5 に行くのが最も多い失敗です。「観測を見ずに prior だけで妥当な世界が出るか」を確認しないと、事後の妥当性を評価する基準が持てません。
 
 ---
 
-## 11.2 Partial pooling の直感
+## 11.2 `pm.Model` の基本構文
 
-部分プーリングは、**「各グループ固有の値」と「全体の平均」の折衷**を、データ量に応じて自動調整します。
+### 3 層構造
 
-$$
-\alpha_g \sim \mathrm{Normal}(\mu_\alpha, \sigma_\alpha), \quad g = 1, \dots, G
-$$
-
-- $\mu_\alpha$：全体平均（母集団パラメータ、ハイパーパラメータ）
-- $\sigma_\alpha$：グループ間のばらつき（母集団パラメータ）
-- $\alpha_g$：グループ $g$ 固有の値
-
-**縮み（shrinkage）の起き方**：
-
-- グループ $g$ のデータが多い → $\alpha_g$ は自身のデータに強く引かれる
-- グループ $g$ のデータが少ない → $\alpha_g$ は $\mu_\alpha$ に強く引かれる
-- $\sigma_\alpha$ が小さい → 全グループが $\mu_\alpha$ に近い
-- $\sigma_\alpha$ が大きい → 各グループが独立に近い
-
-**このメカニズムを手作業でチューニングするのは非現実的**です。階層モデルは Bayesian の枠組みで自動的にこれを行います [[11-1]](#ref-11-1) [[11-2]](#ref-11-2)。
-
----
-
-## 11.3 反復測定モデル（試料 × 繰り返し）
-
-### 場面
-
-同じ試料に対して、同じ装置で 3〜5 回測定を繰り返す。**繰り返し内のばらつき**（測定精度）と、**試料間のばらつき**（試料の真の分散）を分けたい。
-
-### モデル
-
-$$
-y_{s, r} \sim \mathrm{Normal}(\alpha_s, \sigma_{\text{obs}}), \quad \alpha_s \sim \mathrm{Normal}(\mu, \sigma_{\text{sample}})
-$$
-
-- $y_{s,r}$：試料 $s$ の $r$ 回目の測定値
-- $\alpha_s$：試料 $s$ の真値（潜在）
-- $\sigma_{\text{obs}}$：測定装置のノイズ
-- $\mu, \sigma_{\text{sample}}$：試料集団の平均と分散
+PyMC のモデルは常に **prior → deterministic transformation → likelihood** の 3 層で書きます。
 
 ```python
 import pymc as pm
 import numpy as np
 
-# 合成階層データ（リポジトリルート data/synthetic-hierarchy/ から、付録A §A.1.1）
-# sample_id: 各測定がどの試料か、shape=(N,)
-# y_obs:     測定値、shape=(N,)
+with pm.Model() as model:
+    # ① 事前分布（parameters）
+    alpha = pm.Normal("alpha", mu=0.0, sigma=1.0)
+    beta  = pm.Normal("beta",  mu=0.0, sigma=1.0)
+    sigma = pm.HalfNormal("sigma", sigma=1.0)
 
-n_samples = len(np.unique(sample_id))
+    # ② 決定的変換（linear predictor など）
+    mu = pm.Deterministic("mu", alpha + beta * x_obs)
 
-with pm.Model(coords={"sample": np.arange(n_samples),
-                       "obs":    np.arange(len(y_obs))}) as repeated:
-    # 母集団パラメータ
-    mu           = pm.Normal("mu", mu=0.0, sigma=5.0)
-    sigma_sample = pm.HalfNormal("sigma_sample", sigma=2.0)
-    sigma_obs    = pm.HalfNormal("sigma_obs",    sigma=1.0)
-
-    # 試料ごとの真値（中心化パラメータ化：後で非中心化に変更）
-    alpha = pm.Normal("alpha", mu=mu, sigma=sigma_sample, dims="sample")
-
-    # 尤度
-    y = pm.Normal("y", mu=alpha[sample_id], sigma=sigma_obs,
-                  observed=y_obs, dims="obs")
-
-    idata = pm.sample(
-        draws=1000, tune=1000, chains=4,
-        nuts_sampler="numpyro",         # §10.9 の準備を活用
-        target_accept=0.90,             # 中心化 & divergences なしなら 0.90 で開始
-        random_seed=42,
-    )
+    # ③ 尤度（likelihood, observed が付く）
+    y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_data)
 ```
 
-> [!TIP]
-> **`sample_id` は 0-based int**：PyMC の fancy indexing は 0-based の整数 ndarray を想定しています。文字列やカテゴリ型をそのまま渡すと失敗します。
+**3 層ルール**：
+
+- `observed=` が**付かない**確率変数 = パラメータ（推定対象）
+- `observed=` が**付く**確率変数 = 尤度（データが実現値）
+- `pm.Deterministic` は事後保存対象にしたい派生量にのみ使う（すべてを Deterministic にしない）
+
+> [!IMPORTANT]
+> **上記は in-sample 専用**：`x_obs` が plain NumPy array のままだと、**同じモデルを新規データの予測に再利用できません**（`x_obs` がフィット時の値に固定されるため）。out-of-sample 予測を Skill として提供する場合は、入力を `pm.Data` に包み、`pm.set_data` で差し替えます：
 >
 > ```python
-> sample_id = np.asarray(sample_id, dtype="int64")
-> assert sample_id.min() == 0
-> assert sample_id.max() == n_samples - 1
+> with pm.Model(coords={"sample": np.arange(len(y_data))}) as model:
+>     x = pm.Data("x", x_obs, dims="sample")
+>     alpha = pm.Normal("alpha", mu=0.0, sigma=1.0)
+>     beta  = pm.Normal("beta",  mu=0.0, sigma=1.0)
+>     sigma = pm.HalfNormal("sigma", sigma=1.0)
+>     mu = pm.Deterministic("mu", alpha + beta * x, dims="sample")
+>     y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_data, dims="sample")
+>
+> # 予測時
+> with model:
+>     pm.set_data({"x": x_new}, coords={"sample": np.arange(len(x_new))})
+>     idata_pred = pm.sample_posterior_predictive(
+>         idata, predictions=True, random_seed=42,
+>     )   # predictions=True で観測 y との整合を要求せず、in/out-of-sample を分離
 > ```
 >
-> `lot_id`, `inst_id` も同様。
-
-### 読み方
-
-- `sigma_obs`：装置ノイズ（繰り返し測定 3〜5 回で 1 試料の平均を出す価値の判断材料）
-- `sigma_sample`：試料集団の真の分散
-- `sigma_obs / sigma_sample` 比：**この比が 1 に近ければ、繰り返し測定がノイズに埋もれるサイン**。試料を増やす方が情報効率が高い
+> **`predictions=True` を付ける理由**：`observed=y_data` は fit 時の値に固定されており、`dims="sample"` を通じて `sample` 座標に紐付いています。`predictions=True` を付けないと、`set_data` で `sample` 長を変えたときに **観測 y（長さ n）と新座標（長さ len(x_new)）の shape 不整合**で `CoordinateValidationError` になります。`predictions=True` は out-of-sample 予測専用のパスに切り替え、結果は `idata_pred.predictions` に格納されます（`posterior_predictive` ではありません）。
 
 > [!TIP]
-> **設計への逆流**：試料 20 個 × 繰り返し 5 回 = 100 測定と、試料 50 個 × 繰り返し 2 回 = 100 測定は、**情報量が異なります**。反復測定モデルを走らせると、どちらの設計が母平均・母分散の推定に効率的かを事後的に評価できます（Advanced Capstone の実例、第13章）。
+> **命名規則**：Skill 仕様書 ⑤（禁止事項）と揃えて、パラメータ名は **snake_case・単位付きコメント**を推奨します（`alpha  # eV, offset`）。ArviZ の可視化で名前がそのまま軸ラベルになるため、後から書き換えるコストが大きい。
+
+### 座標（coords）と次元名
+
+`pm.Model(coords=...)` で軸に名前を付けておくと、事後の可視化・保存が段違いに楽になります。
+
+```python
+coords = {"sample": np.arange(len(y_data)), "feature": ["temp", "pressure"]}
+with pm.Model(coords=coords) as model:
+    beta = pm.Normal("beta", mu=0.0, sigma=1.0, dims="feature")
+    ...
+```
+
+**階層モデルで必須**（第12章）：`dims="lot"`, `dims="instrument"` の名前が付くと partial pooling の解釈が容易。本章の非階層モデルでも習慣化しておきます。
 
 ---
 
-## 11.4 ロット差モデル（試料 × ロット）
+## 11.3 Prior predictive check：観測前の世界を見る
 
-### 場面
+### なぜ観測前にチェックするか
 
-合成バッチ（ロット）ごとにわずかな差がある可能性がある。**「ロット差は無視できるか？」**を Skill で判定したい。
-
-### モデル
-
-$$
-y_{s} \sim \mathrm{Normal}(\alpha_{l(s)}, \sigma_{\text{obs}}), \quad \alpha_l \sim \mathrm{Normal}(\mu, \sigma_{\text{lot}})
-$$
-
-- $l(s)$：試料 $s$ が属するロット
-- $\sigma_{\text{lot}}$：ロット間ばらつき（**関心量**）
+事前分布は **「物理的に妥当な世界を生む分布」でなければなりません**。強すぎる prior は観測を無視した結論を生み、弱すぎる prior は非物理的な予測を生みます。**Prior predictive check は、観測を見る前に prior を評価する唯一の方法**です。
 
 ```python
-with pm.Model(coords={"lot":    np.arange(n_lots),
-                       "sample": np.arange(len(y_obs))}) as lot_effect:
-    mu        = pm.Normal("mu", mu=0.0, sigma=5.0)
-    sigma_lot = pm.HalfNormal("sigma_lot", sigma=2.0)
-    sigma_obs = pm.HalfNormal("sigma_obs", sigma=1.0)
-
-    # ロットごとの平均
-    alpha_lot = pm.Normal("alpha_lot", mu=mu, sigma=sigma_lot, dims="lot")
-
-    y = pm.Normal("y", mu=alpha_lot[lot_id], sigma=sigma_obs,
-                  observed=y_obs, dims="sample")
-
-    idata_lot = pm.sample(
-        draws=1000, tune=1000, chains=4,
-        nuts_sampler="numpyro",
-        target_accept=0.90, random_seed=42,
-    )
+with model:
+    prior_pred = pm.sample_prior_predictive(draws=500, random_seed=42)
 ```
+
+`prior_pred.prior_predictive["y_obs"]` が **prior のみから生成された仮想観測**（500 × n_samples 行列）。これを ArviZ でプロットして、**物理的に不可能な値**（負の bandgap、100% を超える収率など）が高頻度で出ていないかを確認します。
+
+### 診断の基準
+
+| 症状 | 診断 | 対応 |
+|---|---|---|
+| 予測範囲が物理的閾値を大きく超える | Prior が弱すぎる | `sigma` を狭める、`Truncated` を追加 |
+| 予測範囲が実測レンジより明らかに狭い | Prior が強すぎる | `sigma` を広げる、または情報事前分布の正当化を再確認 |
+| 予測分布が実測平均から大きくずれる | 中心（`mu`）が誤っている | 単位・スケール・変換の確認 |
+| 予測分布に極端な多峰・裾 | 尤度・変換が不適切 | パラメータ変換（log、standardized）を検討 |
 
 > [!WARNING]
-> **G が小さいと `sigma_lot` は prior 依存**：ロット数 G < 5 のとき、`sigma_lot` の事後分布は**強く prior に依存**します（データ 1 個から母集団分散は推定できないのと同じ理屈）。以下を必須運用にします：
->
-> - `sensitivity_alternatives` で `sigma_lot` の prior を 2〜3 種類試す（第10章 §10.7）
-> - Skill 仕様書 ⑤（禁止事項）に「G < 5 の階層モデルで sigma_group を単独証拠にしない」を追加
-> - G が増やせるならデータ設計側で追加を検討
+> **Prior predictive を「観測と一致させる」のは目的外**：目的は「物理的に許容可能な世界を prior が生むか」であり、観測を再現することではありません。観測を再現するのは posterior predictive です（§11.5）。
 
-### 「ロット差は無視できるか」判定
+### Skill 仕様書との対応
 
-`sigma_lot` の**事後分布**を、閾値 $\tau$（例：0.05 eV）と比較して 3 判定：
-
-| 判定 | 条件 | 結論 |
-|---|---|---|
-| **無視できる** | 95% CrI の**上端** < $\tau$ | ロット差は実務上小さい、完全プーリング化を検討 |
-| **無視できない** | 95% CrI の**下端** > $\tau$ | ロット差は明確、階層モデルを維持 |
-| **保留** | 95% CrI が $\tau$ を跨ぐ | データ追加、prior 感度分析、意思決定閾値の再検討 |
-
-> [!IMPORTANT]
-> **`sigma_lot ≈ 0` を「無視できる」と誤読しない**：Bayesian では**事後分布そのもの**を判断材料にします。「点推定が 0.02 だから小さい」は不十分。閾値ベースで **確率的な意思決定**を行い、`P(sigma_lot > threshold | data)` を Skill 出力に含めます：
->
-> ```python
-> threshold = 0.05  # eV
-> prob_significant = (idata_lot.posterior["sigma_lot"] > threshold).mean().item()
-> ```
->
-> これは第9章 `uncertainty_scheme.posterior_quantity: threshold_probability` の実装。
-
----
-
-## 11.5 測定誤差モデル（観測 = 真値 + 誤差）
-
-### 場面
-
-装置校正のばらつき・環境ノイズ・オペレーター差などで、**観測値は真値の推定であり、真値自体が不確か**。Errors-in-Variables 型の問題。
-
-### モデル
-
-$$
-y_i = x_i^{\text{true}} + \epsilon_i, \quad x_i^{\text{true}} \sim \mathrm{Normal}(\mu, \sigma_x), \quad \epsilon_i \sim \mathrm{Normal}(0, \sigma_{\text{obs}})
-$$
-
-観測 $y_i$ とは別に、$x_i^{\text{true}}$ を**潜在変数**として推定します。第9章 §9.3 で挙げた「観測誤差の不確かさ」を実装するのがこの型です。
-
-```python
-with pm.Model(coords={"obs": np.arange(len(y_obs))}) as meas_error:
-    mu         = pm.Normal("mu", mu=0.0, sigma=5.0)
-    sigma_x    = pm.HalfNormal("sigma_x", sigma=2.0)          # 真値の分布
-    sigma_obs  = pm.HalfNormal("sigma_obs", sigma=1.0)         # 装置ノイズ
-
-    # 潜在真値：観測ごとに独立の真値（=単発測定・n 試料 = n 観測のケース）
-    x_true = pm.Normal("x_true", mu=mu, sigma=sigma_x, dims="obs")
-
-    # 観測モデル
-    y = pm.Normal("y", mu=x_true, sigma=sigma_obs,
-                  observed=y_obs, dims="obs")
-
-    idata_me = pm.sample(
-        draws=1000, tune=1000, chains=4,
-        nuts_sampler="numpyro",
-        target_accept=0.90, random_seed=42,
-    )
-```
-
-> [!IMPORTANT]
-> **反復測定がある場合は `x_true` を `sample` 次元に**：同じ試料を複数回測っているなら、真値は**観測ごと**ではなく**試料ごと**です：
->
-> ```python
-> with pm.Model(coords={"sample": np.arange(n_samples),
->                        "obs":    np.arange(len(y_obs))}) as meas_error_repeated:
->     ...
->     x_true = pm.Normal("x_true", mu=mu, sigma=sigma_x, dims="sample")
->     y = pm.Normal("y", mu=x_true[sample_id], sigma=sigma_obs,
->                   observed=y_obs, dims="obs")
-> ```
->
-> 前者と後者を混同すると、装置ノイズ `sigma_obs` の推定が歪みます（前者は `sigma_obs` を過小、後者は正しく分離）。
-
-> [!TIP]
-> **スケール選択**：反応速度定数・拡散係数・強度比などは**対数スケールで階層モデルを組む方が自然**な場合があります（例：`x_true` を `Normal` ではなく `LogNormal`、あるいはあらかじめ `y_log = np.log(y_obs)` で対数化）。物理量がゼロ・負を取りうるかを確認してから決めます。
-
-### 識別性の注意
-
-**`sigma_x` と `sigma_obs` は識別可能である必要**があります。両方が推定対象で、繰り返し測定などの追加情報がないと、**モデルは 2 つの分散を区別できません**（`sigma_x^2 + sigma_obs^2` は決まるが分解できない）。
-
-| 状況 | 識別可能か | 対応 |
-|---|---|---|
-| 装置ノイズ `sigma_obs` の外部情報あり（メーカー仕様など） | ✅ | `sigma_obs` を固定 or 強い prior |
-| 繰り返し測定がある | ✅ | 反復測定モデルで両分散を分離 |
-| 単発測定のみ、外部情報なし | ❌ | 測定誤差モデルは適用不可、完全プーリングに戻す |
-
-> [!WARNING]
-> **識別不能な測定誤差モデルは、divergences・低 ESS を大量発生させます**。§11.6 の非中心化パラメータ化で解決すると思い込みやすいですが、根本原因はモデル構造です。まず `sigma_obs` に**強い情報事前分布**を置けるか検討します。
-
----
-
-## 11.6 中心化 vs 非中心化パラメータ化：divergences への処方箋
-
-### Neal's funnel と divergences
-
-階層モデルで最も頻発する問題が **funnel geometry** です。$\sigma_\alpha$ が小さいとき、$\alpha_g$ の事後分布が漏斗状になり、NUTS は探索に失敗して **divergences** を大量に出します [[11-3]](#ref-11-3) [[11-4]](#ref-11-4)。
-
-### 中心化（centered）パラメータ化
-
-これまで書いてきた形式：
-
-```python
-alpha = pm.Normal("alpha", mu=mu, sigma=sigma_sample, dims="sample")
-```
-
-$\sigma_\alpha$ が中〜大のときは**この形が効率的**。しかし $\sigma_\alpha$ が小さいと funnel が発生します。
-
-### 非中心化（non-centered）パラメータ化
-
-**標準正規からの再パラメータ化**：
-
-$$
-\alpha_g = \mu + \sigma_\alpha \cdot z_g, \quad z_g \sim \mathrm{Normal}(0, 1)
-$$
-
-```python
-with pm.Model(coords={"sample": np.arange(n_samples),
-                       "obs":    np.arange(len(y_obs))}) as repeated_nc:
-    mu           = pm.Normal("mu", mu=0.0, sigma=5.0)
-    sigma_sample = pm.HalfNormal("sigma_sample", sigma=2.0)
-    sigma_obs    = pm.HalfNormal("sigma_obs",    sigma=1.0)
-
-    # 非中心化：標準正規オフセット
-    alpha_offset = pm.Normal("alpha_offset", mu=0.0, sigma=1.0, dims="sample")
-    alpha        = pm.Deterministic(
-        "alpha", mu + sigma_sample * alpha_offset, dims="sample",
-    )
-
-    y = pm.Normal("y", mu=alpha[sample_id], sigma=sigma_obs,
-                  observed=y_obs, dims="obs")
-```
-
-### いつどちらを使うか
-
-**根本原則**は「funnel geometry を避ける」ことです。実務的には、**グループごとの尤度がどれだけ強いか**で決まります [[11-3]](#ref-11-3)：
-
-| 状況 | 推奨パラメータ化 | 理由 |
-|---|---|---|
-| **グループごとのデータが少ない**（1〜5 観測/群） | **非中心化** | 尤度が弱く、事後が prior 由来の漏斗状になる |
-| **グループごとのデータが多い**（30+ 観測/群） | 中心化 | 尤度が強く、事後が funnel から離れる |
-| $\sigma_\alpha$ の prior が広い（弱情報） | **非中心化** | 事後 $\sigma_\alpha$ が小さい領域に潜り込みやすい |
-| $\sigma_\alpha$ の事前情報が確度高く中〜大 | 中心化 | funnel geometry は発生しにくい |
-| **迷ったら** | **両方走らせて比較** | divergences・ESS・BFMI・runtime を比較 |
-
-> [!NOTE]
-> **「事後の $\sigma_\alpha$ が小さい / 大きい」は結果**、原因ではありません。実装時点では**データの情報量と prior の広さ**で判断します。事後を見て切り替えるのは 2 回目のフィット以降。**両バリアントを Skill として保持**し、`switched_from` に切り替え履歴を残すのが本書のスタイルです。
-
-### 実務のフロー
-
-1. **中心化で書く**（読みやすさ優先、divergences があっても初期実験としてOK）
-2. `target_accept=0.90` でサンプリング
-3. divergences > 0 → 非中心化に切替 + 再サンプリング
-4. まだ divergences → `target_accept=0.95` に引き上げ
-5. まだ divergences → **モデル構造・prior・識別性**を疑う（第12章の判断論）
-
-> [!IMPORTANT]
-> **非中心化にすれば必ず解決するわけではない**：識別性の問題（§11.5）、prior の広すぎ、data の情報不足による本質的な難しさは reparameterization では解決しません。第12章の実務判断論で扱います。
-
----
-
-## 11.7 NumPyro をバックエンドに使う
-
-### なぜ NumPyro
-
-階層モデルは中〜大規模になりやすく、**JIT コンパイル + XLA による高速化**が効きます。同じモデルで、PyTensor バックエンドの数倍〜数十倍速くなることも珍しくありません。
-
-### 最小設定
-
-第10章 §10.9 で凍結した手順：
-
-```python
-import jax
-jax.config.update("jax_enable_x64", True)   # 必ず先頭で 1 回
-
-import pymc as pm
-
-with repeated_nc:
-    idata = pm.sample(
-        draws=1000, tune=1000, chains=4,
-        nuts_sampler="numpyro",     # ここだけ変える
-        target_accept=0.95,
-        random_seed=42,
-    )
-```
-
-### provenance への追加記録
-
-第10章の `backend_config` は本章以降**ネスト形が canonical**です。第10章のフラット形（`backend_config.backend`）は入門用の簡易表現で、本章から下記の primary/fallback 構造を正とします：
+prior predictive check の結果は、`prior_specification` の `justification` に**具体的な数値サマリ**として記録します：
 
 ```yaml
-backend_config:
-  primary:
-    backend:                numpyro
-    jax_x64:                true
-    jax_platform:           cpu             # jax.devices() の結果を要記録
-    numpyro_chain_method:   parallel        # or sequential / vectorized
-  fallback:
-    backend:                pytensor
-    fallback_reason_logged: true
-  parameterization:
-    strategy:               non_centered    # centered / non_centered
-    switched_from:          centered        # divergences で切り替えた記録
-    switch_reason:          "n_divergences=143 with centered"
+prior_specification:
+  ...
+  prior_predictive_summary:
+    check_date:     2026-XX-XX
+    n_prior_draws:  500
+    quantile_2.5:   -0.8
+    quantile_97.5:  0.9
+    physical_bound_violations: 0     # 例：負の bandgap を生んだ割合
+    reviewed_by:    "PI name"
 ```
-
-**`parameterization.switched_from`** を書く理由：Skill 認定後に他者が読んだとき、「なぜ非中心化を選んだか」の履歴がないと、モデル修正時に判断が引き継がれません。
 
 ---
 
-## 11.8 応用例：装置間差
+## 11.4 サンプリングと収束診断
 
-### 場面
-
-3〜5 装置で同じ試料を測る。**装置間差**が試料差やロット差より大きいと、Skill の**適用範囲**を装置ごとに切り分ける必要があります。
-
-### モデル（試料 × 装置の 2 階層）
-
-$$
-y_{s,i} \sim \mathrm{Normal}(\alpha_s + \gamma_i, \sigma_{\text{obs}}), \quad \alpha_s \sim \mathrm{Normal}(\mu_\alpha, \sigma_{\text{sample}}), \quad \gamma_i \sim \mathrm{Normal}(0, \sigma_{\text{inst}})
-$$
-
-- $\gamma_i$：装置 $i$ のオフセット（sum-to-zero 制約 or 弱い prior で識別）
-- $\sigma_{\text{inst}}$：装置間ばらつき
+### NUTS でのサンプリング
 
 ```python
-with pm.Model(coords={"sample": np.arange(n_samples),
-                       "inst":   np.arange(n_instruments),
-                       "obs":    np.arange(len(y_obs))}) as inst_effect:
-    mu_alpha     = pm.Normal("mu_alpha", mu=0.0, sigma=5.0)
-    sigma_sample = pm.HalfNormal("sigma_sample", sigma=2.0)
-    sigma_inst   = pm.HalfNormal("sigma_inst",   sigma=1.0)
-    sigma_obs    = pm.HalfNormal("sigma_obs",    sigma=1.0)
-
-    # 試料効果（非中心化）
-    alpha_offset = pm.Normal("alpha_offset", 0.0, 1.0, dims="sample")
-    alpha = pm.Deterministic("alpha",
-                             mu_alpha + sigma_sample * alpha_offset, dims="sample")
-
-    # 装置効果：sum-to-zero を明示（mu_alpha との交絡回避）
-    gamma_raw       = pm.Normal("gamma_raw", 0.0, 1.0, dims="inst")
-    gamma_zero_mean = gamma_raw - gamma_raw.mean()
-    gamma = pm.Deterministic("gamma",
-                             sigma_inst * gamma_zero_mean, dims="inst")
-
-    y = pm.Normal("y", mu=alpha[sample_id] + gamma[inst_id],
-                  sigma=sigma_obs, observed=y_obs, dims="obs")
+with model:
+    idata = pm.sample(
+        draws=1000,
+        tune=1000,
+        chains=4,
+        random_seed=42,
+        target_accept=0.90,     # divergences が出たら 0.95 → 0.99 と上げる
+        return_inferencedata=True,
+    )
 ```
 
+**デフォルトで押さえておく点**：
+
+- `chains=4` 未満は診断が甘くなる（`chains=1` は $\hat{R}$ が意味を持たない）
+- `tune` は warmup 期間。診断に含めない
+- `return_inferencedata=True` は PyMC 5 の既定。ArviZ の `InferenceData` オブジェクトが返る
+- `target_accept` は 0.80 から上げていく。0.95 でも divergences が消えないなら**モデル構造の問題**（第13章の reparameterization）
+
+### 収束診断の「見る場所」
+
+**5 つのシグナル + 1 目視**を、常に同じ順序で見ます：
+
+| 順序 | 診断量 | 見方 | 警告の閾値 |
+|---|---|---|---|
+| 0（目視） | Trace plot | `az.plot_trace(idata, var_names=["alpha", "beta", "sigma"])` | chain が"毛虫状"に重なっているか（分離・段差は不整合） |
+| 1 | `divergences` | `int(idata.sample_stats["diverging"].sum().item())` | > 0 で要調査、> 10 で対処必須 |
+| 2 | $\hat{R}$（R-hat） | `az.summary(idata)["r_hat"]` | > 1.01 で要確認、> 1.05 は明確な未収束の強い警告 |
+| 3 | ESS bulk / ESS tail | `az.summary(idata)[["ess_bulk", "ess_tail"]]` | 4 chains の総 ESS で 400 が最低ライン。tail quantile / threshold probability / rare-event 推定はより大きな ESS を要求 |
+| 4 | Tree depth | `sample_stats["tree_depth"]` の最大 | `max_treedepth`（デフォルト 10）に張り付いていたら reparameterize |
+| 5 | Energy（BFMI） | `az.bfmi(idata)` | < 0.3 で階層構造・スケーリング・重い裾・prior 広すぎを疑う |
+
 > [!IMPORTANT]
-> **sum-to-zero が必要な理由**：`gamma_i ~ Normal(0, sigma_inst)` だけでは、`mu_alpha` と `gamma` の実現平均が**識別不能に交絡**します（`mu_alpha + gamma_i = (mu_alpha + c) + (gamma_i - c)` が同じ尤度）。装置数 3〜5 の少 G では特に事後が発散しやすくなります。上記のように `gamma_raw - gamma_raw.mean()` で **`sum(gamma) = 0`** を強制するか、PyMC の `pm.ZeroSumNormal`（対応バージョンで）を使います。
->
-> **少 G（G < 5）の警告**：装置数が少ないと `sigma_inst` は prior 依存が強くなります（§11.4 と同じ理屈）。`sensitivity_alternatives` を必須運用にします。
+> **$\hat{R}$ の推奨閾値は 1.01**：かつては 1.1 が使われましたが、Vehtari et al. (2021) 以降 **1.01** が標準です [[10-1]](#ref-10-1)。ArviZ もこの閾値をベースに実装されています。「> 1.05 対処必須」は本書の運用目安であり、Skill 認定の合否ラインは組織で調整してください。
 
-### 装置間差の意思決定
+> [!TIP]
+> **YAML 保存時のスカラ変換**：`idata.sample_stats["diverging"].sum()` は xarray の scalar DataArray を返します。provenance にそのまま書くと型互換で事故ります。`int(x.item())` / `float(x.item())` で Python scalar に変換してから記録します（後述の `diagnostics_summary` テンプレはこれを想定した値）。
 
-- $\sigma_{\text{inst}}$ の CrI が実務閾値以下 → 装置差は無視、Skill は全装置共通
-- 閾値を超える → **装置ごとに別 Skill として認定**、`applicability_domain` に装置ID を明記
+### divergences への一次対応
 
-これは Skill の**適用範囲仕様**（vol-01 第7章 §7.5）を Bayesian で駆動する典型パターンです。
+1. `target_accept` を 0.90 → 0.95 → 0.99 と上げる
+2. それでも残る場合はモデル構造（階層モデルの中心化 → 非中心化パラメータ化。第12章）
+3. Prior が広すぎて事後の裾を探索できていないケースも多い（狭める）
+
+### `diagnostics_summary` フィールド
+
+Skill provenance に**必ず記録**する診断量：
+
+```yaml
+diagnostics_summary:
+  diagnostics_pass:  true               # 下記 thresholds を全て満たしたかの派生ブール
+  thresholds:
+    max_rhat:        1.01
+    min_ess_bulk:    400                # 全パラメータの最小値に対する下限
+    min_ess_tail:    400
+    max_divergences: 0
+    min_bfmi:        0.3
+  n_divergences:     0
+  max_rhat:          1.003
+  min_ess_bulk:      1250               # 全パラメータ中の最小値
+  min_ess_tail:      980                # 同上
+  max_tree_depth:    8                  # max_treedepth 未満なら健全
+  bfmi_min:          0.85
+  sampler:           pymc.NUTS
+  target_accept:     0.90
+  chains:            4
+  draws_per_chain:   1000
+  tune_per_chain:    1000
+  runtime_seconds:   47.2
+  arviz_version:     0.17.x
+  pymc_version:      5.x.x
+  random_seed:       42
+```
+
+> [!NOTE]
+> `min_ess_bulk` / `min_ess_tail` は **モデル内の全パラメータの最小値**として運用します。特定パラメータ（例：関心量）だけの ESS を別途記録したい場合は `key_parameters: {x_unknown: {ess_bulk: 1450, ess_tail: 1100}}` を追加。
 
 ---
 
-## 11.9 階層モデル Skill の provenance テンプレ
+## 11.5 Posterior predictive check：事後で観測を再現できるか
 
-第10章 §10.8 の provenance に、階層モデル特有の情報を追加します。
+### 実行
+
+```python
+with model:
+    pm.sample_posterior_predictive(
+        idata, random_seed=42, extend_inferencedata=True,
+    )
+
+import arviz as az
+az.plot_ppc(idata, num_pp_samples=100)
+```
+
+`az.plot_ppc` は**観測データの分布**（デフォルトでは KDE）に、事後予測分布からのサンプルを重ねます。**分布形が一致するか**、**外れ値の位置・量が現実的か**を見ます。
+
+### 診断の観点
+
+| 観察 | 診断 |
+|---|---|
+| 事後予測と観測がほぼ重なる | モデルはデータを再現できている（妥当性の必要条件） |
+| 事後予測の裾が観測より短い | 分散が過小推定（誤差モデルの見直し、Student-t への変更検討） |
+| 事後予測が観測より広く分散 | 情報が反映されていない（likelihood の再検討、prior 弱化） |
+| 特定領域の観測が事後予測に現れない | モデルの構造的な欠落（非線形性、階層構造の欠如） |
+
+> [!WARNING]
+> **PPC は「一致すれば正しい」ではない**：観測を再現できるモデルは**無数にあります**。PPC が失敗すればモデルが誤りである十分条件ですが、成功しても正しい保証はありません（過学習・特定化不足）。PPC は「明らかな不整合を検出する」使い方が本筋です。
+
+### 統計量ベースの PPC
+
+視覚だけでなく、**要約統計量の一致**も確認します：
+
+```python
+az.plot_bpv(idata, kind="p_value")       # Bayesian p-value
+```
+
+Bayesian p-value が **0 または 1 に極端に近い場合**、観測の特徴を事後予測が説明できていないサインです。**0.05〜0.95 は粗い目安**であり、頻度論の仮説検定のような厳密な合否ラインではありません。**モデル不整合の検出用シグナル**として使います。
+
+---
+
+## 11.6 ハンズオン：校正曲線のベイズ版
+
+### 頻度論版（vol-01 復習）
+
+vol-01 では校正曲線を線形回帰でフィットし、`np.polyfit` + `numpy.linalg.lstsq` で係数を推定しました。予測は点推定、CI は残差からの近似でした。
+
+### ベイズ版：モデル
+
+未知濃度 $x_i$ で観測される信号 $y_i$ が
+
+$$
+y_i = \alpha + \beta x_i + \varepsilon_i, \quad \varepsilon_i \sim \mathrm{Normal}(0, \sigma)
+$$
+
+**Skill 仕様書の目的欄**：既知標準からの検量線を学習し、未知試料の濃度を **予測分布**（点推定ではない）で返す。
+
+```python
+with pm.Model(coords={"sample": np.arange(len(y_obs))}) as calibration:
+    # ① priors（弱情報）
+    alpha = pm.Normal("alpha", mu=0.0, sigma=5.0)          # offset
+    beta  = pm.Normal("beta",  mu=1.0, sigma=1.0)          # slope（1 付近を弱く期待）
+    sigma = pm.HalfNormal("sigma", sigma=1.0)              # 観測誤差
+
+    # ② deterministic
+    mu = alpha + beta * x_std                              # x_std は既知濃度
+
+    # ③ likelihood
+    y = pm.Normal("y", mu=mu, sigma=sigma, observed=y_obs, dims="sample")
+
+# --- 5 ステップ ---
+with calibration:
+    prior_pred = pm.sample_prior_predictive(draws=500, random_seed=42)     # ② prior predictive
+    idata      = pm.sample(draws=1000, tune=1000, chains=4,
+                           target_accept=0.90, random_seed=42)             # ③ サンプリング
+    pm.sample_posterior_predictive(idata, random_seed=42,
+                                   extend_inferencedata=True)              # ⑤ posterior predictive
+```
+
+### 未知試料の濃度予測
+
+未知信号 $y^\star$ が観測されたときの $x^\star$ の**事後分布**は、通常は逆問題として別途モデル化します（信号→濃度の逆写像）。最も透明な方法は、**未知濃度 $x^\star$ 自体をパラメータとして扱う**ことです（Bayesian inverse regression）：
+
+```python
+with pm.Model(coords={"std": np.arange(len(y_std_obs))}) as inverse_cal:
+    alpha = pm.Normal("alpha", mu=0.0, sigma=5.0)
+    beta  = pm.Normal("beta",  mu=1.0, sigma=1.0)
+    sigma = pm.HalfNormal("sigma", sigma=1.0)
+
+    # 既知標準の観測
+    mu_std = alpha + beta * x_std
+    pm.Normal("y_std", mu=mu_std, sigma=sigma, observed=y_std_obs, dims="std")
+
+    # 未知試料の濃度（推定対象パラメータ、物理的に非負・校正範囲内に制約）
+    x_unknown = pm.TruncatedNormal(
+        "x_unknown", mu=0.0, sigma=5.0,
+        lower=x_std.min(), upper=x_std.max(),   # 校正範囲外への外挿を抑制
+    )
+    mu_unk = alpha + beta * x_unknown
+    pm.Normal("y_unknown", mu=mu_unk, sigma=sigma, observed=y_unknown_obs)
+
+    idata_inverse = pm.sample(
+        draws=1000, tune=1000, chains=4,
+        target_accept=0.90, random_seed=42,
+    )
+
+az.summary(idata_inverse, var_names=["x_unknown"])
+```
+
+`az.summary(...)` が **95% CrI 付きの未知濃度の事後分布**を返します。頻度論の外挿は逆行列演算で近似 CI を出しますが、ベイズ版はそのまま逆問題として自然に扱えます。
+
+> [!WARNING]
+> **物理制約を prior で入れる**：`Normal(0, 5)` のように制約なしにすると、**負の濃度・校正範囲外の値**が事後に混入し得ます。上記の `TruncatedNormal(..., lower=x_std.min(), upper=x_std.max())` は最小限の物理制約。ドメインに応じて `LogNormal`, `Uniform(0, C_max)`, `HalfNormal` なども検討してください。**校正範囲外の外挿は prior 依存が急激に強まる**ため、Skill 仕様書の適用範囲節で明示的に禁止します。
+
+> [!NOTE]
+> **仕様書の `uncertainty_scheme.posterior_quantity`** をここで使い分けます：
+>
+> - パラメータ CrI（$\alpha, \beta$ の不確かさ） = `parameter`
+> - 未知濃度 CrI（$x^\star$ の不確かさ、上記モデル） = `parameter`（$x^\star$ もパラメータ）
+> - 新規試料の信号予測 = `prediction`（posterior predictive）
+
+---
+
+## 11.7 事前分布への感度分析
+
+### 目的
+
+第10章で凍結した `sensitivity_alternatives` を実際に走らせ、**事後の結論が prior に依存しすぎていないか**を診断します。
+
+### 手順（3 分岐が実務のミニマム）
+
+1. **メイン prior**（弱情報）でサンプリング → 事後の点推定 + CrI を記録
+2. **弱い prior**（`sigma` を 2〜5 倍）で再サンプリング
+3. **強い prior**（`sigma` を 1/2〜1/5 倍）で再サンプリング
+4. 3 つの事後を並べ、**意思決定が変わるか**を確認
+
+### 診断基準
+
+| 観察 | 判定 | 対応 |
+|---|---|---|
+| 3 分岐で CrI が実質重なる | 事後はデータ支配、prior 選択に頑健 | 報告時に「robust to prior choice」と記録 |
+| 弱い prior と主 prior はほぼ同じ、強い prior で結論が変わる | 主 prior が強すぎる疑い | prior の正当化を再確認 |
+| 弱い prior で CrI が発散、強い prior でしか安定しない | データが情報不足、prior に依存した結論 | データ追加 or 意思決定閾値を厳しく |
+
+### Skill provenance への記録
+
+```yaml
+sensitivity_analysis:
+  performed:    true
+  branches:
+    - {label: main,     posterior_mean: 2.42, cri_95: [2.10, 2.75]}
+    - {label: weaker,   posterior_mean: 2.41, cri_95: [2.02, 2.83]}
+    - {label: stronger, posterior_mean: 2.44, cri_95: [2.20, 2.68]}
+  decision_stable_across_branches: true
+  reviewed_by:  "PI name"
+```
+
+`decision_stable_across_branches: false` の場合、Skill 仕様書 ④（成功条件）の閾値を再検討します。
+
+---
+
+## 11.8 PyMC Skill の provenance テンプレ
+
+vol-01 の provenance を PyMC 用に拡張したフィールド（付録 A で正式化）：
 
 ```yaml
 provenance:
-  # 第10章のフィールドをすべて継承
-  ...
+  # vol-01 基本フィールド
+  library_versions:   {pymc: 5.x.x, arviz: 0.17.x, numpy: 1.x.x}
+  data_hash:          sha256:...
+  random_seed:        42
+
+  # 第10章で導入済み（Skill 実行前に凍結）
+  prior_specification:
+    parameter:                       bandgap_offset
+    distribution:                    Normal
+    hyperparameters:                 {mu: 0.0, sigma: 0.5}
+    units:                           eV
+    parameter_scale:                 original
+    support:                         [-3.0, 3.0]
+    likelihood_context:              "Normal observation model with sigma_obs estimated"
+    justification:                   "内部レポート XX (2024)"
+    literature_ref:                  [ref-lab-report-2024]
+    justification_document:          docs/priors/bandgap_offset.md
+    data_cutoff_for_prior:           2025-12-31
+    prior_predictive_check_required: true
+    sensitivity_alternatives:
+      - {distribution: Normal, sigma: 1.0, label: weaker}
+      - {distribution: Normal, sigma: 0.2, label: stronger}
+    reviewed_by:                     "PI name"
+    review_date:                     2026-XX-XX
 
   # 第11章で追加
-  hierarchical_structure:
-    levels:
-      - {name: sample,     n: 20,  data_per_level: 5}
-      - {name: lot,        n: 4,   data_per_level: 25}
-      - {name: instrument, n: 3,   data_per_level: 33}
-    structure_type: crossed             # nested / crossed / partially_crossed
-    partial_pooling_targets:  [alpha, gamma]
-    complete_pooling_targets: [mu_alpha]
-    model_formula:
-      response:         y
-      likelihood:       Normal
-      linear_predictor: "alpha[sample_id] + gamma[inst_id]"
-      observation_dim:  obs
-    index_mapping:
-      sample_id: "obs -> sample"
-      inst_id:   "obs -> instrument"
-    zero_sum_constraints: [gamma]       # sum-to-zero を課した効果
+  sampler_config:
+    sampler:          NUTS
+    chains:           4
+    draws:            1000
+    tune:             1000
+    target_accept:    0.90
+    max_treedepth:    10
+    init_strategy:    jitter+adapt_diag
 
-  parameterization:
-    strategy:            non_centered
-    switched_from:       centered
-    switch_reason:       "n_divergences=143 with centered"
-    verified_via:        "prior predictive check + posterior predictive check"
+  backend_config:
+    backend:          pytensor       # numpyro / nutpie / blackjax も可（§11.9）
+    jax_x64:          null           # numpyro 使用時のみ true
 
-  identifiability_check:
-    performed:           true
-    method:              "prior predictive check + external calibration data"
-    concerns:            []
-    reviewed_by:         "PI name"
+  posterior_artifact:
+    path:             artifacts/posterior_v1.0.0.nc     # .github/skills/<name>/artifacts/ 配下（付録A §A.1.1）
+    format:           netCDF
+    sha256:           ...
 
-  shrinkage_summary:
-    # 標準化群偏差（各群が母平均から何 σ_α 離れているか）
-    standardized_group_deviation:
-      metric: "|alpha_partial[g] - mu_alpha| / sigma_alpha"
-      max:    1.8
-      min:    0.1
-    # 縮み係数（no-pooling 推定 → partial-pooling 推定でどれだけ母平均に寄ったか）
-    shrinkage_factor:
-      metric: "1 - |alpha_partial[g] - mu_alpha| / |alpha_no_pooling[g] - mu_alpha|"
-      max:    0.72        # データ少 → 強い縮み
-      min:    0.08        # データ多 → ほぼ動かない
-    n_shrunk_groups:      3    # shrinkage_factor > 0.5 の群数
-    groups_with_low_ess:  []
+  diagnostics_summary:
+    # §11.4 の diagnostics_summary をそのまま貼る（thresholds + diagnostics_pass を含む）
 
-  applicability_domain:
-    instruments:         [inst-A, inst-B, inst-C]
-    lot_range:           [lot-2024-01, lot-2025-12]
-    sample_composition:  "半導体単結晶、n=100 まで検証済"
-    exclusions:          ["装置 D は sigma_inst の CrI 外、別 Skill 認定必要"]
+  prior_predictive_summary:
+    # §11.3 の記録（prior_specification.prior_predictive_check_required=true の実行結果）
+  posterior_predictive_summary:
+    bayesian_p_value:      0.42
+    kolmogorov_smirnov_p:  0.35    # 参考、閾値ではない
+
+  sensitivity_analysis:
+    # §11.7 の記録（prior_specification.sensitivity_alternatives の実行結果）
+
+  uncertainty_scheme:
+    # 第10章 §10.5 のスキームをそのまま
 ```
 
-### 合成階層データ
+**エージェント時代の運用**：この provenance を **Skill 実行の出力に強制的に含めさせる**設計にします（テンプレを出力しない Skill は監査違反）。第15章の失敗パターンで再登場します。
 
-本章の例は **リポジトリルートの `data/synthetic-hierarchy/`**（配置規約は付録A §A.1.1）の合成データを想定しています（第2章 §2.9 で予告）。実データ候補は付録 C。
+> [!NOTE]
+> **依存関係**：`prior_predictive_summary` は `prior_specification` の子、`sensitivity_analysis` は `prior_specification.sensitivity_alternatives` の実行結果、`diagnostics_summary.diagnostics_pass` が `false` なら Skill は成功条件④を満たしません。この 4 者は**独立に書き換えてはいけない**ため、Skill 実行時にワンショットで生成します。
 
-- **なぜ合成か**：階層構造が制御可能で「真値」が既知、Skill が正しく回収できるかを検証できる
-- **提供される階層**：試料 × 繰り返し / 試料 × ロット / 試料 × 装置 / 3 階層フル
-- **意図的な難所**：小サンプル群、識別性ギリギリ、divergences を誘発する設定
+---
 
-第13章 Advanced Capstone では、この合成データで **階層モデル Skill の完成を認定**します。
+## 11.9 NumPyro/JAX に移る前の 5 ページ
+
+第12章（階層モデル）ではサンプリング速度がボトルネックになりやすく、**NumPyro（JAX バックエンド）** を推奨します。本章末で移行準備を整えます。
+
+### 準備 1：JAX の 64-bit モード
+
+**必ず有効化**します。デフォルトの 32-bit では数値精度不足で $\hat{R}$ が悪化することがあります。
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)
+```
+
+これは **Python プロセスの先頭で 1 回だけ実行**し、JAX を使う他のコードより前に置きます。
+
+### 準備 2：PyMC からの NumPyro 呼び出し
+
+PyMC 5 では**同じモデル定義**で NumPyro NUTS を使えます：
+
+```python
+with calibration:
+    idata_np = pm.sample(
+        1000, tune=1000, chains=4,
+        nuts_sampler="numpyro",         # PyTensor の代わりに NumPyro を使用
+        random_seed=42,
+        target_accept=0.90,
+    )
+```
+
+`backend_config.backend: numpyro` を provenance に記録します。
+
+### 準備 3：乱数キー管理
+
+JAX の乱数は **状態を持たない `PRNGKey`** で扱います。PyMC 経由なら `random_seed` を渡せば内部で処理されますが、**NumPyro を直接使う場合**（第12章の一部）は：
+
+```python
+import jax.random as jr
+key = jr.PRNGKey(42)
+key, subkey = jr.split(key)     # 使うたびに分岐
+```
+
+**アンチパターン**：同じ `PRNGKey(0)` を複数箇所で使うと**乱数系列が重複**します。必ず `split` で分岐させます。
+
+### 準備 4：PyTensor fallback
+
+NumPyro でエラーが出た場合、**同じモデル・同じシードで PyTensor に戻す**ことができます。Skill 仕様書に **fallback ルート**を明記：
+
+```yaml
+backend_config:
+  primary:   {backend: numpyro, jax_x64: true}
+  fallback:  {backend: pytensor}
+  fallback_reason_logged: true
+```
+
+### 準備 5：環境の凍結
+
+vol-01 の `pip freeze > requirements.txt` に加えて、**JAX のプラットフォーム記録**を追加：
+
+```python
+print(jax.devices())              # 例: [CpuDevice(id=0)] or [gpu(id=0)]
+```
+
+これを Skill provenance の `backend_config` に記録します。同じ Skill が **CPU/GPU で数値が微差ぶれる**ため、再現性の必要条件です。
+
+> [!TIP]
+> **GPU での再現性は本質的に難しい**：`XLA_FLAGS` の設定・ドライバのバージョン・CUDA バージョンで数値が変わり得ます。**Skill 認定の最終検証は CPU で行う**のがミニマム安全策です（第15章）。
 
 ---
 
 ## 11.10 章末ワーク
 
-1. **反復測定モデルを 5 分で走らせる**：リポジトリルート `data/synthetic-hierarchy/repeated/` から `sample_id` と `y_obs` を読み込み、§11.3 のモデルを NumPyro で回す。`sigma_obs / sigma_sample` 比を計算し、繰り返し数の設計判断を書く
-2. **ロット差の意思決定**：§11.4 のモデルで `P(sigma_lot > 0.05)` を計算し、Skill 仕様書の④成功条件に**閾値ベース確率**を書く
-3. **識別性チェック**：§11.5 の測定誤差モデルで、`sigma_obs` に**強い prior**（例：`HalfNormal(0.1)`）と**弱い prior**（例：`HalfNormal(5.0)`）で走らせ、`sigma_x` の事後がどう変わるかを比較する
-4. **中心化 → 非中心化への切替**：§11.6 の両バリアントで同じデータを走らせ、`n_divergences` を比較。差が出たら `switched_from` を provenance に記録
-5. **装置間差の Skill 分割判断**：§11.8 のモデルで `sigma_inst` の 95% CrI を出し、閾値と比較して Skill の `applicability_domain` を決める
-6. **NumPyro 高速化の確認**：同じモデルを `pytensor` と `numpyro` で走らせ、`runtime_seconds` と `max_rhat`、`min_ess_bulk` を比較する
+1. **`pm.Model` の 3 層を書き分ける**：vol-01 で使った線形回帰データを、prior → deterministic → likelihood の 3 層で書く。`pm.Deterministic` を使うべき変数と使うべきでない変数を判別する
+2. **Prior predictive check の目視**：bandgap や Raman ピーク位置を対象に prior を書き、`sample_prior_predictive` で 500 サンプル生成、**物理的閾値違反率**を計算する
+3. **収束診断の 5 シグナルを 1 モデルで確認**：divergences / $\hat{R}$ / ESS bulk / ESS tail / tree depth / BFMI を `az.summary` と `sample_stats` から抽出、`diagnostics_summary` YAML を埋める
+4. **校正曲線ベイズ版のハンズオン**：既知標準 5 点 + 未知試料 3 点で `x_unknown` を推定、CrI 幅と頻度論外挿の CI 幅を比較する
+5. **感度分析 3 分岐**：主 prior・弱い prior・強い prior で同じデータをフィットし、CrI が重なるかを比較する。`decision_stable_across_branches` を判定する
+6. **NumPyro に移し替える**：同じモデルで `nuts_sampler="numpyro"` を有効化、サンプリング速度と $\hat{R}$/ESS を比較する。`jax.devices()` を provenance に記録する
 
 ---
 
 ## 11.11 本章のまとめ
 
-- **3 体制**：完全プーリング / 完全非プーリング / 部分プーリング。実務のデフォルトは部分プーリング
-- **反復測定・ロット差・測定誤差**は材料研究の 3 大階層シナリオ。それぞれの `sigma_*` を意思決定に接続する
-- **`P(sigma_lot > threshold | data)`** のような**閾値ベース確率**を Skill 出力に含める（`uncertainty_scheme.posterior_quantity: threshold_probability`）
-- **測定誤差モデルは識別性が要**。繰り返し測定 or 外部校正情報がないと解けない
-- **中心化 vs 非中心化**：グループごとのデータが少ない・prior が広いときは非中心化。divergences が出たら切替、両バリアントを持ち、`switched_from` を記録。`target_accept` は 0.90 で開始し、必要に応じて 0.95 → 0.99 へ
-- **NumPyro を推奨**：`jax_enable_x64` + `nuts_sampler="numpyro"` + `jax.devices()` を凍結
-- **装置間差**は Skill の適用範囲決定に直結。`applicability_domain` を Bayesian で駆動
-- 階層モデル Skill の provenance には **`hierarchical_structure` / `parameterization` / `identifiability_check` / `shrinkage_summary` / `applicability_domain`** を追加
+- **PyMC は prior → deterministic → likelihood の 3 層**で書く。この順序を崩さない
+- **5 ステップ（記述 → prior predictive → サンプリング → 診断 → posterior predictive）** を Skill の骨格とする
+- **収束診断は 5 シグナル**：divergences → $\hat{R}$ (>1.01 で警告) → ESS bulk/tail → tree depth → BFMI
+- **PPC は妥当性の必要条件、十分条件ではない**：一致で安心せず、不一致では棄却
+- **感度分析 3 分岐**（main / weaker / stronger）を Skill に組み込み、`decision_stable_across_branches` を出す
+- PyMC Skill の provenance には **`sampler_config` / `backend_config` / `posterior_artifact` / `diagnostics_summary`** が必須
+- 第12章の階層モデル前に **JAX 64-bit・NumPyro 経路・PyTensor fallback・乱数キー分岐**を凍結
 
 ---
 
@@ -552,21 +570,20 @@ provenance:
 
 ### 本書内の該当章
 
-- 第2章 §2.9：合成階層データ `data/synthetic-hierarchy/`（リポジトリルート、付録A §A.1.1）の位置づけ
-- 第4章 §4.3：`task_type: bayesian_inference`
-- 第9章：`uncertainty_scheme`（`posterior_quantity: threshold_probability` を本章で活用）
-- 第10章 §10.6：非階層の Bayesian（本章はその拡張）
-- 第10章 §10.9：JAX/NumPyro 準備（本章のバックエンド）
-- 第12章：MCMC 実務判断（divergences の扱い、reparameterization 選択）
-- 第13章：Advanced Capstone（本章の階層モデル Skill を統合）
-- 付録 A：provenance スキーマ拡張（本章追加フィールドの正式定義）
-- 付録 C：階層データの実データ候補
+- 第5章 §5.3：`task_type: bayesian_inference` の位置づけ
+- 第10章：CI vs CrI、事前分布、`uncertainty_scheme` の言語化
+- 第12章：階層モデル・partial pooling・非中心化パラメータ化（NumPyro 推奨）
+- 第13章：MCMC 実務の判断論（打切り基準、divergences 対処、reparameterization）
+- 第15章：事前分布の暴走、MCMC 未収束、バックエンド差の失敗
+- 付録 A：provenance スキーマ拡張（本章の追加フィールドの正式定義）
+- 付録 B：PyMC ↔ Stan 対応表
 
 ### 外部参考
 
-<a id="ref-11-1">[11-1]</a> Gelman, A., & Hill, J. (2006). *Data Analysis Using Regression and Multilevel/Hierarchical Models*. Cambridge University Press. — 階層モデルの実務的教科書
-<a id="ref-11-2">[11-2]</a> McElreath, R. (2020). *Statistical Rethinking*, 2nd ed. — partial pooling の直感的解説（Ch 13–14）
-<a id="ref-11-3">[11-3]</a> Betancourt, M., & Girolami, M. (2015). Hamiltonian Monte Carlo for Hierarchical Models. In *Current Trends in Bayesian Methodology with Applications*. — funnel geometry と非中心化パラメータ化
-<a id="ref-11-4">[11-4]</a> Betancourt, M. (2017). Diagnosing Biased Inference with Divergences. [https://betanalpha.github.io/assets/case_studies/divergences_and_bias.html](https://betanalpha.github.io/assets/case_studies/divergences_and_bias.html) — divergences の実務対処
-<a id="ref-11-5">[11-5]</a> Stan Development Team. *Stan User's Guide: Hierarchical Models*. [https://mc-stan.org/docs/stan-users-guide/](https://mc-stan.org/docs/stan-users-guide/) — 対応する Stan 実装（付録 B 参照）
-<a id="ref-11-6">[11-6]</a> NumPyro Team. *NumPyro Examples*. [https://num.pyro.ai/en/stable/examples/](https://num.pyro.ai/en/stable/examples/) — JAX バックエンドでの階層モデル実装例
+<a id="ref-10-1">[10-1]</a> Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., & Bürkner, P.-C. (2021). Rank-Normalization, Folding, and Localization: An Improved $\hat{R}$ for Assessing Convergence of MCMC. *Bayesian Analysis*, 16(2), 667–718. — $\hat{R}$ の改良版と 1.01 閾値の根拠
+<a id="ref-10-2">[10-2]</a> PyMC Development Team. *PyMC Documentation*. [https://www.pymc.io/](https://www.pymc.io/) — 本章コードの一次出典
+<a id="ref-10-3">[10-3]</a> ArviZ Contributors. *ArviZ Documentation*. [https://python.arviz.org/](https://python.arviz.org/) — 診断可視化 API
+<a id="ref-10-4">[10-4]</a> Betancourt, M. (2017). A Conceptual Introduction to Hamiltonian Monte Carlo. *arXiv:1701.02434*. — NUTS の背景と divergences の意味
+<a id="ref-10-5">[10-5]</a> Gabry, J., Simpson, D., Vehtari, A., Betancourt, M., & Gelman, A. (2019). Visualization in Bayesian workflow. *Journal of the Royal Statistical Society: Series A*, 182(2), 389–402. — prior/posterior predictive check のワークフロー
+<a id="ref-10-6">[10-6]</a> NumPyro Team. *NumPyro Documentation*. [https://num.pyro.ai/](https://num.pyro.ai/) — JAX バックエンド、`PRNGKey`
+<a id="ref-10-7">[10-7]</a> JAX Team. *JAX Documentation: 64-bit precision*. [https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html) — `jax_enable_x64` の使い方

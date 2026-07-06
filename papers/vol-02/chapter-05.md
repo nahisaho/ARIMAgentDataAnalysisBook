@@ -1,545 +1,360 @@
-# 第5章 教師あり学習を Skill 化する
+# 第5章 統計/ML 分析用 Skill の設計原則
 
 > **本章の到達目標**
-> - 第4章の Skill 仕様書テンプレートを、**教師あり学習 Skill**（scikit-learn ベース）として実装できる
-> - 章冒頭の **anti-leakage split contract**（同一試料・同一ロットの分割違反禁止）を、Skill の入り口で機械的に検査できる
-> - 線形回帰・**PLS**・ランダムフォレスト・勾配ブースティングを、目的とデータ性質から選び分けられる
-> - 3 つのハンズオン（校正曲線・物性予測・スペクトル分類）を、共通の Skill 構造で実装できる
-> - 失敗例（リーク混入・過学習・特徴量スケール未処理）を検知し、改善版を書ける
+> - vol-01 第7章の 6 要素（目的／入力条件／出力形式／成功条件／禁止事項／再現性条件）を、統計/ML Skill 向けに拡張できる
+> - **「何を成功とみなすか」**を、評価指標（MAE / RMSE / R² / ROC-AUC 等）・目的関数・許容範囲の 3 点セットで書ける
+> - 統計/ML Skill 特有の**禁止事項**（データリーク・指標の後付け選び・train/test 情報の混入）を列挙できる
+> - **循環設計問題の統計版**（エージェントに指標選択と結果評価を両方任せることのリスク）を回避する Skill 設計ができる
+> - 章末に、統計/ML Skill 仕様書テンプレート（vol-02 版）を持ち帰る
 >
 > **本章で扱わないこと**
-> - k-fold / grouped / time-series の詳細な CV 設計、ネスト CV → **第7章**
-> - SHAP・PDP・permutation importance などの解釈可能性 → **第8章**
-> - PyMC・階層モデル → **第9〜11章**
-> - 深層学習（NN, CNN, Transformer 系） → 本書外（vol-03 予定）
-> - 実装コードの完全形（本章は Skill 構造とキーとなる契約チェックに集中、完全なノートブックは付属リポジトリ）
+> - CV の詳細設計（k-fold / grouped / time-series / nested）→ **第8章**
+> - 具体的な scikit-learn API・コード実装 → 第6章以降
+> - 事前分布・MCMC 診断の書き方 → 第11章・第13章
+> - provenance フィールドの完全定義 → 付録A
 
 ---
 
-## 5.1 この章で作る Skill
+## 5.1 なぜ「設計」から始めるのか（統計/ML 版の動機）
 
-本章で作る **教師あり学習 Skill** は、次の 3 つのハンズオンを共通構造で扱います：
+vol-01 第7章で導入した「Skill 仕様書 6 要素」は、**分析を実装する前に、日本語で目的と契約を書き下す**規律でした。統計/ML では、この規律の**重要性がさらに増します**：
 
-| ハンズオン | データ | 目的変数 | 主に使う手法 | 該当節 |
-|---|---|---|---|---|
-| A. 校正曲線 | 標準試料の測定値と真値ペア（vol-01 由来の合成データ） | 濃度・強度など連続値 | **線形回帰**（単純・多項式） | §5.6 |
-| B. 物性予測 | MatBench `matbench_expt_gap` (n=4,604) | バンドギャップ (eV) | **ランダムフォレスト / 勾配ブースティング** | §5.7 |
-| C. スペクトル分類 | RRUFF Raman データ | 鉱物種ラベル | **PLS-DA / ロジスティック回帰** | §5.8 |
+- **「動くコード」の裏で、統計的には破綻している**——決定係数 0.95 の裏で、同一試料が train/test 両方に入っていた
+- **「精度が良いモデル」の中身が説明できない**——共同研究者に「なぜこの元素が効いているのか」を聞かれて答えられない
+- **「有意な差」を出すために、後から評価指標を変えた**——p 値 0.06 → 相関 r=0.7 に切り替えて「有意」と主張
 
-**共通構造**は第4章のテンプレートに準拠します：①目的 / ②入力条件 / ③出力形式 / ④成功条件（3 点セット）/ ⑤禁止事項（severity 付き）/ ⑥再現性条件。**本章では、この 6 要素にコードを対応させる**ことに集中し、CV 設計の細部（第7章）や解釈（第8章）は後段に譲ります。
+これらはすべて **「成功の定義を曖昧なまま実装に入った」** ことが原因です。第5章では、実装に入る前に、**「何を成功とみなすか」** を厳密に書き下す方法を扱います。
 
 > [!IMPORTANT]
-> **第5章は「型を作る章」です**。第6章（教師なし）、第10・11章（ベイズ）、第13章（capstone）は、本章で作った Skill 構造を差分で拡張していきます。ここで手を抜くと後の章が全部やり直しになります。
+> **本章の主題は「成功の定義」であって、「どう推定するか」ではありません**。CV の設計、ハイパーパラメータ探索、ネスト CV は第8章で扱います。ここで先に成功を定義しておかないと、第8章の CV 設計は「何を最適化するか」が空欄のまま始まってしまいます。
 
 ---
 
-## 5.2 章冒頭の anti-leakage split contract
+## 5.2 6 要素の統計/ML 向け拡張
 
-**本章のすべてのハンズオンは、次の契約を通過してから始めます**。詳細な CV 設計は第7章ですが、**最低限これだけは第5章の入り口で機械的に検査**します：
+vol-01 第7章の 6 要素は、統計/ML Skill でもそのまま使えます。ただし、各要素の**中身**が統計/ML 特有になります。表で比較します：
 
-### 契約項目（最低限）
-
-1. **同一試料が train / test の両方に入っていない**
-   - 「同一試料」の定義：`sample_id` 列で判定（無ければ Skill 実行前に付与を必須化）
-2. **同一ロット / バッチが train / test の両方に入っていない**（該当データのみ）
-   - 例：合成条件が同じロット、同一実験セッションの繰り返し測定
-   - `group_id` 列で判定
-3. **時系列データでは train が test より過去である**
-   - `timestamp` 列で判定、未来を先に見ない
-4. **全データでの正規化・スケーリングを行っていない**
-   - `StandardScaler.fit` は train のみで実施、test には `transform` のみを適用（`Pipeline` 経由で自動化）
-5. **目的変数派生量を特徴量に含めていない**
-   - 特徴量列名と目的変数の系譜（provenance）を突き合わせて確認
-
-### 実装スケルトン（第5章共通の契約チェッカ）
-
-```python
-class LeakageError(RuntimeError):
-    """契約違反時の fatal 例外（第4章 §4.5 分類 A に対応）。"""
-
-def check_split_contract(
-    X_train, X_test, y_train, y_test,
-    *,
-    id_train=None, id_test=None,          # sample_id の値配列
-    group_train=None, group_test=None,    # group_id の値配列
-    ts_train=None, ts_test=None,          # timestamp の値配列
-    target_lineage: set[str] = frozenset(),
-    requires_sample_id: bool = True,       # デフォルトで必須
-    requires_group_id: bool = False,       # 該当データのみ True
-    requires_timestamp: bool = False,      # 時系列データのみ True
-) -> None:
-    """全ハンズオンの入り口で呼ぶ。契約違反があれば raise（fatal）。"""
-    # 1. sample_id 重複禁止
-    if requires_sample_id:
-        if id_train is None or id_test is None:
-            raise LeakageError("sample_id が必須だが与えられていない")
-        overlap = set(id_train) & set(id_test)
-        if overlap:
-            raise LeakageError(f"sample_id overlap: {len(overlap)} 件")
-    # 2. group_id 重複禁止
-    if requires_group_id:
-        if group_train is None or group_test is None:
-            raise LeakageError("group_id が必須だが与えられていない")
-        overlap = set(group_train) & set(group_test)
-        if overlap:
-            raise LeakageError(f"group_id overlap: {len(overlap)} 件")
-    # 3. 時系列順序（本章では最小 holdout 用のみ扱う）
-    if requires_timestamp:
-        if ts_train is None or ts_test is None:
-            raise LeakageError("timestamp が必須だが与えられていない")
-        if pd.isna(ts_train).any() or pd.isna(ts_test).any():
-            raise LeakageError("timestamp に欠損あり")
-        if ts_train.max() >= ts_test.min():
-            raise LeakageError("train が test より未来を含む、または同時刻を共有")
-    # 4. 目的変数派生量チェック
-    illegal = set(X_train.columns) & target_lineage
-    if illegal:
-        raise LeakageError(f"目的変数派生量が特徴量に混入: {illegal}")
-    # 5. スケーリング契約は Pipeline で担保 (§5.4)
-```
-
-**設計上のポイント**：
-
-- **`sample_id` はデフォルトで必須**。指定を忘れると即 `LeakageError`
-- **特徴量 `X` と識別子 `id_*` は分離**（`X_train` に `sample_id` 列を含めると Pipeline が特徴量として学習してしまう）
-- **`requires_timestamp=True` は本章の最小 holdout 用**。rolling / expanding CV は第7章
-- **同一 timestamp 内リーク** は `>=` で拾う（等号を許すと同時刻測定が train/test に分散するため）
-
-
-> [!WARNING]
-> `LeakageError` は **fatal 例外**として扱い、Skill 実行を停止します（第4章 §4.5 分類 A）。「警告だけ出して続行」は禁止です——エージェントが自動継続してしまうと、後段で「動いた」ように見えるからです。
-
-### この契約でカバーできないこと
-
-- **train 内での CV split の分割違反**（例：CV の各 fold で group leak が起きる）→ 第7章の `GroupKFold`・`GroupShuffleSplit` で対応
-- **前処理の順序による微妙なリーク**（例：欠損補完を全データで実施）→ Pipeline 化で担保（§5.4）
-- **時系列の遅延特徴量作成時の未来参照** → 第7章のケーススタディで扱う
-
-本章では **「大きな 3 つの穴」だけを塞ぎ**、細部は第7章に任せる方針です。
-
----
-
-## 5.3 3 つのハンズオンの位置づけ
-
-3 ハンズオンは、**難易度**と**手法**の観点で意図的に段階を付けています：
-
-```mermaid
-flowchart LR
-    A[A. 校正曲線<br/>線形回帰] --> B[B. 物性予測<br/>RF / GBM]
-    B --> C[C. スペクトル分類<br/>PLS-DA / ロジスティック]
-    A -.->|型の完成| B
-    B -.->|CV導入| C
-```
-
-| 観点 | A. 校正曲線 | B. 物性予測 | C. スペクトル分類 |
+| # | 要素 | vol-01（データ整備 Skill） | vol-02（統計/ML Skill） |
 |---|---|---|---|
-| データ数 | 数十点（小 n） | 数千点（MatBench） | 数百〜数千点（RRUFF） |
-| 手法 | 線形回帰・多項式 | RF・GBM（LightGBM 系） | PLS-DA・ロジスティック |
-| 主な学び | Skill 構造の完成 | ハイパーパラメータ・CV 導入 | 高次元・多クラス・PLS の妥当性 |
-| 難所 | 過学習（多項式次数） | 特徴量重要度の誤読 | 波長間の強い相関 |
-| 章間接続 | 第4章のテンプレを最小例で完成 | 第7章 CV / 第8章 解釈可能性の予告 | 第6章 PCA との対比 |
+| ① | 目的 | 「XRD ファイルを標準 DataFrame に変換する」 | 「組成 20 変数から硬度を予測する回帰モデルを学習する」 |
+| ② | 入力条件 | 装置形式・単位・欠損率 | 特徴量スキーマ・目的変数の型・**学習/評価データの分離状態** |
+| ③ | 出力形式 | 標準 DataFrame（列・単位・型） | **学習済みモデル + 評価指標 + 予測（sklearn: 予測値・予測確率・可能なら予測区間 / ベイズ: 事後分布・事後予測分布） + provenance** |
+| ④ | 成功条件 | 契約チェックを通る | **評価指標 X が Y 以上、かつ CV 設計 Z を満たす** |
+| ⑤ | 禁止事項 | 生データ上書き・外部送信 | **上記 + データリーク・指標の後付け変更・特徴量への目的変数の混入** |
+| ⑥ | 再現性条件 | 入力ハッシュ・skill_version・random_seed | **上記 + `cv_scheme` / `model_config` / `data_split` / `sampler_config`（ベイズなら）** |
 
-**A から順に読むことを推奨**しますが、時間が限られていれば **A + B** だけでも Skill 構造の理解には十分です。C は第6章 PCA と対比しながら読むと理解が深まります。
-
----
-
-## 5.4 教師あり学習 Skill の共通構造
-
-第4章の仕様書テンプレートを、実装レベルで次の 5 ブロックに展開します。**全ハンズオンで同じ構造を守る**のが本章のポイントです：
-
-```
-Skill 実行の流れ:
-  1. 入力検証     → schema チェック + anti-leakage split contract
-  2. Pipeline 構築 → 前処理 + モデル（sklearn.pipeline.Pipeline）
-  3. 学習・評価  → CV スコア + 独立テストスコア
-  4. 予測（任意）→ 予測値 + 外挿警告
-  5. 記録        → provenance 保存
-```
-
-### ブロック 2 の要：`Pipeline` を必ず使う
-
-**scikit-learn の `Pipeline` は「前処理を含めた fit / predict を 1 オブジェクトにまとめる」道具**で、リーク防止に必須です。**Pipeline を使わずに前処理を手書きすると、CV の各 fold で「全データで fit した scaler」が使われて微妙なリークが起きます**（第7章で再説）。
-
-```python
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge
-
-pipeline = Pipeline([
-    ("scaler", StandardScaler()),   # fit は fold の train のみで行われる
-    ("model",  Ridge(alpha=1.0)),
-])
-pipeline.fit(X_train, y_train)      # 前処理 + 学習が一気通貫
-```
-
-### ブロック 3 の要：`cross_val_score` の落とし穴と代替
-
-`cross_val_score` は簡単ですが、**各 fold のスコアしか返らず、fold ごとの予測値・分割 index が取れない**のが弱点です。本章では、**再現性を担保するために `cross_validate` + 明示的 splitter** を推奨します：
-
-```python
-from sklearn.model_selection import cross_validate, KFold
-
-cv = KFold(n_splits=5, shuffle=True, random_state=42)
-scores = cross_validate(
-    pipeline, X_train, y_train, cv=cv,
-    scoring=["neg_root_mean_squared_error", "r2"],
-    return_train_score=True, return_indices=True,  # 分割 index を残す
-)
-```
-
-`return_indices=True`（scikit-learn 1.3+ で利用可能）を使うと、`data_split`（第4章 §4.6）を provenance にそのまま保存できます。古い環境では splitter の `split()` 結果を自前保存してください。返り値の `scores["indices"]["train"]` / `scores["indices"]["test"]` は numpy 配列なので、JSON/YAML 保存時は `.tolist()` 化が必要です。
-
-> [!WARNING]
-> ここでは説明のために `KFold` を素で使っていますが、**反復測定・同一ロットが含まれるデータでは `GroupKFold`（第7章）が本来の姿**です。本章のスケルトンは「型のデモ」であり、実データで運用する際は必ずグループ構造を確認します。
-
-### ブロック 5 の要：provenance の最小セット
-
-第4章の追加推奨フィールドに、実行結果を書き込みます：
-
-```python
-provenance = {
-    # vol-01 継承
-    "input_sha256": sha256_of(X, y),
-    "skill_version": "0.1.0",
-    "run_datetime_utc": now_utc_isoformat(),
-    "package_versions": {"scikit-learn": sklearn.__version__, ...},
-    "random_seed": 42,
-    # vol-02 outline canonical
-    "cv_scheme": {"type": "KFold", "n_splits": 5, "shuffle": True, "seed": 42},
-    "data_split": scores["indices"],  # 各 fold の train/test index
-    "model_config": pipeline.get_params(),
-    # 第4章追加推奨
-    "feature_columns": list(X_train.columns),
-    "target_column": {"name": y.name, "unit": "eV"},
-    "metric_definition": {
-        "primary": "RMSE = sqrt(mean((y_true - y_pred)^2))",
-        "unit": "eV",
-        "aggregation": "fold-mean",
-    },
-    "training_score": scores["train_neg_root_mean_squared_error"].tolist(),
-    "cv_score": scores["test_neg_root_mean_squared_error"].tolist(),
-}
-```
-
-**この構造は、全ハンズオン共通**です。§5.6〜§5.8 では、この構造への差分だけを説明します。
+**本章では、④成功条件・⑤禁止事項・⑥再現性条件**を特に深掘りします。①〜③は vol-01 第7章と第9章の延長として、章末テンプレートで確認できるようにします。
 
 ---
 
-## 5.5 手法の選び分け（線形・PLS・RF・GBM）
+## 5.3 成功条件を書き下す：評価指標・目的関数・許容範囲
 
-第3章 §3.2 の選択マップを、教師あり回帰・分類に絞って具体化します：
+「成功条件」を統計/ML 用に書き下す際は、次の **3 点セット** を必ず含めます：
 
-| 手法 | 得意領域 | 苦手 | 本書での位置づけ |
-|---|---|---|---|
-| **線形回帰・Ridge・Lasso** | 特徴量が少なく解釈重視、校正曲線 | 非線形関係、変数間強相関 | 校正曲線・ベースライン |
-| **PLS（部分最小二乗）** | 特徴量が多く（p > n）、変数間相関が強い（スペクトル） | 極端な非線形 | 分光データの標準手法 |
-| **ランダムフォレスト (RF)** | 非線形、変数間相互作用、頑健性 | 外挿、過学習の予防が甘い | 中規模 tabular の第一選択 |
-| **勾配ブースティング（LightGBM / XGBoost）** | 予測性能最重視、大規模 tabular | ハイパーパラメータ調整が繊細、外挿 | ベンチマーク・性能上限確認 |
+1. **評価指標**（何を測るか）
+2. **目的関数**（学習時に最小化/最大化するもの）
+3. **許容範囲**（どの値以上・以下なら成功か）
 
-### 選び方の 3 質問
+### 3 点セットが揃った成功条件の例
 
-1. **特徴量数 p は n より大きいか？** → Yes なら PLS / Ridge が候補
-2. **変数間に強い相関があるか？** → Yes なら Lasso（変数選択）か PLS（合成成分）
-3. **物理的な線形性の根拠があるか？** → Yes なら線形、No なら RF / GBM
+> ✅ **成功条件（回帰の例）**：
+> - 評価指標：**RMSE（GPa 単位）**
+> - 目的関数：MSE（学習時の損失）
+> - 許容範囲：**5-fold CV の平均 RMSE ≤ 2.5 GPa、標準偏差 ≤ 0.5 GPa**。ただし各 fold の RMSE が 3.5 GPa を超えるものが 1 つでもあれば失敗
 
-**「とりあえず全部試して一番良かったのを採用」は第4章 §4.4 の循環設計問題**にあたります。Skill 仕様書段階で **1〜2 手法に絞り**、選ばなかった手法は「なぜ選ばなかったか」を仕様書 ① 目的の下に書きます。
+> ✅ **成功条件（分類の例）**：
+> - 評価指標：**F1 スコア（macro 平均）**、副次的に混同行列
+> - 目的関数：log loss
+> - 許容範囲：**5-fold CV の平均 F1 ≥ 0.80、各クラスの再現率 ≥ 0.70**
 
-> [!TIP]
-> どうしても複数試したい場合は、**独立テストを見る前に決着させる**か、**「探索用 Skill」と「本評価 Skill」を分ける**（探索は CV 内、本評価は 1 回のみ）ようにします。第4章 §4.4 の対話例で示した「テスト後の後付け探索」は禁止です。
+### 3 点セットが揃っていない、悪い成功条件
 
----
+> ❌ 「精度が良いこと」——**指標が未定義**
+>
+> ❌ 「精度 90% 以上」——**多クラス分類で 90% は「全部を最頻クラスに分類」でも達成可能**
+>
+> ❌ 「r² が高いこと」——**閾値がない**
+>
+> ❌ 「有意な相関があること」——**p 値の閾値、多重比較補正、事後選択の禁止が未定義**
 
-## 5.6 ハンズオン A：校正曲線 Skill
+### 主な評価指標と使い分け
 
-**目的**：標準試料の測定値と真値のペアから、未知試料の測定値を真値に変換する校正関数を作る。
-
-### Skill 仕様書（要約）
-
-| 要素 | 内容 |
-|---|---|
-| ① 目的 | 単変量校正曲線を学習し、未知試料の測定値を物理量に変換する。`task_type=regression` |
-| ② 入力 | tabular（`measured`, `true_value`, `sample_id`）、n≈30〜100 |
-| ③ 出力 | 学習済み Pipeline、CV スコア、外挿警告フラグ、provenance |
-| ④ 成功条件 | 評価指標 = RMSE (単位は目的変数と同じ)、目的関数 = MSE、5-fold CV RMSE ≤ 目的変数レンジの 5%、R² ≥ 0.95 |
-| ⑤ 禁止事項 | 標準試料の重複投入（同一 sample_id の train/test 混在）、多項式次数の後付け引き上げ、外挿域予測の警告なし |
-| ⑥ 再現性 | 上記共通セット + `polynomial_degree` |
-
-### 実装スケルトン
-
-```python
-FEATURES = ["measured"]
-METADATA = ["sample_id"]
-
-def fit_calibration(df, degree=1, cv_splits=5, random_state=42):
-    # 特徴量と識別子を分離（sample_id を特徴量にしない）
-    X = df[FEATURES]
-    y = df["true_value"]
-    ids = df["sample_id"]
-    # 1. 分割 → 入力検証（sample_id 契約）
-    X_train, X_test, y_train, y_test, id_train, id_test = train_test_split(
-        X, y, ids, test_size=0.2, random_state=random_state,
-    )
-    check_split_contract(
-        X_train, X_test, y_train, y_test,
-        id_train=id_train, id_test=id_test,
-        requires_sample_id=True,
-    )
-    # 2. Pipeline
-    pipeline = Pipeline([
-        ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
-        ("scaler", StandardScaler()),
-        ("model", Ridge(alpha=1.0)),
-    ])
-    # 3. 学習 + CV（同一 sample_id が反復測定される場合は GroupKFold 推奨、第7章）
-    cv = KFold(n_splits=cv_splits, shuffle=True, random_state=random_state)
-    scores = cross_validate(pipeline, X_train, y_train, cv=cv,
-                            scoring=["neg_root_mean_squared_error", "r2"],
-                            return_indices=True)
-    pipeline.fit(X_train, y_train)
-    # 4. 独立テスト（1 回のみ）
-    test_rmse = root_mean_squared_error(y_test, pipeline.predict(X_test))
-    # 5. provenance 記録（省略）
-    return pipeline, scores, test_rmse, provenance
-```
-
-### 典型的な失敗と修正
-
-| 失敗 | 症状 | 修正 |
+| 指標 | 用途 | 注意点 |
 |---|---|---|
-| 多項式次数を試して一番良いのを採用 | CV スコアと独立テストが大きく乖離 | 次数を仕様書で 1 or 2 に固定、探索は別 Skill |
-| 標準試料の反復測定を分割せず投入 | R²=0.99 だが実装現場で使うと精度悪化 | `sample_id` 契約チェッカで拒否 |
-| 校正範囲外の測定値を予測 | 外挿域で非現実的な値 | 予測時に `X` の値域と学習範囲を比較して警告 |
+| **RMSE / MAE** | 回帰、絶対誤差 | 単位が結果と同じ、外れ値の影響を RMSE は受けやすい |
+| **R²（決定係数）** | 回帰、分散説明率 | データ範囲に依存、外挿では信頼できない |
+| **MAPE** | 相対誤差重視の回帰 | 目的変数が 0 付近だと爆発、対数変換の検討を |
+| **F1（macro / weighted）** | 不均衡分類 | macro は各クラス等重み平均で少数クラスを埋もれさせない、weighted はサンプル数重み付けで多数クラス寄り。**不均衡分類ではクラス別 recall / precision も併記** |
+| **ROC-AUC / PR-AUC** | 二値分類の閾値非依存評価 | クラス不均衡が強い場合は PR-AUC を優先 |
+| **Log Loss / NLL** | 確率予測の質 | 予測確率のキャリブレーションを見るのに有用 |
+| **物理的許容範囲**（例：予測値が非負） | 材料研究特有 | 統計指標が良くても物理的に破綻していれば失敗 |
+
+### タスク種別ごとの成功条件
+
+3 点セットは回帰・分類では自然に埋まりますが、教師なし学習・異常検知・ベイズ推定ではそのままでは埋めにくいことがあります。タスク種別 (`task_type`) ごとに、成功条件に何を書くべきかを次表に示します：
+
+| `task_type` | 評価指標に入れるもの | 目的関数の扱い | 許容範囲の例 | 該当章 |
+|---|---|---|---|---|
+| regression | RMSE / MAE / R² / MAPE | MSE などの学習損失 | CV 平均 RMSE ≤ X、各 fold ≤ Y | 第6章 |
+| classification | F1 / ROC-AUC / PR-AUC / クラス別 recall | log loss などの学習損失 | 各クラス recall ≥ X | 第6章 |
+| dimensionality reduction (PCA 等) | 累積寄与率・再構成誤差・既知群との整合・成分安定性 | 分散最大化など（明示的な学習損失は薄い） | 累積寄与率 ≥ X、成分の再現性 | 第7章 |
+| clustering | silhouette などの内部指標、既知ラベルがあれば ARI / NMI、クラスタ安定性 | クラスタ内分散最小化など | silhouette ≥ X、bootstrap 再現率 ≥ Y | 第7章 |
+| anomaly detection | 検出率・偽陽性率・既知異常の再現性 | reconstruction error など | 偽陽性率 ≤ X、既知異常検出率 ≥ Y | 第7章 |
+| Bayesian inference | 事後予測チェック・信用区間・診断指標 | 事後分布そのもの（点最小化ではない） | R̂ ≤ 1.01、ESS ≥ 400、事後予測分布が観測と整合 | 第11章・第13章 |
+
+**回帰・分類以外のタスクでも、「何を測るか」「何を最適化するか」「どこで合格とするか」の 3 分類は同じ**です。埋めにくい欄には「該当なし」と明示し、代わりの判定基準を書きます。空欄のまま実装に入るのが最悪です。
+
+
+
+多くの機械学習モデルでは、**学習時に最小化する損失**と、**評価時に見る指標**が異なります：
+
+- 回帰：学習は MSE、評価は RMSE や MAE
+- 分類：学習は log loss、評価は F1 や ROC-AUC
+
+**Skill 仕様書には両方を明記**します。混同すると、「学習は最適化されているのに評価指標では悪化」という事故（第15章）が起きます。
 
 ---
 
-## 5.7 ハンズオン B：物性予測 Skill
+## 5.4 循環設計問題の統計版
 
-**目的**：組成・記述子から物性値（バンドギャップ等）を予測する。MatBench `matbench_expt_gap` (n=4,604) を使う。
+第2章 §2.2 で予告した **循環設計問題の統計版** を、ここで正式に定義します。
 
-### Skill 仕様書（要約 + A との差分）
+### 定義
 
-| 要素 | A との差分 |
-|---|---|
-| ① 目的 | 多変量回帰、`task_type=regression` |
-| ② 入力 | 組成記述子（Magpie 等で生成）、または CIF から特徴量抽出。n≈数千 |
-| ③ 出力 | RF or GBM の学習済み Pipeline、特徴量重要度（第8章で扱う）、外挿警告 |
-| ④ 成功条件 | RF/Magpie ベースラインの目安：**MatBench 公式 5-fold で RMSE ≈ 0.8–0.9 eV**。RMSE ≤ 0.5 eV は上位モデル・高度特徴量・専用モデルの目標であり本章の合格基準にはしない。詳細な数値は本節末尾の外部参考を参照 |
-| ⑤ 禁止事項 | 特徴量重要度で選んだ変数だけで再学習して独立テストを見る（後付け特徴量選択） |
-| ⑥ 再現性 | RF/GBM のハイパーパラメータ（`n_estimators`, `max_depth`, `learning_rate` 等）全指定 |
+**エージェントが「評価指標も、モデル選択の実行も」両方を行うと、指標が「都合の良い方向」に選ばれるリスクがある** ——これが循環設計問題の統計版です。
 
-> [!NOTE]
-> **MatBench は公式 5-fold の nested-CV benchmark** です。leaderboard 数値と比較したい場合は、任意の `KFold` ではなく **MatBench 公式 fold（`matbench` パッケージ）を使う**必要があります。本章は Skill 構造を学ぶための練習として `KFold` を使いますが、公式リーダーボード比較は付録B / 第7章で扱います。
+### 具体例
 
-### 実装スケルトン（RF）
-
-```python
-from sklearn.ensemble import RandomForestRegressor
-
-pipeline = Pipeline([
-    ("model", RandomForestRegressor(
-        n_estimators=500, max_depth=None, min_samples_leaf=2,
-        n_jobs=-1, random_state=42,
-    )),
-])
-# 以降の cross_validate / provenance は §5.4 と同じ
+```
+ユーザー：「モデルを最適化してください」
+エージェント：「RMSE で最適化しました。RMSE=2.3 GPa です」
+ユーザー：「他の指標は？」
+エージェント：「MAE=1.8, R²=0.72, MAPE=15% です」
+ユーザー：「R² がもう少し欲しいですね」
+エージェント：「R² が高くなる特徴量の組み合わせを追加探索しました。R²=0.79 です」
+ユーザー：「独立テストのスコアは？」
+エージェント：「独立テストで確認したところ RMSE=2.9 でした。閾値を 3.0 に緩めれば合格です」
 ```
 
-### RF/GBM 特有の注意
+この対話は一見自然ですが、次の 3 つの問題が同時に起きています：
 
-- **`n_estimators` を後から増やして CV スコアを改善する**のは仕様書違反（後付け）。仕様書で範囲を固定
-- **特徴量重要度は「予測に効いた」であって「物理的に効いた」ではない**（第8章）
-- **外挿は苦手**：学習データが取っていない組成領域の予測は、`applicability_domain_check`（最近傍距離チェック等、実装は§5.10）で warning を返す
+1. **評価指標を最終結果に合わせて変えている**（RMSE 最適化と言いながら R² を追い始めた）
+2. **独立テストのスコアを見た後に特徴量を追加した**（test set leakage）
+3. **独立テストのスコアを見た後に合格閾値を緩めた**（p-hacking の統計版）
 
-### LightGBM を使う場合
+いずれもデータリークと同種の科学的不正の入り口です。
 
-LightGBM は sklearn API 互換なので、`Pipeline` にそのまま入ります：
+### 回避策：Skill 契約に「指標の固定」を書き込む
 
-```python
-from lightgbm import LGBMRegressor
-pipeline = Pipeline([
-    ("model", LGBMRegressor(
-        n_estimators=500, num_leaves=31, learning_rate=0.05,
-        random_state=42, n_jobs=-1,
-    )),
-])
-```
+Skill 仕様書に、以下を **④成功条件** として明記します：
 
-**RF と LightGBM の比較は「性能上限確認」が目的**であり、両方を並行運用するのは Skill 増殖の元です。運用 Skill は 1 つに絞ります。
+> ✅ **④ 成功条件**（循環設計回避版）：
+> - 評価指標は **RMSE（GPa）** に固定する。**Skill 実行後の評価指標変更は禁止**
+> - 副次的指標として MAE, R², 予測範囲外率を報告するが、これらは合格判定には使わない
+> - 合格判定の閾値（RMSE ≤ 2.5 GPa）は **Skill 設計時に固定** し、実行結果によって変更しない
 
----
+そして、⑤禁止事項に：
 
-## 5.8 ハンズオン C：スペクトル分類 Skill
+> ✅ **⑤ 禁止事項**（循環設計版）：
+> - **評価指標の後付け変更**（Skill 実行後に別指標を用いて「合格」と主張することを禁止）
+> - **合格閾値の後付け緩和**（結果が悪かった時に閾値を下げることを禁止）
+> - **モデル/特徴量の後付け追加**を、独立テストセットのスコアを見た後に行うこと（**test set への漏洩**）
 
-**目的**：Raman スペクトル（数百〜数千の波数点）から鉱物種を分類する。RRUFF データを使用。
+### エージェント運用上のルール
 
-### Skill 仕様書（要約 + A/B との差分）
-
-| 要素 | A/B との差分 |
-|---|---|
-| ① 目的 | 多クラス分類、`task_type=classification` |
-| ② 入力 | 波数（列）× 試料（行）の tabular（p ≈ 500〜2000、n ≈ 数百〜千） |
-| ③ 出力 | 学習済み Pipeline、**PLS 潜在空間でのクラススコア + argmax 判別**（校正確率が必要なら `CalibratedClassifierCV` を後段に）、混同行列 |
-| ④ 成功条件 | macro F1 ≥ 0.85、各クラス recall ≥ 0.75、クラス数 K で K が大きい場合は per-class 集計 |
-| ⑤ 禁止事項 | ベースライン補正・正規化を全データで実施（Pipeline 化必須）、同一標本（specimen）の複数スペクトルを train/test 両方に分散配置 |
-| ⑥ 再現性 | 前処理チェイン（ベースライン推定法、平滑化、L2 正規化）を仕様書で固定 |
-
-### PLS-DA（PLS 判別分析）を使う理由
-
-Raman スペクトルは **p >> n（波長点 > 試料数）** かつ **隣接波長間で強い相関**があります。この状況では：
-
-- **単純ロジスティック回帰**：p > n で解が発散、L2 正則化必須
-- **PLS-DA**：合成成分（潜在変数）を作って回帰し、判別する。**分光分野の標準的第一選択**
-- **RF / GBM**：波長間の順序情報を活かしにくく、通常 PLS より劣る
-
-### 実装スケルトン（PLS-DA）
-
-```python
-from sklearn.cross_decomposition import PLSRegression
-from sklearn.preprocessing import LabelBinarizer
-
-# PLS-DA は「PLS 回帰 + one-hot 目的変数 + argmax 判別」
-lb = LabelBinarizer()
-Y_train = lb.fit_transform(y_train)   # (n, K)
-
-# PLSRegression は内部で中心化・スケーリングを行うため
-# 外側の StandardScaler は使わない（二重処理を防ぐ）
-pipeline = Pipeline([
-    ("pls", PLSRegression(n_components=10, scale=True)),
-])
-pipeline.fit(X_train, Y_train)
-Y_score = pipeline.predict(X_test)           # クラス score（確率ではない）
-y_pred = lb.classes_[np.argmax(Y_score, 1)]  # argmax で判別
-```
-
-**PLS-DA の出力は「クラス score」であり、確率校正されていない点に注意**します。ROC/PR 曲線や意思決定閾値の設計が必要な場合は、後段に `sklearn.calibration.CalibratedClassifierCV` を置くか、L2 正則化ロジスティック回帰に切り替えます。`n_components`（潜在変数の数）は **CV で選ぶ**が、独立テストを見た後の後付け変更は禁止（§4.4 循環設計）。
-
-### Raman 前処理の一般論
-
-上記スケルトンは PLS-DA の最小例です。実運用では、次を Pipeline 内に組み込みます：
-
-- **ベースライン補正**（Asymmetric Least Squares 等、`FunctionTransformer` 経由）
-- **強度正規化**（vector normalization、area normalization、SNV のいずれか、目的に応じて選択）
-- **平滑化**（Savitzky-Golay filter、必要に応じて微分）
-- **波長軸の統一補間**（試料ごとに波長点が異なる場合）
-
-前処理はすべて Pipeline 内で実施し、fold ごとに fit されることを担保します。前処理の選択自体を CV で最適化する場合は、これも独立テストを見る前に固定します。
-
-### group leak と `GroupKFold`
-
-「サンプル数を稼ぐために同一標本の複数スペクトルを重複投入」すると、`sample_id` レベルで leak します。RRUFF では **同一標本（specimen）** に複数の測定エントリがある場合があり、この場合は **`specimen_id`（標本 ID）を `group_id` にして `GroupKFold`（第7章）** を使うのが本来の姿です。
+- エージェントに「モデル選択を行ってください」と指示する前に、**Skill 契約に評価指標と閾値が書かれていることを確認**
+- 実行後に「もっと良い指標はないか」と聞くこと自体は OK。ただし **その場で採用しない**——Skill 契約の改訂として、次のバージョンから使う
+- 事後分析（探索的データ解析）と本評価は **別 Skill** として分ける
 
 > [!WARNING]
-> **鉱物種ラベル（分類の目的変数）を group に使うのは誤り**です。それをすると、fold ごとに特定クラスが train から消え、通常の多クラス分類として評価が成立しません（それは open-set / zero-shot 分類という別問題で、本書では扱いません）。group は「同一標本」「同一測定セッション」「同一 RRUFF entry」など、**目的変数と直交する識別子**を選びます。
-
-本章では最低限「同一 `specimen_id` が train/test 両方に無い」ことを §5.2 の契約チェッカで担保します。波長軸の不揃いは事前補間を Pipeline 内に組み込み（`FunctionTransformer` 経由）、fold 内で実施します。
+> 循環設計問題は、AI エージェントを使わない従来の研究でも起きます。しかし **エージェントは高速に「探索」できてしまう**ため、リスクが大きく増幅します。第8章のネスト CV、第15章の p-hacking もこの延長線上にあります。
 
 ---
 
-## 5.9 失敗パターンと改善版
+## 5.5 統計/ML Skill の禁止事項（vol-02 版）
 
-3 ハンズオン共通で頻出する失敗を、統合表としてまとめます（第14章の予告編）：
+vol-01 第7章の禁止事項（生データ上書き・外部送信・単位変換の暗黙実施）に加え、統計/ML Skill では **次の 6 項目** を必ず禁止事項として書き下します。項目は**「データ流路の漏洩」「評価基準の後付け」「適用範囲違反」**の 3 分類に整理できます：
 
-| 症状 | 原因 | 改善策 | 該当節 |
+### A. データ流路の漏洩（fatal で拒否すべき事故）
+
+1. **データリーク（train/test 間の情報漏洩）**
+   - 例：全データで正規化 → 分割、同一試料の反復測定を分割せず配置、時系列で未来を先に見る
+   - 詳細は第8章
+2. **特徴量への目的変数の混入**
+   - 例：目的変数から派生した量（例：物性値を含む「材料コスト指標」）を特徴量に含める
+
+### B. 評価基準の後付け（provenance / 監査ログで検出すべきプロセス違反）
+
+3. **評価指標の後付け変更**（§5.4）
+4. **合格閾値の後付け緩和**（§5.4）
+5. **独立テストセットの複数回参照**
+   - CV で選んだハイパーパラメータを、独立テストで確認するのは 1 回のみ。悪ければ Skill を再設計するのが正しい
+
+### C. 適用範囲違反（用途によって severity が変わる）
+
+6. **モデルの外挿域での予測を、事前警告なしに返すこと**
+   - 例：学習データの温度範囲が 200-400 K のモデルに 600 K を入力しても、警告なしに数値を返す
+
+### 禁止事項の severity と検出方法
+
+vol-01 第8章の 3 段階（fatal / warning / flag）と provenance 検査を組み合わせて、次のように運用します：
+
+| 禁止事項 | 分類 | 推奨 severity | 検出方法 |
 |---|---|---|---|
-| CV スコアが良いのに独立テストが悪い | 前処理を Pipeline 化せず全データで実施 | `Pipeline` 経由に変更 | §5.4 |
-| CV スコアが良いのに実運用で悪化 | 同一試料/ロットの train/test 混在 | `check_split_contract` を fatal で拒否 | §5.2 |
-| ハイパーパラメータを増やすと CV スコアが上がり続ける | 探索空間が広すぎる + テストを繰り返し見ている | ネスト CV（第7章）、独立テストは 1 回のみ | §5.5, 第7章 |
-| 結果を見た後で指標・閾値・除外条件を変更した（p-hacking の統計版） | 探索と本評価が分離されていない | 仕様書に frozen date と diff を記録、audit violation として扱う | §4.4, §4.5 |
-| 特徴量重要度で選んだ変数だけで再学習 → 精度改善 | 特徴量選択のリーク | 特徴量選択も Pipeline 内で fold ごとに実施 | §5.7, 第7章 |
-| 学習データに無い組成/波長域で予測 → 非現実的な値 | 外挿域予測の警告なし | applicability domain チェックを予測時に組み込み | §5.10 |
+| ① train/test 情報漏洩 | A | **fatal** | split 前後の schema/index 検査、fit 時の契約チェック |
+| ② 目的変数混入 | A | **fatal** | 特徴量 schema と target 系譜の比較 |
+| ③ 評価指標の後付け変更 | B | **audit violation** | Skill 仕様書の version / frozen date、実行ログの指標名 |
+| ④ 合格閾値の後付け緩和 | B | **audit violation** | 成功条件フィールドの diff、承認履歴 |
+| ⑤ 独立テストの複数回参照 | B | **audit violation / warning** | test 評価の実行回数ログ |
+| ⑥ 外挿域予測 | C | **warning / flag / fatal（用途次第）** | applicability domain チェック（学習データの範囲・特徴量分布） |
 
-**改善版はコード差分ではなく、Skill 仕様書の差分として管理**します。「なぜ v0.2 で追加したか」を仕様書のバージョン履歴に書き残すのが provenance 運用の基本です。
+**A（fatal）は fit / predict の入り口で機械的に拒否**します。**B（audit violation）は runtime では検出できない**ため、Skill 仕様書のバージョン管理・実行 provenance・レビュープロセスで担保します。**C は用途に応じて severity を選ぶ**（探索用途なら warning、承認稟議に使う予測なら fatal）ように、Skill 仕様書に severity を明記します。
 
 ---
 
-## 5.10 他データ型への転用と applicability domain
+## 5.6 再現性条件の拡張（vol-02 版）
 
-本章の 3 ハンズオンは Raman・組成が中心ですが、**同じ Skill 構造で他のデータ型に転用可能**です。転用時のチェックポイント：
+vol-01 の再現性条件（`input_sha256` / `skill_version` / `run_datetime_utc` / `package_versions` / `random_seed`）に、統計/ML では次のフィールドを追加します。**完全定義は付録A**、ここでは概観のみ：
 
-| データ型 | 追加チェック | 参照 |
+| フィールド | 分類 | 意味 | 対応章 |
+|---|---|---|---|
+| `cv_scheme` | outline canonical | 分割方法（k-fold / grouped / time-series）、fold 数、グループ列、shuffle 設定、seed | 第8章 |
+| `data_split` | outline canonical | 実際の train/val/test の index リストか fold ID | 第8章 |
+| `model_config` | outline canonical | モデル種別（例：`RandomForestRegressor`）、ハイパーパラメータの完全リスト | 第6章 |
+| `sampler_config` | outline canonical（ベイズ用） | サンプラー名・チェーン数・iter 数・warmup・target_accept・seed | 第11章 |
+| `backend_config` | outline canonical（ベイズ用） | 計算基盤（PyTensor / JAX）、デバイス、precision | 第11章 |
+| `posterior_artifact` | outline canonical（ベイズ用） | 事後サンプルの保存形式・パス | 第11章 |
+| `diagnostics_summary` | outline canonical（ベイズ用） | R̂・ESS・発散数・エネルギー診断のサマリ | 第13章 |
+| `feature_columns` | 第5章で追加推奨 | 使用した特徴量の順序付きリスト（順序保存が重要） | 第6章 |
+| `target_column` | 第5章で追加推奨 | 目的変数の列名と単位 | 第5章 |
+| `metric_definition` | 第5章で追加推奨 | 評価指標の関数定義（数式・パラメータ・単位を含む）※具体 API は第6章 | 第5章 |
+| `training_score` / `cv_score` | 第5章で追加推奨 | 学習・CV の各 fold スコアと集計値（平均・標準偏差） | 第6章 |
+
+分類の意味：
+- **outline canonical**：本書の目次（`chapter-outline.md` v0.3）で定義された標準フィールド
+- **第5章で追加推奨**：outline で必須ではないが、本章の 3 点セット・禁止事項を運用するために強く推奨するフィールド
+
+**再現性条件の中で最も抜けやすいのは `data_split` と `metric_definition`** です。前者は「同じ CV スコアを再現するために、どの試料が train でどの test だったか」の情報、後者は「RMSE = √mean((y_true − y_pred)²) のように**評価指標を数式・単位・パラメータで固定する**」情報です。関数名だけでは、平方根の位置・多クラスの平均方法・欠損の扱いなどが暗黙化されるため、`metric_definition` には最低限：
+
+- 数式表現（例：`RMSE = sqrt(mean((y_true - y_pred)^2))`）
+- 単位（例：GPa）
+- 集計方法（多クラスなら macro / weighted、CV なら fold 平均 or 全体連結）
+- ライブラリ実装を使う場合のパッケージ名とバージョン（具体的な関数名・引数は第6章で扱う）
+
+を記録します。
+
+---
+
+## 5.7 統計/ML Skill 仕様書テンプレート（vol-02 版）
+
+以下が本章の主成果物です。第6章以降のすべての Skill 設計で、このテンプレートを起点にします。
+
+> [!IMPORTANT]
+> このテンプレートは **人間が先に書き下す「仕様書」** です。実装される `SKILL.md`（vol-01 付録A で定義した frontmatter 付きの Skill 定義ファイル）とは別物で、**仕様書 → 第6章以降で `SKILL.md` に変換 → 実装** の順で使います。仕様書は日本語で書き、`SKILL.md` は vol-01 付録A のスキーマ（`name` / `description` / `version` / `data_type` / `target_task` / `last_verified` / `dependencies` などの frontmatter）を継承します。
+
+```markdown
+# Skill 仕様書：<Skill 名>
+
+## ① 目的
+- 何を予測/推定/分類するか、1 文で
+- どんな判断に使うか（例：「合成条件の絞り込み」「装置校正の妥当性確認」）
+- `task_type`：regression / classification / dimensionality_reduction / clustering / anomaly_detection / bayesian_inference のどれか
+
+## ② 入力条件
+- **データ型**：spectrum / timeseries / image / pattern / tabular / multimodal のどれか
+- **特徴量スキーマ**：列名・単位・型・値域・欠損許容度（vol-01 第8章の入出力スキーマ形式）
+- **目的変数**：列名・単位・型・値域（教師あり学習の場合）
+- **サンプル数**：想定される最小・最大の n
+- **学習/評価データの分離状態**：既に分かれているか、Skill が分割するか
+
+## ③ 出力形式
+- **学習済みモデル**：形式（joblib / pickle / ONNX / netCDF 等）、保存パス
+- **評価結果**：CV スコア（各 fold + 集計）、独立テストスコア（あれば）
+- **予測（オプション）**：
+  - sklearn 系：予測値・予測確率・可能なら予測区間、外挿警告フラグ
+  - ベイズ系：事後分布・事後予測分布・信用区間
+- **provenance**：付録A 準拠
+
+## ④ 成功条件（3 点セット）
+- **評価指標**：<`task_type` に応じて選択（§5.3 のタスク種別表を参照）>
+- **目的関数**：<学習損失。ベイズなら「事後分布」と明記>
+- **許容範囲**：<例：5-fold CV 平均 RMSE ≤ 2.5、標準偏差 ≤ 0.5、各 fold ≤ 3.5>
+- **物理制約チェック**：<例：予測値はすべて非負、質量保存則を満たす>
+
+## ⑤ 禁止事項（severity 付き）
+| 分類 | 項目 | severity |
 |---|---|---|
-| XRD パターン | 2θ 軸のズレ補正、ピーク検出との併用 | vol-01 第13章 |
-| 顕微鏡画像 | 特徴量抽出（PCA / 深層 embedding）→ 本 Skill に投入 | 本書外（vol-03） |
-| 時系列（in-situ 測定） | 時系列 CV（第7章）必須、遅延特徴量作成時の未来参照禁止 | 第7章 |
-| 多目的最適化 | 本 Skill は単目的想定。多目的は別 Skill で構成 | 本書外 |
+| A. データ流路 | 生データ上書き / 外部送信 / 単位変換の暗黙実施（vol-01 継承） | fatal |
+| A. データ流路 | データリーク（全データ正規化・分割違反・時系列先読み） | fatal |
+| A. データ流路 | 特徴量への目的変数の混入 | fatal |
+| B. 評価基準の後付け | 評価指標の後付け変更 | audit violation |
+| B. 評価基準の後付け | 合格閾値の後付け緩和 | audit violation |
+| B. 評価基準の後付け | 独立テストの複数回参照 | audit violation / warning |
+| C. 適用範囲 | 外挿域での予測を警告なしに返す | warning / flag / fatal（用途で選択） |
 
-### applicability domain チェックの最小版
-
-```python
-def check_applicability_domain(X_train_transformed, X_pred_transformed,
-                               k=5, threshold_quantile=0.99):
-    """予測点が学習データの近傍にあるかを最近傍距離で判定。
-
-    重要：Pipeline の前処理を通した後の空間で距離計算すること。
-    生の組成特徴量やスペクトル強度をそのまま渡すと、
-    列ごとのスケール差で距離の意味が壊れる。
-    """
-    from sklearn.neighbors import NearestNeighbors
-    # train 側：自己近傍を含めないよう k+1 を取り、先頭（距離 0）を捨てる
-    nn_train = NearestNeighbors(n_neighbors=k + 1).fit(X_train_transformed)
-    d_train, _ = nn_train.kneighbors(X_train_transformed)
-    d_train = d_train[:, 1:]  # 自己距離を除外
-    # 予測点：train を基準に k 近傍
-    nn_ref = NearestNeighbors(n_neighbors=k).fit(X_train_transformed)
-    d_pred, _ = nn_ref.kneighbors(X_pred_transformed)
-    threshold = np.quantile(d_train.mean(axis=1), threshold_quantile)
-    is_extrapolation = d_pred.mean(axis=1) > threshold
-    return is_extrapolation  # True の予測点は warning 対象
+## ⑥ 再現性条件
+- vol-01 継承：`input_sha256` / `skill_version` / `run_datetime_utc` / `package_versions` / `random_seed`
+- vol-02 outline canonical：
+  - `cv_scheme`：分割方法・fold 数・グループ列・shuffle・seed
+  - `data_split`：各 fold の train/test index
+  - `model_config`：モデル種別・ハイパーパラメータ
+  - **（ベイズ Skill）** `sampler_config` / `backend_config` / `posterior_artifact` / `diagnostics_summary`
+- 第5章で追加推奨：
+  - `feature_columns`：特徴量順序
+  - `target_column`：目的変数と単位
+  - `metric_definition`：評価指標の数式・単位・集計方法（例：`RMSE = sqrt(mean((y_true - y_pred)^2))`, unit=GPa, aggregation=fold-mean）
+  - `training_score` / `cv_score`：学習・CV スコア
 ```
 
-これは **暫定的な最小実装**です。組成データでは Mahalanobis 距離、スペクトルでは PLS 残差など、より適切な距離が知られています（Roy 2015 参照）。また、Pipeline 前段の前処理が入っている場合は `pipeline[:-1].transform(X)` で最終モデル直前の空間を作り、そこで距離を測ります。詳細は付録B のチートシートに載せます。
+### エージェントとの使い方
+
+この仕様書を先に日本語で書き、**第6章以降でこの仕様書を `SKILL.md` 化してエージェントに渡します**。仕様書に閾値・禁止事項・severity が書かれていれば、エージェントが生成する fit / predict コードにも自動的に契約チェック・警告文が組み込まれます。仕様書と `SKILL.md` の間で **①〜⑥ の内容が食い違わないよう、両方を同じ PR で更新する** のを Skill 運用の基本ルールとします。
 
 ---
 
-## 5.11 章末チェックリスト・ワーク
+## 5.8 章末ワーク
 
-### セルフチェックリスト（Skill 実装後に確認）
+以下のワークを行ってから第6章に進んでください。**この設計工程を省略すると、第6章以降のハンズオンで「何を成功とするか」の合意が取れなくなります**。
 
-- [ ] Skill 仕様書の ①〜⑥ が第4章テンプレに沿って埋まっているか？
-- [ ] `check_split_contract` が Skill の入り口で呼ばれ、契約違反時は `LeakageError` で停止するか？
-- [ ] 前処理は Pipeline 内に入っており、全データで `fit` を呼ぶ箇所が無いか？
-- [ ] `cross_validate` で `return_indices=True` を使い、`data_split` を provenance に保存しているか？
-- [ ] 独立テストは 1 回のみ評価しているか？ 複数回参照していないか？
-- [ ] 予測時に applicability domain 警告が発火するか？
-- [ ] provenance に `feature_columns`, `target_column`, `metric_definition` が入っているか？
-
-### ワーク
-
-1. 自分の実験データで、A / B / C のどれか 1 つの構造を選び、Skill 仕様書を書く（第4章の続き）
-2. `check_split_contract` を、自分のデータで意図的にリークを作って呼び出し、fatal で拒否されることを確認
-3. ハイパーパラメータを 3 通り試し、**独立テストを見る前に**採用値を仕様書で固定する
-4. 独立テストを 1 回だけ評価し、結果を provenance と一緒に保存する
-5. 「もっと良いスコアが欲しくなった時に、何をしてはいけないか」を仕様書 ⑤ 禁止事項に追記する（第4章 §4.4 / §4.5 の復習）
+1. **自分の実験データで、1 つの回帰/分類タスクを設定**
+   - 例：「XRD 20 点から硬度を予測する回帰」「Raman スペクトルから相同定する分類」
+2. **仕様書テンプレートの ①②③④⑤⑥ を日本語で埋める**
+   - 特に ④成功条件は **3 点セット**（指標・目的関数・許容範囲）を必ず含める
+   - ⑤禁止事項は本章の 6 項目 + vol-01 の項目
+3. **セルフレビュー**：以下を確認
+   - [ ] ④成功条件に閾値が入っているか？
+   - [ ] ⑤禁止事項の各項目に severity（fatal / audit violation / warning / flag）が割り当てられているか？
+   - [ ] ⑥再現性条件に `data_split` と `metric_definition` が含まれているか？
+   - [ ] エージェントが Skill を実行した際、「合格 or 不合格」が機械的に判定できるか？
+4. **禁止事項の運用設計**：⑤禁止事項の各項目について、**検出方法**（fit 時の schema 検査 / provenance 検査 / レビュー時の手動確認）を書き足す
+5. **共同研究者・指導教員に見せる**：仕様書だけで、実装コードを見なくても「何をやろうとしているか」が伝わるかを確認
 
 ---
 
-## 5.12 本章のまとめ
+## 5.9 本章のまとめ
 
-- 教師あり学習 Skill は、第4章の仕様書テンプレを **入力検証 / Pipeline / 学習・評価 / 予測 / provenance の 5 ブロック**で実装する
-- **anti-leakage split contract**（同一試料・同一ロット・時系列順・スケーリング・目的変数派生）を章冒頭で機械的に検査。違反は fatal
-- **Pipeline を必ず使う**：前処理を含めた fit/predict を 1 オブジェクトに閉じ込め、CV の各 fold で正しく処理されることを保証
-- 手法選択は **3 質問（p vs n、変数間相関、線形性根拠）** で絞り、循環設計問題（第4章 §4.4）を避ける
-- 3 ハンズオン（校正曲線・物性予測・スペクトル分類）は共通構造で、A から順に難度が上がる
-- 詳細な CV 設計・解釈可能性は **第7章・第8章** に譲る。本章は「型」を作る章
+- 統計/ML Skill の設計は、vol-01 第7章の 6 要素を拡張する。中身は統計/ML 特有になる
+- **成功条件は 3 点セット**（評価指標・目的関数・許容範囲）で書く。片言の「精度が良い」ではダメ
+- **循環設計問題の統計版**：指標選択と結果評価をエージェントに両方任せない。指標は Skill 契約で固定
+- 統計/ML 特有の**禁止事項 6 項目**：データリーク・特徴量への目的変数混入・指標後付け変更・閾値後付け緩和・独立テスト複数回参照・外挿予測の警告なし返却
+- **再現性条件の拡張**：`cv_scheme` / `data_split` / `model_config` / `feature_columns` / `metric_definition` を追加。完全定義は付録A
+- 次章（第6章）から、この仕様書テンプレートを使って **教師あり学習 Skill** を実装する
 
 ---
 
 ## 参考資料
 
 ### 本書内の該当章
-- [第2章 ARIM データに現れる統計的課題](./chapter-02.md)
-- [第3章 Scikit-learn と PyMC の全体像・使い分け](./chapter-03.md)
-- [第4章 統計/ML 分析用 Skill の設計原則](./chapter-04.md)
-- 第6章 教師なし学習を Skill 化する（次章）
-- 第7章 モデル選択・交差検証・データリーク検知（詳細 CV）
-- 第8章 解釈可能性とレポート化（SHAP / PDP / permutation importance）
-- 付録A 統計/ML Skill テンプレート集
-- 付録B Scikit-learn チートシート
+- [第1章 vol-01 の最小復習](./chapter-01.md)
+- [第2章 vol-01 の Skill に何が足りないのか](./chapter-02.md)
+- [第3章 ARIM データに現れる統計的課題](./chapter-03.md)
+- [第4章 Scikit-learn と PyMC の全体像・使い分け](./chapter-04.md)
+- 第6章 教師あり学習を Skill 化する（次章）
+- 第8章 モデル選択・交差検証・データリーク検知（詳細 CV）
+- 付録A 統計/ML Skill テンプレート集（provenance 完全定義）
 
 ### 外部参考
-- scikit-learn User Guide - Supervised learning: <https://scikit-learn.org/stable/supervised_learning.html>
-- scikit-learn Pipeline: <https://scikit-learn.org/stable/modules/compose.html>
-- Dunn, A., Wang, Q., Ganose, A. et al. "Benchmarking materials property prediction methods: the Matbench test set and Automatminer reference algorithm." *npj Computational Materials* **6**, 138 (2020). <https://doi.org/10.1038/s41524-020-00406-3>
-- Wold, S., Sjöström, M., & Eriksson, L. "PLS-regression: a basic tool of chemometrics." *Chemometrics and Intelligent Laboratory Systems* **58**, 109–130 (2001). <https://doi.org/10.1016/S0169-7439(01)00155-1>
-- Ke, G., Meng, Q., Finley, T. et al. "LightGBM: A Highly Efficient Gradient Boosting Decision Tree." *Advances in Neural Information Processing Systems* **30** (NIPS 2017).
-- Roy, K., Kar, S., & Ambure, P. "On a simple approach for determining applicability domain of QSAR models." *Chemometrics and Intelligent Laboratory Systems* **145**, 22–29 (2015).
+- scikit-learn Metrics: <https://scikit-learn.org/stable/modules/model_evaluation.html>
+- Kapoor, S., & Narayanan, A. "Leakage and the reproducibility crisis in machine-learning-based science." *Patterns* **4**, 100804 (2023). <https://doi.org/10.1016/j.patter.2023.100804>
+- Wagstaff, K. "Machine Learning that Matters." *ICML 2012*. — 「良いスコアより、意義のある評価を」の古典的論考
+- Simmons, J. P., Nelson, L. D., & Simonsohn, U. "False-Positive Psychology: Undisclosed Flexibility in Data Collection and Analysis Allows Presenting Anything as Significant." *Psychological Science* **22**, 1359–1366 (2011). — 「後付けの柔軟性（p 値だけでなく、指標選択・特徴量選択など分析選択の自由度一般）」による偽陽性の古典。§5.4 循環設計問題・§5.5 評価基準の後付けの理論的根拠

@@ -1,853 +1,936 @@
-# 第11章 材料 Foundation Model と MCP 連携 — Agentic 呼び出し契約
+# 第11章 深層モデルの検証・可視化・レポート化 — Human-in-the-loop 拡張
 
 > [!NOTE]
 > **本章の到達目標**
-> - **MatBERT / CrystaLLM / ChemBERTa** の 3 系統を区別し、材料タスクごとの使い分けを書き分けられる
-> - **Hugging Face Hub からの取得と重み署名検証**を第4章 Layer 2 の厳格版として実装できる
-> - **LLM 系 MCP との連携パターン**を、権限分離・監査ログ付きで設計できる
-> - **`fm_query` Skill** を書き、エージェントが FM に問い合わせるときの hallucination 対策プロトコル（retrieval-augmented 検証 + confidence 明示 + citation 強制）を実装できる
-> - **`fm_update_gate` 契約**を書き、Foundation Model の更新（新バージョン / 新重み）をエージェントが受け入れるかの判断ゲートを作れる
-> - vol-01 第10章の文献照合 Skill を **FM 出力の検証**に拡張できる
-> - vol-02 第15章「モデル配布の議論」を FM に適用し、**FM 特有の配布 / 更新リスク**を Skill 契約に落とせる
+> - **Grad-CAM / Integrated Gradients / SHAP for deep** の 3 系統を区別し、それぞれの前提と限界を書き分けられる
+> - **`feature_attribution` Skill** を実装し、attribution そのものの信頼性を測るサニティチェック（sanity checks for saliency maps）を契約に組み込める
+> - **attribution hallucination の対策プロトコル**（model randomization test, data randomization test, cascading randomization）を Skill 化できる
+> - **reliability diagram** を深層モデルに適用し、第9章 `calibration_check` の出力を Human 説明資料に接続できる
+> - **Human-in-the-loop 拡張**：誤判定サンプルを Human に流し戻し、Human が attribution を検証してラベル修正案を返す UX を Skill 契約に落とせる
+> - **深層レポートテンプレート**（環境固定 + weights sha + augmentation config + attribution artifacts + Human review log）を書ける
+> - vol-01 第6章「予防的 Human-in-the-loop 3 原則」を**深層モデル特有の誤判定流し戻し UX**として拡張できる
 >
 > **本章で扱わないこと**
-> - **SSL / 対比学習で FM を作る側の議論** → **第12章**
-> - **FM を使った capstone**（深層特徴 → PyMC 階層） → **第13章**
-> - **FM 特有の運用失敗事例集** → **第14章**（本章は設計側の予防）
-> - **組織展開と責任分担** → **第15章**
+> - **Foundation Model の hallucination** → **第12章**（LLM/FM 特有の retrieval-augmented 検証）
+> - **SSL / 対比学習の attribution** → **第13章**（表現空間の解釈）
+> - **CAM 系の理論詳細**（Grad-CAM++ / Score-CAM / Ablation-CAM 等） → 参考文献
+> - **深層一般 × Agentic 失敗事例集** → **第15章**（本章では設計側の予防を扱う）
 
 ---
 
 ## 11.1 この章で作る Skill
 
-3 つの **Foundation Model 用 Agentic Skill** と 1 つの **更新受け入れゲート**を作ります。
+3 つの **解釈・検証 Agentic Skill** と 1 つの **深層レポートテンプレート**を作ります。
 
 | Skill / 成果物 | 役割 | 入出力 |
 |---|---|---|
-| **`fm_fetch_and_verify`** | Hugging Face Hub から FM を取得し、重み署名 / ライセンス / provenance を検証 | 入力: repo_id + revision → 出力: verified weights + fm_provenance |
-| **`fm_query`** | FM に問い合わせ、hallucination 対策プロトコルつきで応答を返す | 入力: prompt + retrieval sources + citation policy → 出力: response + citations + confidence |
-| **`fm_update_gate`**（契約 + Skill） | FM の新バージョン / 新重みを受け入れるかを判断 | 入力: new_fm_manifest + benchmark_results → 出力: accept / defer_to_human / reject |
-| **`fm_call_via_mcp`** | 組織内 MCP サーバ経由で LLM 系 FM を呼び出す（付録B に実装） | 入力: mcp endpoint + payload → 出力: response + audit_log |
+| **`feature_attribution`** | Grad-CAM / IG / SHAP の 3 手法を統一 API で呼び出し、attribution artifact を保存 | 入力: model + sample + method → 出力: attribution map + provenance |
+| **`attribution_sanity_check`** | attribution の hallucination を検出（model randomization / data randomization） | 入力: 元 attribution + 乱数化後 attribution → 出力: similarity score + pass/fail |
+| **`human_handback_review`**（契約 + Skill） | 誤判定・不確かさ超過サンプルを Human に流し戻し、Human 判定・ラベル修正案を回収 | 入力: flagged sample + attribution + uncertainty → 出力: Human review record（ラベル修正 / 保留 / 却下） |
+| **`deep_report_template`** | 環境・重み・augmentation・attribution・Human review をまとめた再現可能レポート | 入力: 全 provenance → 出力: HTML / PDF レポート |
 
-前提として、第4章 3 レイヤ provenance + Ch7 Layer 4 + Ch9 `bayesian_inference_config` + Ch10 `layer_attribution` / `layer_human_review`、第10章 `deep_report_template` を継承。**本章では FM 用の拡張ブロック `foundation_model_provenance` を導入**します（Ch07 Layer 4 と同じ拡張パターン）。
+前提として、第5章 3 レイヤ provenance + 第8章 Layer 4 + 第10章 `bayesian_inference_config`、第9章 `uncertainty_stop_gate`、第8章 `domain_gap_gate` を継承します。**本章のレポートは第4-9 章のすべての契約状態を集約する監査可能ドキュメント**として設計します。
 
 ---
 
-## 11.2 なぜこの章が必要か — vol-01 第10章と vol-02 第15章の合流
+## 11.2 なぜこの章が必要か — vol-01 第6章の深層拡張
 
-vol-01 第10章では **arXiv / Paper Search MCP** による文献照合 Skill を作り、「AI が生成した内容を人間が検証する」プロトコルを確立しました。vol-02 第15章では「モデル配布」の判断基準（誰が配って、誰が受け取り、どう検証するか）を議論しました。
+vol-01 第6章では「予防的 Human-in-the-loop 3 原則」を導入しました：**(1) 疑わしいときは Human**、**(2) 決めるのは Human**、**(3) 記録は改ざん不可**。深層モデルではこれが以下の理由で不十分になります：
 
-Foundation Model は、これら 2 つの議論の**合流点**です：
-
-- **FM は生成 AI であり、hallucination が起きる**（vol-01 の文献照合 Skill と同じ問題）
-- **FM は "他人の学習成果" を再配布する仕組み**（vol-02 のモデル配布の議論と同じ問題）
-- **FM は更新頻度が高く、重み差替えがエージェントの動作を静かに変える**（Ch7 の pretrained weights より頻度と影響が大きい）
-- **FM は組織内 MCP 経由で呼ばれることが多く、監査ログの設計が別途必要**
+- **モデルの内部が説明不能**：Human が「なぜこの予測になったか」を理解できないと、判定を信頼できず、フィードバックもできない
+- **attribution 自体が hallucinate する**：Grad-CAM や SHAP の出力が「モデルの真の依存性」ではなく、単に "それらしい" 領域をハイライトすることがある（Adebayo et al., 2018）
+- **誤判定サンプルの Human 流し戻し UX がない**：第9章 gate で "route_to_human" と言われても、Human 側に「何を見て、何を判定し、どう記録するか」の構造がなければ機能しない
+- **深層レポートは事後再現が困難**：重み・環境・augmentation・attribution 生成条件がすべて揃わないと、6 か月後の監査に耐えない
 
 ```mermaid
 flowchart TB
-    A["Foundation Model"] --> B{"利用形態"}
-    B -->|"エージェントが直接<br/>Hugging Face Hub から取得"| C["fm_fetch_and_verify<br/>+ 重み署名検証"]
-    B -->|"組織内 MCP サーバ経由"| D["fm_call_via_mcp<br/>+ 監査ログ"]
-    C --> E["fm_query"]
-    D --> E
-    E --> F["hallucination 対策<br/>RAG + citation + confidence"]
-    F --> G["deep_report_template に記録 (Ch10)"]
-    H["新バージョン FM リリース"] --> I["fm_update_gate"]
-    I -->|"accept"| C
-    I -->|"defer_to_human"| J["Human 判断"]
-    I -->|"reject"| K["旧バージョン継続"]
+    A["推論結果<br/>+ uncertainty (Ch8/9)"] --> B{"gate 判定"}
+    B -->|"pass"| C["自律決定"]
+    B -->|"review / stop"| D["human_handback_review"]
+    D --> E["attribution 生成<br/>+ sanity check"]
+    E --> F["Human UI:<br/>予測 + attribution + uncertainty + 類似訓練サンプル"]
+    F --> G{"Human 判定"}
+    G -->|"承認"| H["ラベル確定・agent 続行"]
+    G -->|"修正"| I["ラベル修正案 + 再学習トリガ (L3 承認)"]
+    G -->|"保留"| J["queue に戻し・別 Human 再確認"]
+    H & I & J --> K["deep_report_template<br/>にすべて記録"]
 ```
 
 > [!IMPORTANT]
-> **本章は "FM を使う側" の設計の章です**。「FM が何ができるか」より「エージェントが FM を安全に呼ぶための契約と検証」が主題。FM そのものの内部理解は第12章（SSL/対比学習で FM を作る側）で扱います。
+> **本章は "解釈可能性" ではなく "検証可能性 + Human へ流し戻す UX + 再現可能レポート" の章です**。Grad-CAM の理論よりも、**attribution を Human が信じるための担保**と、**流し戻し後の Human 判定を Skill に組み込む方法**が主題です。
 
 ---
 
-## 11.3 MatBERT / CrystaLLM / ChemBERTa の位置づけ
+## 11.3 Attribution 3 系統の位置づけ
 
-材料 × Foundation Model の主要 3 系統：
+深層モデルの特徴 attribution 手法は大きく 3 系統：
 
-| モデル | ベース | 事前学習データ | 得意タスク | ライセンス | 特徴 |
-|---|---|---|---|---|---|
-| **MatBERT** | BERT | 材料科学論文 200 万件 | 論文からの材料特性抽出、NER、テキスト分類 | Apache-2.0 系 | テキスト理解特化、生成なし |
-| **CrystaLLM** | GPT-2 系 | CIF 形式の結晶構造 100 万件 | 結晶構造生成、CIF 補完、条件付き生成 | Apache-2.0 系 | 生成モデル、hallucination 対策必須 |
-| **ChemBERTa** | RoBERTa | SMILES 77M | 分子物性予測、分子表現学習 | MIT 系 | SMILES 特化、生成能力は限定的 |
+| 系統 | 代表手法 | 対象モデル | 計算コスト | Human 直感性 |
+|---|---|---|---|---|
+| **CAM 系**（勾配 × 活性化） | Grad-CAM, Grad-CAM++, Score-CAM | CNN（局所受容野） | 低（forward + 1 backward） | 高（ヒートマップ） |
+| **勾配積分系** | Integrated Gradients (IG), SmoothGrad | 任意の微分可能モデル | 中（N 個の interpolation） | 中〜高 |
+| **摂動系** | SHAP (DeepSHAP / KernelSHAP), Occlusion, LIME | 任意（black-box 可） | 高（N 個の摂動サンプル） | 中（シャップ値の解釈が必要） |
 
 ### 使い分け早見表
 
-| タスク | 推奨 FM | 補足 |
-|---|---|---|
-| 論文から材料組成を抽出（NER） | **MatBERT** | 生成不要、埋め込み or 分類ヘッド追加 |
-| 結晶構造の候補生成 | **CrystaLLM** | 生成 → **必ず** 物理検証（対称性、密度、結合角）でフィルタ |
-| 分子から物性予測（回帰 / 分類） | **ChemBERTa** | 埋め込み → 線形 or MLP ヘッド |
-| 未知組成の合成可能性判断 | 単独 FM では不十分 | 複数 FM + retrieval + Human 承認 |
-| 論文からの引用元検索 | **MatBERT + BM25 / arXiv MCP** | vol-01 第10章の拡張 |
+| 目的 | 推奨 |
+|---|---|
+| CNN の畳み込み層で「どの空間領域が効いた」を見る | **Grad-CAM** |
+| axiomatic な性質（completeness, sensitivity）が欲しい | **Integrated Gradients** |
+| モデル非依存で shapley 値ベースの寄与を出したい | **SHAP** |
+| CNN 以外の Transformer / MLP 系 | IG または SHAP（Grad-CAM は不適） |
+| Human に「ここが根拠」と直感的に示したい | Grad-CAM ヒートマップ + IG による細部確認 |
 
 > [!WARNING]
-> **CrystaLLM のような生成モデルは特に hallucination リスクが高い**です。CIF を生成しても、原子座標や対称性が物理的に整合しない場合が多い。§11.6 の hallucination 対策プロトコルは生成系 FM で必須。
-
-### CrystaLLM 生成物の物理検証（`crystal_physical_validation`）
-
-CrystaLLM の CIF 出力は必ず以下のフィルタを通す。1 つでも fail した候補は破棄：
-
-```yaml
-# crystal_physical_validation.yaml（fm_query の生成系分岐で必須）
-skill: "crystal_physical_validation"
-version: "1.0.0"
-
-validators:
-  cif_parser_valid:
-    tool: "pymatgen.io.cif.CifParser"
-    tool_version: ">=2024.6"
-    fail_label: "cif_parse_error"
-  charge_neutrality:
-    tolerance_abs_electrons: 0.05
-    fail_label: "non_neutral_composition"
-  density_range:
-    min_g_per_cm3: 0.5                              # 気相〜金属の範囲を広めに
-    max_g_per_cm3: 25.0                             # Os の理論上限を超えたら破棄
-    fail_label: "density_out_of_range"
-  bond_length_check:
-    method: "sum_of_covalent_radii * factor"
-    min_factor: 0.7                                 # 実測共有結合半径和の 70% 未満は不整合
-    max_factor: 1.5
-    fail_label: "bond_length_unphysical"
-  bond_angle_check:
-    min_deg: 40.0                                   # 40 度未満は幾何的に不整合
-    fail_label: "bond_angle_unphysical"
-  symmetry_consistency:
-    tool: "spglib"
-    symprec: 0.1
-    require_declared_spacegroup_matches: true
-    fail_label: "spacegroup_mismatch"
-  allowed_elements:
-    whitelist_or_domain_specific: true              # 組織で定義
-    fail_label: "disallowed_element"
-
-acceptance:
-  all_validators_pass_or_labeled: true
-  discard_on_any_fail: true
-
-provenance:
-  crystal_physical_validation_provenance:
-    validator_versions: "dict of tool -> version"
-    per_validator_result: "list"
-    discarded_candidates_count: "int"
-    accepted_candidates_count: "int"
-```
-
-> [!WARNING]
-> 上記の閾値は **開発用のデフォルト**です。実運用では対象元素系・空間群・温度条件でチューニングし、`crystal_physical_validation_provenance` に記録してください。
+> **Grad-CAM は Transformer 系に "そのままでは" 適用できません**。Vision Transformer には attention rollout や Transformer-specific CAM 変種を使います。契約で「モデル系統に応じた手法選択」を強制すること（§11.5）。
 
 ---
 
-## 11.4 Hugging Face Hub からの取得と重み署名検証
+## 11.4 Attribution hallucination — 3 つのサニティチェック
 
-Ch7 で pretrained weights の provenance を厳格化しましたが、FM では以下が加わります：
+**Adebayo et al. (2018) "Sanity Checks for Saliency Maps"** が示した重要な指摘：一部の attribution 手法は、**モデルの重みをランダム化しても** / **ラベルをランダム化してもほぼ同じ attribution map を出す**。つまり "モデルの依存性" ではなく **単なる入力の edge / texture** を可視化しているだけの場合がある。
 
-### FM 取得時の厳格チェック
+### 3 つのサニティチェック
 
-> [!IMPORTANT]
-> **manifest 信頼ルート（Trust Root）**：`expected_manifest` はエージェントが任意に生成できる dict ではなく、**組織の manifest レジストリ**（署名済み append-only ストア）から `manifest_id` で取得します。エージェントは承認済み manifest ID を指定するのみで、内容を書き換えることはできません。レジストリ側で `human_approver` の quorum 署名と immutable timestamp を保持します。
+| チェック | 手順 | 期待される結果 |
+|---|---|---|
+| **Model randomization test** | 学習済み重みを層ごとにランダム重みに置換し、attribution を再計算 | ランダム化した層以下の attribution が**大きく変わる**（similarity 低下） |
+| **Cascading randomization** | 出力層から順に層をランダム化していき、attribution の遷移を見る | ランダム化が進むにつれ attribution が**段階的に劣化** |
+| **Data randomization test** | ラベルをランダムシャッフルして学習し、attribution を比較 | ランダムラベル学習モデルの attribution は元モデルと**似ていない**べき |
+
+### 実装（`attribution_sanity_check`）
 
 ```python
-# fm_fetch_and_verify.py
-import hashlib
-import re
-from huggingface_hub import snapshot_download, HfApi
-
-# 40-hex 完全 SHA のみ許容（短縮 SHA / tag / branch / "main" / "latest" は全て拒否）
-_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# attribution_sanity_check.py
+import copy
+import torch
+import torch.nn as nn
+from typing import Callable
 
 
-def _sha256_file(path: str, chunk: int = 1 << 20) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(chunk), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
-def _load_approved_manifest(manifest_id: str, manifest_registry) -> dict:
+def _spearman_correlation(a: torch.Tensor, b: torch.Tensor) -> dict:
     """
-    署名済み manifest レジストリから承認済み manifest を取得。
-    レジストリ側で quorum 署名・timestamp の改ざん不能性を担保。
-    エージェントは manifest_id のみ指定でき、内容の生成はできない。
+    Tie-aware Spearman rank correlation between two flattened attribution maps.
+    return:
+      rho: float or NaN
+      valid: bool  (False if either input is degenerate: too few unique values or ~0 variance)
+    Saliency maps の類似度としては **abs(rho)** を使うこと（符号反転も依存性を意味しうる）。
     """
-    entry = manifest_registry.get(manifest_id)
-    assert entry is not None, f"unknown manifest_id: {manifest_id}"
-    assert manifest_registry.verify_signatures(entry), \
-        "manifest signature invalid or approver quorum not met"
-    return entry["manifest"]
+    import numpy as np
+    a_np = a.detach().cpu().numpy().ravel().astype(np.float64)
+    b_np = b.detach().cpu().numpy().ravel().astype(np.float64)
+
+    # degenerate 検出：unique value 数が極端に少ないか std がほぼ 0 のマップは信頼できない
+    def _degenerate(x):
+        return len(np.unique(x)) < 10 or x.std() < 1e-8
+    if _degenerate(a_np) or _degenerate(b_np):
+        return {"rho": float("nan"), "valid": False, "reason": "degenerate_map"}
+
+    # scipy が利用可能なら scipy.stats.spearmanr（tie 対応）。ここでは numpy でランク平均で代替。
+    try:
+        from scipy.stats import rankdata
+        a_rank = rankdata(a_np, method="average")
+        b_rank = rankdata(b_np, method="average")
+    except ImportError:
+        a_rank = a_np.argsort().argsort().astype(np.float64)
+        b_rank = b_np.argsort().argsort().astype(np.float64)
+
+    a_c = a_rank - a_rank.mean()
+    b_c = b_rank - b_rank.mean()
+    denom = np.linalg.norm(a_c) * np.linalg.norm(b_c)
+    if denom < 1e-12:
+        return {"rho": float("nan"), "valid": False, "reason": "zero_variance"}
+    rho = float((a_c * b_c).sum() / denom)
+    return {"rho": rho, "valid": True, "reason": None}
 
 
-def fm_fetch_and_verify(
-    repo_id: str,
-    revision: str,                           # 40-hex 完全 commit SHA 必須
-    manifest_id: str,                        # 承認済み manifest のレジストリ ID
-    manifest_registry,                       # 署名検証機能つきレジストリ
-    hf_token: str | None = None,
+def model_randomization_test(
+    model: nn.Module,
+    x: torch.Tensor,
+    attribution_fn: Callable[[nn.Module, torch.Tensor], torch.Tensor],
+    layers_to_randomize: list[str],
+    seed: int = 0,
 ) -> dict:
     """
-    Hugging Face Hub から FM を取得し、事前に承認された manifest と照合する。
-
-    approved manifest（レジストリから取得）例：
-      {
-        "safetensors_files": [
-          {"filename": "model.safetensors", "sha256": "abc..."},
-          {"filename": "tokenizer.json", "sha256": "def..."},
-        ],
-        "model_card_file_sha256": "...",         # ダウンロード対象の README.md 固定 hash
-        "license": "apache-2.0",
-        "pretraining_data_license": "cc-by-4.0",
-        "pretraining_data_summary": "materials science papers 2M",
-        "model_family": "matbert",
-        "revision_commit_hash": "<40-hex SHA>",
-        "human_approvers": ["hashed_id_1", "hashed_id_2"],
-        "human_approval_timestamp": "2026-...",
-      }
+    元モデルの attribution と、指定層をランダム化したモデルの attribution を比較。
+    重要：
+      - GPU parameter には GPU 側 generator を使う（device 不一致回避）
+      - BatchNorm running stats 等の buffer もランダム化対象に含めるかを契約で明示
+      - サニティ判定は abs(rho) を使う（符号反転も saliency の依存性として扱う）
+    return:
+      original_attribution, randomized_attribution, similarity, pass
+      randomized_layer_names, randomized_buffer_names, seed
     """
-    # 1) revision は 40-hex 完全 SHA のみ許容（"main" / tag / branch / 短縮 SHA は全て fatal）
-    assert _COMMIT_SHA_RE.match(revision), \
-        f"revision must be a full 40-hex commit SHA (got: {revision!r})"
+    original_attr = attribution_fn(model, x).detach()
 
-    # 2) manifest は必ずレジストリから取得（agent が dict を注入することは不可能）
-    expected_manifest = _load_approved_manifest(manifest_id, manifest_registry)
-    assert revision == expected_manifest["revision_commit_hash"], \
-        "revision does not match approved manifest"
+    randomized_model = copy.deepcopy(model)
+    randomized_params: list[str] = []
+    randomized_buffers: list[str] = []
 
-    # 3) Hub API 側の解決済み SHA が revision と一致することを確認
-    api = HfApi(token=hf_token)
-    model_info = api.model_info(repo_id=repo_id, revision=revision)
-    resolved_sha = getattr(model_info, "sha", None)
-    assert resolved_sha == revision, \
-        f"Hub API resolved sha mismatch: got {resolved_sha}, expected {revision}"
+    def _gen_for(device):
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+        return g
 
-    # 4) Hub API の live 応答は "advisory"。承認判断は manifest 側に固定されている
-    #    ライセンス "cross-check" は Hub 側が manifest と食い違わないことのサニティチェック
-    declared_license_hub = getattr(model_info, "cardData", {}).get("license") if model_info else None
-    if declared_license_hub is not None:
-        assert declared_license_hub == expected_manifest["license"], \
-            f"license mismatch: hub says {declared_license_hub}, manifest says {expected_manifest['license']}"
+    with torch.no_grad():
+        for name, p in randomized_model.named_parameters():
+            if any(name.startswith(prefix) for prefix in layers_to_randomize):
+                g = _gen_for(p.device)
+                p.copy_(torch.empty_like(p).normal_(generator=g))
+                randomized_params.append(name)
+        # BatchNorm 等の running stats（buffer）もランダム化対象に含める
+        for name, buf in randomized_model.named_buffers():
+            if any(name.startswith(prefix) for prefix in layers_to_randomize):
+                if buf.dtype.is_floating_point and buf.numel() > 0:
+                    g = _gen_for(buf.device)
+                    buf.copy_(torch.empty_like(buf).normal_(generator=g))
+                    randomized_buffers.append(name)
 
-    # 5) 重み + tokenizer + model card ファイルを download（allow_patterns で厳格制限）
-    files_to_fetch = [f["filename"] for f in expected_manifest["safetensors_files"]] + ["README.md"]
-    local_dir = snapshot_download(
-        repo_id=repo_id,
-        revision=revision,
-        allow_patterns=files_to_fetch,
-        token=hf_token,
-    )
-
-    # 6) safetensors 以外の形式（.bin, .pt, .ckpt）は絶対に読まない
-    for entry in expected_manifest["safetensors_files"]:
-        assert entry["filename"].endswith(".safetensors") or entry["filename"] == "tokenizer.json", \
-            f"only .safetensors and tokenizer.json allowed, got {entry['filename']}"
-
-    # 7) 全ファイルの sha256 を expected と照合（重み + tokenizer）
-    verified_files = []
-    for entry in expected_manifest["safetensors_files"]:
-        path = f"{local_dir}/{entry['filename']}"
-        actual = _sha256_file(path)
-        assert actual == entry["sha256"], \
-            f"sha256 mismatch for {entry['filename']}: expected {entry['sha256']}, got {actual}"
-        verified_files.append({"filename": entry["filename"], "sha256": actual, "path": path})
-
-    # 8) model card 本体（README.md）の hash も固定 — Hub 上で書き換え可能なため
-    #    live API の cardData ではなく、pinned revision の README.md ファイル hash で照合
-    readme_path = f"{local_dir}/README.md"
-    readme_hash = _sha256_file(readme_path)
-    assert readme_hash == expected_manifest["model_card_file_sha256"], \
-        f"model card file hash mismatch: expected {expected_manifest['model_card_file_sha256']}, got {readme_hash}"
+    randomized_attr = attribution_fn(randomized_model, x).detach()
+    sim = _spearman_correlation(original_attr, randomized_attr)
+    similarity_abs = abs(sim["rho"]) if sim["valid"] else float("nan")
 
     return {
-        "local_dir": local_dir,
-        "verified_files": verified_files,
-        "revision": revision,
-        "manifest_id": manifest_id,
-        "declared_license_from_manifest": expected_manifest["license"],
-        "manifest_used": expected_manifest,
-        "model_card_file_sha256": readme_hash,
+        "original_attribution": original_attr,
+        "randomized_attribution": randomized_attr,
+        "spearman_similarity": sim["rho"],
+        "spearman_similarity_abs": similarity_abs,
+        "similarity_valid": sim["valid"],
+        "invalid_reason": sim["reason"],
+        "pass": bool(sim["valid"] and similarity_abs < 0.3),
+        "randomized_params": randomized_params,
+        "randomized_buffers": randomized_buffers,
+        "seed": seed,
     }
 ```
 
 ### 契約 YAML
 
 ```yaml
-# fm_fetch_and_verify.yaml
-skill: "fm_fetch_and_verify"
+# attribution_sanity_check.yaml
+skill: "attribution_sanity_check"
 version: "1.0.0"
 
 requires:
-  revision_must_be_40hex_commit_sha: true         # fatal on 'main' / tag / branch / 短縮 SHA
-  hub_api_resolved_sha_must_match_revision: true  # HfApi.model_info().sha == revision
-  manifest_from_signed_registry_only: true        # agent-supplied dict 禁止
-  manifest_approver_quorum_min: 2                 # 承認者は 2 名以上
-  safetensors_only: true                          # .bin / .pt / .ckpt 拒否
-  trust_remote_code_forbidden: true               # HF の任意コード実行禁止
+  attribution_method: "grad_cam | integrated_gradients | shap_deep"
+  reference_model: "trained_model_frozen"
+  randomization_seed: "recorded_in_provenance"
+
+tests:
+  - name: "model_randomization_top_layer"
+    layers: ["classifier", "head"]
+    similarity_max: 0.3
+  - name: "model_randomization_cascading"
+    strategy: "top_down_layer_by_layer"
+    trend_expected: "monotonic_decrease"
+  - name: "data_randomization"
+    procedure: "retrain_with_shuffled_labels_to_fit_criterion"
+    fit_criterion:
+      train_loss_ratio_max: 1.5              # 元モデルの train loss × 1.5 以下まで学習させる
+                                             # （"short epochs" だと単にアンダーフィットで sanity check 無効）
+      min_epochs_fraction: 0.5               # 少なくとも元モデル epoch の 50%
+    similarity_max: 0.3                      # |rho| で判定
+  - name: "buffer_randomization_required"
+    include_running_stats: true              # BatchNorm running_mean/var も randomization 対象
+    documented_in_provenance: true
 
 acceptance:
-  all_file_sha256_match: true
-  model_card_file_sha256_matches_manifest: true   # pinned README.md の hash 照合
-  license_from_manifest_matches_hub_advisory: true  # Hub は advisory、決定は manifest
-  no_unknown_files_downloaded: true               # allow_patterns で厳格制限
+  all_tests_must_pass: true
+  reject_attribution_if_any_test_fails: true
 
 agent_authorization:
-  L1: "fetch_and_report"
-  L2: "fetch_and_load_for_inference"
-  L3:
-    can_propose_new_manifest: true
-    cannot_bypass_manifest_check: "forbidden_all_levels"
-  never_allowed:
-    - "fetch_without_manifest"
-    - "load_bin_or_pt_files"
-    - "trust_remote_code_true"
-    - "auto_update_revision"
+  L1: "run_and_report"
+  L2: "run_and_report"
+  L3: "modify_similarity_thresholds_with_prior_approval"
 
 provenance:
-  foundation_model_provenance:                    # 第4章 3 レイヤ + Ch7 Layer 4 + Ch9 + Ch10 と同じ
-                                                  # 「追加ブロック」パターン
-    repo_id: "str"
-    revision_commit_hash: "str (40-hex SHA)"
-    hub_api_resolved_sha: "str"                   # 検証済み一致
-    declared_license: "str (from manifest, not live API)"
-    pretraining_data_license: "str"
-    pretraining_data_summary: "str"
-    model_family: "matbert | crystallm | chemberta | other"
-    files_with_sha256: "list[{file, kind, sha256}]"    # kind ∈ {weights, tokenizer, config, generation_config}
-    # 派生ビュー（読み取り専用）：kind == 'weights' の filter
-    safetensors_files_with_sha256: "list (derived view of files_with_sha256 where kind='weights')"
-    model_card_file_sha256: "str"                 # pinned README.md の hash
-    manifest_id: "str (registry ID)"
-    manifest_approvers_hashed: "list (quorum >= 2)"
-    manifest_approval_timestamp: "iso8601"
-    fetch_timestamp: "iso8601"
+  record_all_similarity_scores: true
+  record_seed: true
+  record_reference_attribution_hash: true
+  record_randomization_hash: true
 ```
 
 > [!IMPORTANT]
-> **`files_with_sha256` が正本**です（付録B B.4.4 の manifest schema と一致）。**tokenizer / config / generation_config も weights と同じ file-level sha256 で pin**します（tokenizer / config が改ざんされると同一重みでも挙動が変わるため——付録B B.4.4 rubber-duck 修正 Blocking-3 参照）。`safetensors_files_with_sha256` は後方互換のための派生ビューで、`files_with_sha256` の `kind='weights'` サブセットに等しくなります。
-
-> [!WARNING]
-> **`revision: "main"` や tag での取得は禁止**です。tag / branch は後から書き換え可能で、同じ「バージョン」で違う重みが降ってくる可能性があります。**必ず commit hash（SHA）を manifest に固定**してください。
+> **`similarity_max: 0.3` は暫定値**です。手法・タスク・モデルアーキテクチャで適切な閾値は変わります。**新規タスクでは "既知の spurious correlation を仕込んだ toy example" で校正**すること。エージェントが閾値を勝手に変えることは L3 でも事前承認必須。
 
 ---
 
-## 11.5 LLM 系 MCP との連携パターン
+## 11.5 `feature_attribution` Skill の統一 API
 
-組織内で FM を運用する場合、直接 Hub から fetch するのではなく **組織内 MCP サーバ経由**で呼び出す構成が一般的です。これにより：
-
-- **権限分離**：エージェントは直接重みに触れず、MCP が推論結果のみ返す
-- **監査ログ**：全問い合わせ / 応答が MCP で記録される
-- **RAG の埋め込み**：MCP が retrieval を先に実行し、context を prompt に埋め込む
-- **rate limit / cost 管理**：GPU 資源を organization レベルで統制
-
-```mermaid
-flowchart LR
-    A["Agent (L2)"] -->|"fm_call_via_mcp"| B["組織内 MCP サーバ"]
-    B --> C["auth 検証<br/>rate limit<br/>audit log"]
-    C --> D["retrieval layer<br/>(arXiv MCP / 社内 DB)"]
-    D --> E["prompt 組立"]
-    E --> F["FM 推論"]
-    F --> G["応答検証<br/>(citation / confidence)"]
-    G --> H["監査ログ書き込み"]
-    H -->|"response + citations"| A
-    G -->|"policy 違反"| I["Human エスカレーション"]
-```
-
-### MCP レベルの権限分離
-
-| MCP メソッド | エージェント権限（Ch4 §4.7） | 呼び出し条件 |
-|---|---|---|
-| `fm.query` | L1〜L3 全員可（推論のみ） | — |
-| `fm.embed` | L1〜L3 全員可 | — |
-| `fm.finetune` | L3 + 事前承認ワークフロー必須 | 承認済み finetune 計画 ID |
-| `fm.load_weights` | エージェント直接呼び出し禁止（MCP 管理者のみ） | MCP admin token 必須 |
-| `fm.list_versions` | L1〜L3（読み取りのみ） | — |
-| `fm.set_default_version` | 全レベル禁止（`fm_update_gate` の Human 承認経由のみ） | **署名済み `fm_update_gate_decision` ID + reviewer quorum 署名**が payload に含まれ、MCP サーバ側で検証。エージェント経由の chain-call でも通らない |
-
-> [!IMPORTANT]
-> **MCP サーバ側の enforcement**：`fm.set_default_version` は decision ID 検証ポリシーを MCP server-side で保持し、agent がどのレベルからも indirect に成功しないようにします。全呼び出しで **caller identity + method + decision ID + timestamp** を append-only ログに記録し、エージェントの権限昇格を検出可能にします。
-
-付録B で **MCP Python SDK による実装ミニマル例**を示します。
-
----
-
-## 11.6 `fm_query` — hallucination 対策プロトコル
-
-FM に問い合わせるときの Skill。**vol-01 第10章文献照合 Skill を FM 出力に適用**します。
-
-### プロトコル 4 原則
-
-1. **Retrieval-augmented 前提**：FM 単体には答えさせない。関連文献 / 社内 DB を retrieval し context に埋める
-2. **Citation 強制**：応答の各 claim に retrieval 結果へのポインタを要求
-3. **Confidence 明示**：FM に「わからない場合は "unknown"」と答える権利を与え、Human 側で dispatch
-4. **Verification loop**：FM 応答を retrieval 結果と再照合し、矛盾があれば flag
-
-### 実装
+3 系統を統一 API で呼び出し、attribution artifact + サニティチェック結果を保存します。
 
 ```python
-# fm_query.py
+# feature_attribution.py
 from dataclasses import dataclass
+from typing import Literal
+import torch
+import torch.nn as nn
+
+AttributionMethod = Literal["grad_cam", "integrated_gradients", "shap_deep"]
 
 
 @dataclass
-class RetrievalHit:
-    source_id: str        # 例: arxiv:2401.xxxxx, internal_doc:12345
-    excerpt: str
-    chunk_id: str         # corpus 内 chunk の一意 ID
-    chunk_sha256: str     # 本文の hash（再現性）
-    embedding_model_id: str
-    embedding_index_version: str
-    corpus_snapshot_id: str
-    rank: int
-    score: float
-    retrieved_at: str
+class AttributionRequest:
+    method: AttributionMethod
+    target_class: int | None = None          # None なら argmax(pred)
+    grad_cam_target_layer: str | None = None # method == "grad_cam" のときのみ
+    ig_baseline: str = "zero"                # "zero" | "blur" | "uniform_noise"
+    ig_steps: int = 50
+    shap_background_size: int = 100
 
 
-def _lexical_faithfulness(
-    text: str,
-    cited_ids: list[str],
-    hits: list[RetrievalHit],
-    ngram_size: int = 3,
-) -> float:
-    """
-    faithfulness score ∈ [0.0, 1.0]（値が大きいほど retrieval と整合）。
-
-    定義：
-      1. text から claim 文を抽出（`.` / `。` / `\\n` 区切り）
-      2. 各文について、その文が引用している source_id に対応する excerpt を集める
-      3. 文の n-gram（token 単位、Unicode 対応の正規化後）と excerpt の n-gram の Jaccard 類似度を計算
-      4. 全 claim 文についての平均を返す（citation を持たない文は 0 として平均に含める）
-
-    Calibration：
-      - 参照実装は SciBERT tokenizer + n=3 token n-gram + Jaccard
-      - Domain 別に閾値（threshold_stop）は再校正すること（本 skill 契約の 0.4 は開発用）
-
-    Fallback：
-      - retrieval hits が空、あるいは cited_ids が空の場合は 0.0 を返す
-      - 文抽出に失敗した場合は `NaN` を返さず 0.0（安全側 = route_to_human 側）
-    """
-    # 実装骨子は本文参照。参照実装は付録B（materials_fm_helpers.py）
-    ...
-
-
-def fm_query(
-    prompt: str,
-    retrieve_fn,                            # (prompt) -> list[RetrievalHit]
-    fm_call_fn,                             # (system, prompt) -> {"text": ..., "logprobs": ...}
-    response_language: str = "ja",          # 応答言語（system prompt に注入）
-    max_hits: int = 8,
-    retrieval_min_hits: int = 3,            # 契約と一致させる
-    require_citations: bool = True,
-    faithfulness_stop_threshold: float = 0.4,
-    confidence_warn_threshold: float = 0.6,
+def feature_attribution(
+    model: nn.Module,
+    x: torch.Tensor,
+    req: AttributionRequest,
 ) -> dict:
     """
-    hallucination 対策プロトコルつきの FM 呼び出し。
+    3 系統を統一 API で呼び出す。以下は骨子。実装は captum / grad-cam ライブラリを使用。
+
+    重要：
+      - CNN 以外に grad_cam を要求されたら fatal（§11.3 warning）
+      - target_class が None なら決定論的 forward で argmax を解決し、provenance に必ず記録
+      - IG baseline の選択は結果に大きく影響するため provenance に必ず記録
     """
-    hits = retrieve_fn(prompt)[:max_hits]
+    assert isinstance(model, nn.Module)
+    _validate_method_vs_architecture(model, req)
 
-    # 事前ガード：retrieval hit が最小要件を満たさない場合、FM を呼ばず Human 送り
-    if len(hits) < retrieval_min_hits:
-        return {
-            "response_text": "",
-            "citations": [],
-            "hallucination_flags": ["insufficient_retrieval_hits"],
-            "confidence_estimate": 0.0,
-            "faithfulness_score": 0.0,
-            "combined_gate": "stop",
-            "action": "route_to_human_no_source_available",
-        }
+    prev_training = model.training
+    model.eval()
+    try:
+        # target_class を **決定論的に** 解決してから provenance に固定
+        with torch.no_grad():
+            logits = model(x)
+            probs = logits.softmax(-1)
+        resolved_target_class = int(logits.argmax(-1).flatten()[0].item()) \
+            if req.target_class is None else int(req.target_class)
+        logits_snapshot_hash = _hash_tensor(logits.detach())
 
-    context = _format_hits_with_ids(hits)
+        req_resolved = AttributionRequest(**{**req.__dict__, "target_class": resolved_target_class})
 
-    # answer_status は機械可読な control token として固定（言語に依存させない）
-    system = (
-        f"You are a materials science assistant. "
-        f"Answer in {response_language}. "
-        f"Answer ONLY from the provided sources. "
-        f"Every factual claim MUST cite one of the provided source_ids in the form [source_id]. "
-        f'If the sources do not contain the answer, respond with exactly this JSON: '
-        f'{{"answer_status": "unknown"}}'
-    )
-    full_prompt = f"{context}\n\nQuestion: {prompt}"
-    response = fm_call_fn(system=system, prompt=full_prompt)
-    text = response["text"]
-
-    # UNKNOWN 応答は control token（JSON）で検出、言語に依存しない
-    if _is_unknown_control_token(text):
-        return {
-            "response_text": text,
-            "citations": [],
-            "hallucination_flags": [],
-            "confidence_estimate": 0.0,
-            "faithfulness_score": 0.0,
-            "combined_gate": "warn",           # 応答なしはハルシネーションではない
-            "action": "route_to_human_no_source_available",
-        }
-
-    # citation 抽出 + retrieval 照合
-    cited_ids = _extract_bracketed_source_ids(text)
-    known_ids = {h.source_id for h in hits}
-    unknown_citations = [cid for cid in cited_ids if cid not in known_ids]
-
-    # 「引用のない claim」を粗く検出（各文が [source_id] を含むか）
-    uncited_claim_sentences = _detect_uncited_claim_sentences(text)
-
-    # claim-level validation：各文の主張が、実際に cited excerpt によって支持されているか
-    #   citation が real でも、excerpt に書かれていない主張は「unsupported claim」として別扱い
-    unsupported_claims = _detect_unsupported_claims(text, cited_ids, hits)
-
-    hallucination_flags = []
-    missing_or_invalid = require_citations and (unknown_citations or uncited_claim_sentences)
-    if missing_or_invalid:
-        hallucination_flags.append("missing_or_invalid_citation")
-    if unsupported_claims:
-        hallucination_flags.append("unsupported_claim_despite_citation")
-
-    # verification loop: 各 citation が対応 excerpt と語彙的に整合するか（faithfulness 近似）
-    faithfulness = _lexical_faithfulness(text, cited_ids, hits)
-    if faithfulness < faithfulness_stop_threshold:
-        hallucination_flags.append("low_lexical_faithfulness")
-
-    # confidence は logprob と faithfulness の組合せ（実装は簡易）
-    logprob_confidence = response.get("mean_logprob_confidence", 0.5)
-    confidence_estimate = 0.5 * logprob_confidence + 0.5 * faithfulness
-
-    # Ch08 uncertainty_stop_gate 互換の tri-state 統合ゲート
-    #   stop 優先：任意の stop 条件で stop、warn は confidence のみで昇格
-    combined_gate = "pass"
-    if hallucination_flags or missing_or_invalid:
-        combined_gate = "stop"
-    elif confidence_estimate < confidence_warn_threshold:
-        combined_gate = "warn"
+        if req_resolved.method == "grad_cam":
+            attribution = _grad_cam(model, x, req_resolved)
+        elif req_resolved.method == "integrated_gradients":
+            attribution = _integrated_gradients(model, x, req_resolved)
+        else:  # shap_deep
+            attribution = _shap_deep(model, x, req_resolved)
+    finally:
+        model.train(prev_training)
 
     return {
-        "response_text": text,
-        "citations": cited_ids,
-        "retrieval_hits_used": [h.source_id for h in hits],
-        "unknown_citations": unknown_citations,
-        "uncited_claim_sentences": uncited_claim_sentences,
-        "unsupported_claims": unsupported_claims,
-        "hallucination_flags": hallucination_flags,
-        "faithfulness_score": faithfulness,
-        "confidence_estimate": confidence_estimate,
-        "combined_gate": combined_gate,                 # "pass" | "warn" | "stop"
-        "action": (
-            "route_to_human" if combined_gate == "stop"
-            else "review_recommended" if combined_gate == "warn"
-            else "continue"
-        ),
+        "method": req_resolved.method,
+        "target_class": resolved_target_class,           # 必ず int 値で記録
+        "target_class_was_auto_resolved": req.target_class is None,
+        "logits_snapshot_hash": logits_snapshot_hash,
+        "probs_top1": float(probs.max(-1).values.flatten()[0].item()),
+        "attribution": attribution.detach(),
+        "attribution_hash": _hash_tensor(attribution),
+        "request_params": req_resolved.__dict__,
     }
+
+
+# アーキテクチャ ↔ 手法の許容関係を明示レジストリ化。
+# ここに列挙されないアーキテクチャで grad_cam を要求すると fatal。
+_GRAD_CAM_ALLOWED_ARCHITECTURES = {"resnet", "vgg", "densenet", "efficientnet", "convnext"}
+_GRAD_CAM_FORBIDDEN_ARCHITECTURES = {"vit", "swin", "deit", "beit", "mlp_mixer"}
+
+
+def _validate_method_vs_architecture(model: nn.Module, req: AttributionRequest) -> None:
+    """
+    Grad-CAM は「Conv があれば OK」ではない：ViT の patch embedding は Conv だが不適。
+    以下を fatal:
+      - モデル系統が forbidden リストにある
+      - grad_cam_target_layer が未指定
+      - 指定された target_layer が model に存在しない、または spatial feature 層でない
+    Transformer 系は Transformer-specific attribution（attention rollout 等）を使うこと。
+    """
+    arch_hint = getattr(model, "architecture_family", None)  # モデルが自己申告する場合
+    if req.method == "grad_cam":
+        if arch_hint is not None and arch_hint in _GRAD_CAM_FORBIDDEN_ARCHITECTURES:
+            raise AssertionError(
+                f"grad_cam is forbidden for {arch_hint}; "
+                "use Transformer-specific attribution (attention rollout / TransCAM) instead"
+            )
+        has_conv = any(isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) for m in model.modules())
+        assert has_conv, "grad_cam requires a model containing Conv layers (§11.3)"
+        assert req.grad_cam_target_layer is not None, "grad_cam_target_layer must be specified"
+
+        # target_layer が実在し、spatial 出力を持つ層であることを確認
+        target = dict(model.named_modules()).get(req.grad_cam_target_layer)
+        assert target is not None, f"grad_cam_target_layer '{req.grad_cam_target_layer}' not found in model"
+        assert isinstance(target, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.BatchNorm2d, nn.ReLU, nn.Sequential)), \
+            f"grad_cam_target_layer '{req.grad_cam_target_layer}' is not a spatial feature layer"
 ```
 
 ### 契約 YAML
 
 ```yaml
-# fm_query.yaml
-skill: "fm_query"
+# feature_attribution.yaml
+skill: "feature_attribution"
 version: "1.0.0"
 
 requires:
-  retrieval_before_fm_call: true                  # RAG 必須。FM 単体呼び出しは fatal
-  retrieval_min_hits: 3                           # hit 0 では回答させない
-  citation_required_in_response: true
-  unknown_response_allowed_and_encouraged: true
+  model_frozen_during_attribution: true
+  method_matches_architecture: true      # code で fatal assert
+  target_class_specified_or_argmax: true
 
-hallucination_gate:
-  monitors:
-    - metric: "insufficient_retrieval_hits"
-      action_if_present: "route_to_human_no_source_available"
-      description: "hits < retrieval_min_hits の場合、FM を呼ばず即 Human 送り"
-    - metric: "missing_or_invalid_citation"
-      action_if_present: "route_to_human"
-    - metric: "unsupported_claim_despite_citation"
-      action_if_present: "route_to_human"
-      description: "citation は real でも excerpt に主張が支持されない claim（fabrication）"
-    - metric: "faithfulness_score"
-      threshold_stop: 0.4                         # 40% 未満なら停止
-      direction: "higher_is_safer"
-    - metric: "confidence_estimate"
-      threshold_warn: 0.6
+parameters:
+  method:
+    default: "grad_cam"
+    options: ["grad_cam", "integrated_gradients", "shap_deep"]
+  ig_baseline:
+    default: "zero"
+    options: ["zero", "blur", "uniform_noise", "domain_specific"]
+    documented_impact: "baseline choice materially affects IG magnitude"
+    provenance_required:
+      - "baseline_type"
+      - "baseline_seed_if_stochastic"          # uniform_noise / blur random seed
+      - "baseline_tensor_hash"                 # 実際に使った baseline の hash
+      - "input_normalization_domain"           # 例: "imagenet_mean_std", "spectrum_minmax_0_1"
+      - "human_approved_rationale"             # zero が normalized data manifold 外にある場合の説明
+    warn_if:
+      zero_baseline_outside_data_manifold: true   # スペクトル min-max 正規化で zero が manifold 外
+  ig_steps:
+    default: 50
+    min: 20
+    max: 200
 
-combined_gate:                                    # Ch08 uncertainty_stop_gate と同じ tri-state
-  states: ["pass", "warn", "stop"]
-  stop_precedence: true                           # 任意の stop 条件で stop
-  warn_only_condition: "confidence_estimate < 0.6 かつ他の stop 条件なし"
-  pass_condition: "全 stop 条件回避 かつ confidence >= warn 閾値"
+outputs:
+  attribution_map: "tensor"
+  attribution_hash: "sha256"
+  request_params: "dict"
 
-acceptance:
-  every_claim_has_citation: true
-  citations_resolve_to_retrieval_hits: true
-  claims_supported_by_cited_excerpts: true        # claim-level validation
-  no_fabricated_source_ids: true
+post_processing:
+  must_run_sanity_check_before_showing_to_human: true    # attribution_sanity_check を必ず前段に
 
 agent_authorization:
-  L1: "query_and_report_only"
-  L2: "query_and_use_response_within_domain_scope"
-  L3:
-    can_query_extended_scope: "with_prior_approval"
-    cannot_disable_hallucination_gate: "forbidden_all_levels"
-  never_allowed:
-    - "call_fm_without_retrieval"
-    - "post_edit_fm_response_to_add_citations"
-    - "silently_drop_uncited_sentences"
+  L1: "run_with_default_params"
+  L2: "run_and_choose_method_within_allowed"
+  L3: "modify_baseline_or_steps_with_prior_approval"
 
 provenance:
-  fm_query_provenance:
-    prompt_hash: "sha256"
-    response_language: "str (e.g., ja, en)"
-    retrieval_hits:                               # 各 hit の再現性フィールドを列挙
-      - source_id: "str"
-        chunk_id: "str"
-        chunk_sha256: "str"
-        embedding_model_id: "str"
-        embedding_index_version: "str"
-        corpus_snapshot_id: "str"
-        retriever_config_hash: "str"
-        rank: "int"
-        score: "float"
-    fm_response_text_hash: "sha256"
-    citations_extracted: "list"
-    unknown_citations: "list"
-    unsupported_claims: "list"
-    hallucination_flags: "list"
-    faithfulness_score: "float"
-    confidence_estimate: "float"
-    combined_gate: "pass | warn | stop"
-    action_taken: "continue | review_recommended | route_to_human | route_to_human_no_source_available"
-    fm_model_provenance_ref: "id (from fm_fetch_and_verify)"
+  layer_attribution:                       # 第5章 3 レイヤ + Ch07 Layer 4 + Ch09 bayesian_inference_config
+                                           # と同じ「拡張ブロック」パターン
+    method: "grad_cam | integrated_gradients | shap_deep"
+    method_selection_reason: "text"
+    request_params: "full dict"
+    attribution_hash: "sha256"
+    sanity_check_result_ref: "path_to_attribution_sanity_check_output"
+    target_class: "int"
+    target_layer_for_grad_cam: "layer_name or null"
 ```
-
-> [!IMPORTANT]
-> **`post_edit_fm_response_to_add_citations` の禁止**は極めて重要です。エージェントが「citation なしの claim」に事後で citation を貼ると、検証プロトコル全体が崩壊します。**FM の生 response と、citation 抽出結果は分けて保存**し、後付けでは editable にしません。
 
 ---
 
-## 11.7 `fm_update_gate` — FM 更新の受け入れ判断
+## 11.6 Reliability Diagram（第9章 `calibration_check` の可視化）
 
-FM は数週間〜数か月で新バージョンが出ます。エージェントが自動で受け入れると、下流タスクの動作が静かに変わります。
+第9章で ECE / Brier score を計算しました。Human 説明資料には **reliability diagram**（横軸 predicted probability bin、縦軸 empirical accuracy）を必ず添えます。
 
-### 判断フロー
+```python
+# reliability_diagram.py
+import numpy as np
 
-```mermaid
-flowchart TB
-    A["新バージョン FM 検出"] --> B["fm_fetch_and_verify で候補取得"]
-    B --> C{"重み署名 + license OK?"}
-    C -->|"NO"| Z["reject"]
-    C -->|"YES"| D["ベンチマーク実行<br/>(社内タスク N 種)"]
-    D --> E{"全ベンチマーク<br/>tolerance 内?"}
-    E -->|"NO"| F["Human 判断へ<br/>(defer_to_human)"]
-    E -->|"YES, かつ<br/>差分小"| G["shadow deploy<br/>(候補と旧を並行実行)"]
-    G --> H{"shadow N 日で<br/>矛盾率 < 閾値?"}
-    H -->|"NO"| F
-    H -->|"YES"| I["Human 最終承認"]
-    I -->|"approve"| J["accept<br/>本番切替"]
-    I -->|"defer"| F
-    F --> K["Human が承認 or 却下"]
+
+def assign_calibration_bins(
+    confidences: np.ndarray,
+    n_bins: int = 15,
+    strategy: str = "uniform",
+) -> dict:
+    """
+    ECE 計算と reliability diagram で **共有** する bin 割当関数。
+    - bin 定義は Ch8 と合わせて (lo, hi]（左開右閉）
+    - strategy="quantile" の場合、重複 edge を検出して effective bin 数を返す
+
+    Ch8 の ECE 関数もこの関数を呼び出すこと。両者が別実装だと bin 定義が食い違い、
+    Human 資料の数字が本文と合わなくなる。
+    """
+    if strategy == "uniform":
+        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+        duplicate_edges = 0
+    else:  # quantile
+        raw_edges = np.quantile(confidences, np.linspace(0.0, 1.0, n_bins + 1))
+        raw_edges[0], raw_edges[-1] = 0.0, 1.0
+        unique_edges = np.unique(raw_edges)
+        duplicate_edges = len(raw_edges) - len(unique_edges)
+        bin_edges = unique_edges
+    effective_n_bins = len(bin_edges) - 1
+
+    # (lo, hi] semantics: 各 conf c に対して最大の m で bin_edges[m] < c <= bin_edges[m+1]
+    # np.searchsorted(side="left") で bin_edges[m] < c を満たす最小 m を得て、-1 で境界に含める
+    bin_ids = np.searchsorted(bin_edges, confidences, side="left") - 1
+    bin_ids = np.clip(bin_ids, 0, effective_n_bins - 1)
+    # 完全一致で 0 になったもの（c == 0.0）は bin 0 に含める
+    return {
+        "bin_edges": bin_edges,
+        "bin_ids": bin_ids,
+        "effective_n_bins": effective_n_bins,
+        "duplicate_edges": duplicate_edges,
+        "strategy": strategy,
+        "inclusivity": "(lo, hi]",
+    }
+
+
+def reliability_diagram_data(
+    probs: np.ndarray,               # (N, K) predicted probabilities
+    labels: np.ndarray,              # (N,) true class indices
+    n_bins: int = 15,
+    strategy: str = "uniform",       # "uniform" | "quantile"（クラス不均衡時は quantile 推奨）
+) -> dict:
+    """
+    bin ごとに (confidence_mean, accuracy, count) を返す。
+    第9章 ECE と bin 定義を共有（assign_calibration_bins 経由）。
+    """
+    predictions = probs.argmax(-1)
+    confidences = probs.max(-1)
+    correct = (predictions == labels).astype(np.float32)
+
+    binning = assign_calibration_bins(confidences, n_bins=n_bins, strategy=strategy)
+    bin_edges = binning["bin_edges"]
+    bin_ids = binning["bin_ids"]
+    effective_n_bins = binning["effective_n_bins"]
+
+    out = {
+        "bin_low": [], "bin_high": [], "conf_mean": [], "accuracy": [], "count": [],
+        "strategy": strategy,
+        "effective_n_bins": effective_n_bins,
+        "duplicate_edges": binning["duplicate_edges"],
+        "inclusivity": binning["inclusivity"],
+    }
+    for m in range(effective_n_bins):
+        mask = bin_ids == m
+        n_m = int(mask.sum())
+        out["bin_low"].append(float(bin_edges[m]))
+        out["bin_high"].append(float(bin_edges[m + 1]))
+        out["count"].append(n_m)
+        if n_m == 0:
+            out["conf_mean"].append(float("nan"))
+            out["accuracy"].append(float("nan"))
+        else:
+            out["conf_mean"].append(float(confidences[mask].mean()))
+            out["accuracy"].append(float(correct[mask].mean()))
+    return out
 ```
 
-### 契約 YAML
+### Human 説明資料への埋め込み
+
+reliability diagram は以下 3 情報を必ず併記：
+
+- **bin 定義**（uniform / quantile、n_bins）— 第9章 ECE と揃える
+- **各 bin のサンプル数**（sparse な bin は解釈注意）
+- **temperature scaling 前後**（§9.5）— 校正の効果を Human に示す
+
+> [!TIP]
+> **reliability diagram を Human に見せるだけでは不十分**です。「diagonal から離れている = miscalibrated」を口頭で説明する Skill が別途必要。`deep_report_template` §11.8 で「reliability diagram → 3 文の自動解釈」を組み込みます。
+
+---
+
+## 11.7 Human-in-the-loop 拡張：誤判定流し戻し UX
+
+第9章 gate で `route_to_human` になったサンプルを、Human が判定できる形で提示する Skill。
+
+### `human_handback_review` の Skill 契約
 
 ```yaml
-# fm_update_gate.yaml
-skill: "fm_update_gate"
+# human_handback_review.yaml
+skill: "human_handback_review"
 version: "1.0.0"
 
 trigger:
-  new_revision_detected: true
-  scheduled_review_interval_days: 30
+  from_uncertainty_stop_gate: true                # Ch8 §9.8
+  from_domain_gap_gate: true                      # Ch7 §8.5（review 判定）
+  from_calibration_drift: true                    # Ch10 §11.9 レポート監視
 
-verification_pipeline:
-  step_1_signature:
-    reference: "fm_fetch_and_verify.yaml"
-    fatal_on_fail: true
-  step_2_benchmarks:
-    tasks: "organization_defined_benchmark_suite"
-    min_tasks: 3
-    per_task_tolerance:
-      metric_delta_max_relative: 0.05         # ベースライン比 ±5% 内
-    stratify_by: ["instrument", "task_type"]
-  step_3_shadow_deploy:
-    sampling_semantics:
-      mode: "duplicated_shadow_traffic"           # 本番 request を「複製」して両モデルで実行
-      user_facing_traffic_uses: "old_only"        # 新 FM は user 応答には未反映
-      eligible_traffic_filter: "production_queries_of_the_target_task"
-    parallel_call_ratio: 0.1                      # 本番 request の 10% を複製して並行実行
-    duration_days: 7
-    min_shadow_samples_total: 5000                # 期間だけでなく最小サンプル数を要求
-    min_samples_per_stratum: 200                  # instrument / task_type の各層で
-    stratify_by: ["instrument", "task_type"]
-    disagreement_metric:
-      formula: "1 - agreement_rate"
-      agreement_rate: "count(old.answer == new.answer) / count(both_answered)"
-      denominator_excludes: ["both_returned_unknown", "either_errored"]
-      confidence_interval: "wilson_95pct"
-      max_disagreement_rate: 0.05                 # CI 上限が 0.05 を超えたら fail
-    expected_baseline_disagreement: 0.02          # 事前想定
-    detectable_effect_size: 0.03                  # 検出したい実効差
-    early_stop_if_worse: true
-    early_stop_trigger: "wilson_lower_ci > max_disagreement_rate"
-  step_4_human_approval:
-    required: true
-    reviewers_min: 2
-    provenance_snapshot_shown: true
-    downstream_impact_analysis_shown: true    # 依存 Skill の影響予測
+human_ui_required_fields:
+  # Human が「見て・判断できる」ための最小構成
+  always_shown:
+    - "sample_id"
+    - "raw_input_view"                              # 画像なら thumbnail、スペクトルなら plot
+    - "predicted_class_with_top_k_probabilities"    # k=5 程度
+    - "predictive_entropy_normalized"
+    - "mutual_information"
+    - "max_softmax_uncertainty"
+    - "domain_gap_score"                            # Ch7 との連動
+    - "attribution_sanity_check_result"             # §11.4 の pass/fail と類似度
+    - "nearest_training_samples"                    # k=5、Human が「似たサンプルはこう分類された」を確認
+    - "recent_calibration_diagram_ref"              # §11.6
+    - "model_version_and_provenance_summary"
+    - "triggered_gate_names_and_thresholds"
+  shown_only_if_sanity_pass:
+    - "attribution_map"                             # §11.5 の grad_cam 等
+  shown_only_if_sanity_fail:
+    - "attribution_hidden_reason"                   # 例: "spearman |rho| = 0.42 > 0.3"
+    - "sanity_fail_summary"                         # どのテストで fail、similarity score
 
-decision_matrix:
-  all_steps_pass_and_human_approve: "accept"
-  benchmark_fail_or_shadow_fail: "defer_to_human"
-  signature_fail: "reject"
-  human_reject: "reject_and_log_rationale"
+human_actions_allowed:
+  - approve_prediction                              # 予測が正しい
+  - correct_label                                   # 別のラベルに修正（下記 required_fields_for 参照）
+  - reject_sample                                   # このサンプルは学習に使わない
+  - request_more_info                               # queue に戻して別 Human に回す
+  - flag_for_model_retraining                       # L3 承認ワークフローへ
 
-rollback_contract:                                # accept 後の regression 対応
-  monitored_metrics_after_accept:
-    - "downstream_hallucination_flag_rate"
-    - "downstream_confidence_distribution_shift"
-    - "downstream_review_duration"                # Ch10 の QC signal
-  rollback_trigger:
-    hallucination_flag_rate_relative_increase_max: 0.20
-    monitoring_window_days: 7
-  rollback_procedure:
-    who_can_trigger: "MCP admin OR on-call engineer with quorum >= 2"
-    action: "fm.set_default_version <- previous_approved_version"
-    requires_signed_emergency_decision: true      # rollback も fm_update_gate_decision の一種
-    audit_event: "fm_rollback (append-only)"
-  old_version_retention:
-    minimum_days_after_accept: 30                 # rollback 可能な期間
-  silent_downgrade_forbidden: true
+required_fields_for:
+  correct_label:                                    # append-only, 学習データ即時変更は禁止
+    - "corrected_label"                             # 修正後のラベル
+    - "label_ontology_version"
+    - "reviewer_confidence"                         # low | medium | high
+    - "rationale_free_text"
+    - "proposal_only_flag: true"                    # データ即時 mutation は不可
+                                                    # 学習データ反映は curator/L3 承認を経由
+
+acceptance:
+  attribution_map_shown_iff_sanity_pass: true       # pass 時のみ表示、fail 時は非表示
+  hallucinating_samples_must_be_flagged: true      # sanity fail サンプルは attribution を表示せず uncertainty のみ提示
+  human_must_view_uncertainty_and_sanity_result: true  # UI で表示済みかログで検証
+  review_duration_used_as_qc_signal_only: true     # 短時間 review は「監査 QC 信号」であり自動無効化条件ではない
+                                                    # random audit sampling で品質チェック
+  required_view_events_logged: true                # どのフィールドを表示・スクロールしたかログ
 
 agent_authorization:
-  L1: "read_only_report"
-  L2: "run_verification_pipeline_but_not_switch"
+  L1: "prepare_ui_and_wait_for_human"
+  L2:
+    action: "prepare_ui_and_record_human_decision_append_only"
+    forbidden: "directly_mutating_training_data_or_labels"      # curate/L3 承認経由のみ
   L3:
-    can_recommend_accept: true
-    cannot_switch_production_without_human: "forbidden_all_levels"
+    action: "same_as_L2 + trigger_retraining_after_separate_curator_approval"
+    forbidden: "auto_apply_correct_label_to_training_set_without_curator_sign_off"
   never_allowed:
-    - "auto_accept_without_human"
-    - "skip_shadow_deploy"
-    - "reduce_benchmark_min_tasks"
-    - "silently_downgrade_after_accept"
+    - "auto_approve_without_human"                # Ch4 §5.7 の absolute rule
+    - "modify_human_review_record_after_write"    # 監査要件
+    - "reduce_ui_snapshot_hash_scope"             # 表示内容の改ざん不可性
 
 provenance:
-  fm_update_gate_decision:
-    old_fm_provenance_ref: "id"
-    new_fm_provenance_ref: "id"
-    benchmark_results_hash: "sha256"
-    shadow_deploy_disagreement_rate: "float"
-    human_reviewers_hashed: "list"
-    decision: "accept | defer_to_human | reject"
-    decision_timestamp: "iso8601"
-    downstream_impact_summary_ref: "id"
+  layer_human_review:                             # 拡張ブロック
+    human_reviewer_id_hashed: true
+    review_timestamp: true
+    ui_snapshot_hash: true                        # 何を見せたかの改ざん不可性
+    displayed_attribution_hash_or_null: true      # sanity fail 時は null
+    attribution_display_state: "shown | hidden_due_to_sanity_fail"
+    displayed_sanity_check_result: true
+    displayed_field_view_events: true             # スクロール・focus ログで required 表示を検証
+    human_action_selected: "one of human_actions_allowed"
+    correct_label_payload_if_any:                 # correct_label 選択時のみ
+      corrected_label: true
+      label_ontology_version: true
+      reviewer_confidence: true
+      rationale_free_text: true
+      proposal_only_flag: true
+    human_free_text_comment_optional: true
+    review_duration_seconds: true                 # QC 信号（自動無効化には使わない）
+    subsequent_agent_action_ref: "id"
+```
+
+> [!IMPORTANT]
+> **`attribution_hallucinating_samples_must_be_flagged`** は特に重要です。サニティチェック（§11.4）に失敗した attribution を Human に見せると、Human は "誤った説明" を信じてしまい、逆に判定精度が下がる（Poursabzi-Sangdeh et al., 2021）。**Fail サンプルでは attribution を表示せず uncertainty と最近傍訓練サンプルのみを提示**します。
+
+### Human 流し戻しシーケンス
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant G as Gates (Ch7 + Ch8)
+    participant F as feature_attribution
+    participant S as attribution_sanity_check
+    participant U as Human UI
+    participant H as Human
+    participant P as Provenance store
+
+    A->>G: predict + uncertainty
+    G-->>A: route_to_human
+    A->>F: attribution(x, method)
+    F-->>A: attribution_map + hash
+    A->>S: sanity_check(attribution, model)
+    S-->>A: pass|fail + similarity
+    alt sanity check pass
+        A->>U: display: input + attribution + uncertainty + neighbors
+    else sanity check fail
+        A->>U: display: input + [attribution hidden] + uncertainty + neighbors + warning
+    end
+    U->>H: 上記を表示
+    H-->>U: 選択 (approve / correct_label / reject / request_more_info / flag_for_retraining)
+    U->>P: ui_snapshot_hash + human_action + duration を記録
+    P-->>A: subsequent_agent_action_ref
+```
+
+---
+
+## 11.8 深層レポートテンプレート `deep_report_template`
+
+第4-10 章の全 provenance + Human review + attribution + uncertainty を集約する監査可能レポート。
+
+### レポート構造
+
+```yaml
+# deep_report_template.yaml
+sections:
+  - id: "0_summary"
+    content:
+      - model_task
+      - report_period
+      - overall_metrics
+      - counts_of_human_handbacks
+      - counts_of_gate_stops
+
+  - id: "1_environment"
+    reference: "Ch4 Layer 1"
+    fields:
+      - "gpu_backend.*"
+      - "cudnn_deterministic"
+      - "torch_deterministic_algorithms"
+      - "random_seed_per_worker"
+
+  - id: "2_pretrained_weights"
+    reference: "Ch4 Layer 2 + Ch7 §8.4"
+    fields:
+      - "weights_uri"
+      - "revision (commit hash)"
+      - "weights_sha256 (verified: true/false)"
+      - "weights_license"
+      - "pretraining_data_license"
+
+  - id: "3_training_and_inference"
+    reference: "Ch4 Layer 3 + Ch7 Layer 4 (transfer) + Ch9 bayesian_inference_config"
+    fields:
+      - "finetune_config"
+      - "augmentation_config"
+      - "transfer_learning.*"
+      - "bayesian_inference_config.*   # if applicable"
+
+  - id: "4_uncertainty_and_calibration"
+    reference: "Ch8 + Ch9"
+    fields:
+      - "calibration_ece"
+      - "brier_score"
+      - "reliability_diagram_image_ref"
+      - "temperature_value"
+      - "uncertainty_method_selected"        # from Ch9 selection table
+      - "uncertainty_stop_gate_thresholds"
+
+  - id: "5_gate_activity"
+    reference: "Ch7 + Ch8"
+    fields:
+      - "domain_gap_gate_pass_review_stop_counts"
+      - "uncertainty_stop_gate_activation_counts"
+      - "combined_admission_policy_state"
+
+  - id: "6_attribution"
+    reference: "§11.5"
+    fields:
+      - "method_used"
+      - "sanity_check_pass_rate"
+      - "sample_attribution_gallery_ref"
+      - "hallucinating_samples_count"
+
+  - id: "7_human_review"
+    reference: "§11.7"
+    fields:
+      - "human_handbacks_total"
+      - "action_distribution"                # approve / correct_label / reject / ...
+      - "median_review_duration_seconds"
+      - "correct_label_rate_indicating_model_error"
+      - "flagged_for_retraining_count"
+
+  - id: "8_provenance_integrity"
+    fields:
+      - "all_provenance_files_hash_chain_valid"
+      - "any_missing_layer_detected"        # 監査で fatal
+      - "any_agent_authorization_violation_detected"
+
+  - id: "9_narrative_auto_generated"
+    reference: "§11.6 TIP"
+    content:
+      - reliability_diagram_interpretation_3_sentences
+      - uncertainty_trend_interpretation_3_sentences
+      - human_handback_reason_top_3
+
+immutability:
+  once_signed_by_human: true
+  amendments_allowed_via: "appended_change_log_only"
+  hash_chain_required: true
+
+agent_authorization:
+  L1: "generate_and_display"
+  L2: "generate_and_submit_for_human_review"
+  L3: "generate_and_countersign"
+  never_allowed:
+    - "modify_prior_signed_report"          # 監査
+    - "omit_any_section"                    # fatal if any section missing
+```
+
+### 生成コード（骨子）
+
+```python
+# deep_report.py — 実装骨子
+def generate_deep_report(
+    provenance_bundle: dict,   # Ch4-9 の provenance を全て含む
+    attribution_bundle: dict,  # §11.5-10.7 の attribution artifacts
+    human_review_bundle: dict, # §11.7 の Human 判定ログ
+    previous_report_hash: str | None,
+    renderer_version: str,
+    output_format: str = "html",
+) -> str:
+    # 全 bundle と renderer をカバーする **report manifest** を先に構築し、hash chain の根とする
+    manifest = {
+        "provenance_bundle_hash": _hash_content(provenance_bundle),
+        "attribution_bundle_hash": _hash_content(attribution_bundle),
+        "human_review_bundle_hash": _hash_content(human_review_bundle),
+        "previous_report_hash": previous_report_hash,
+        "renderer_version": renderer_version,
+    }
+    manifest_hash = _hash_content(manifest)
+
+    _assert_all_required_sections_present(provenance_bundle, attribution_bundle, human_review_bundle)
+    _assert_hash_chain_valid(provenance_bundle)
+    _assert_attribution_artifact_hashes_match(attribution_bundle)   # UI snapshot と保存物の一致
+    _assert_ui_snapshot_hashes_present(human_review_bundle)         # 全レビューに snapshot hash
+    _assert_no_agent_auth_violation(provenance_bundle)
+
+    body = _render_sections(provenance_bundle, attribution_bundle, human_review_bundle)
+    narrative = _generate_narrative_3_sentences_per_topic(body)      # slot-fill 固定テンプレート
+    report = _compose(body, narrative, manifest, output_format)
+    report_root_hash = _hash_content((report, manifest_hash))
+    _register_in_immutable_store(report, manifest, report_root_hash)
+    return report
 ```
 
 > [!WARNING]
-> **FM 更新の "静かな受け入れ" は最も危険な失敗モードの 1 つ**です。新 FM は同じインタフェースで違う応答を返し、下流の Skill・レポート・Human 判断がすべて "旧 FM の癖" に依存している可能性があります。`fm_update_gate` は Ch7 `pretrained_weights` の pre-check より **一段厳しく**設計（shadow deploy を挟む）。
+> **`_generate_narrative_3_sentences_per_topic` は決定論的テンプレートで書く**こと。LLM に自由生成させると hallucination が入り、監査レポートとして無効化されます。「reliability diagram の bin X〜Y でズレが Z」のような slot-fill 型固定テンプレートに限定します。
 
 ---
 
-## 11.8 vol-01 第10章文献照合 Skill との接続
+## 11.9 レポートの継続監視 — calibration drift と Human review 傾向
 
-vol-01 第10章では arXiv / Paper Search MCP を使い、AI 生成テキストの各主張を論文と照合しました。本章 `fm_query` はこれを **FM 出力に対する retrieval + citation + faithfulness** に拡張しています。
+深層モデルは運用中に **calibration drift**（時間経過で ECE が上昇）や **Human review 傾向の変化**（"correct_label" が急増 = モデル誤り増加）を起こします。
 
-| 論点 | vol-01 第10章 | vol-03 第11章 |
+### 監視 Skill `deep_operational_monitor`
+
+```yaml
+# deep_operational_monitor.yaml
+skill: "deep_operational_monitor"
+version: "1.0.0"
+
+monitors:
+  - name: "calibration_drift"
+    metric: "weekly_ece"
+    baseline: "rolling_reference_ece_last_4_weeks_pre_deployment"   # training-time 単発ではなく rolling window
+    alert_relative_increase: 0.5            # ベースライン比 +50% で alert
+    min_samples_per_window: 200             # サンプル数不足時は alert 抑止
+    confidence_interval: "bootstrap_95pct"  # 単点比較ではなく CI で判定
+    stratify_by: ["instrument", "class"]    # 全体は OK でも装置別/クラス別にズレがないか
+    delayed_label_policy: "wait_up_to_14_days_then_compute"
+
+  - name: "human_correct_label_rate_spike"
+    metric: "correct_label_count / handback_count"
+    window: "rolling_7_days"
+    alert_threshold_absolute: 0.3           # 30% 以上が correct_label なら alert
+    min_handbacks_in_window: 30             # 分母が小さいときは alert 抑止
+    denominator_zero_behavior: "no_alert"
+    stratify_by: ["reviewer_cohort", "class"]
+
+  - name: "attribution_sanity_check_fail_rate_spike"
+    metric: "sanity_fail_count / total_attributions"
+    alert_threshold: 0.2                    # 20% 以上失敗で alert
+    min_samples_per_window: 100
+    stratify_by: ["method"]                 # grad_cam / IG / shap 別
+
+  - name: "gate_stop_rate_spike"
+    metric: "uncertainty_stop_gate_activation / total_predictions"
+    alert_relative_increase: 1.0            # 倍以上で alert
+    min_predictions_per_window: 500
+    stratify_by: ["instrument"]
+
+on_alert:
+  - notify_human
+  - freeze_agent_autonomous_decisions_at_L2   # L2 は L1 相当に一時降格
+  - trigger_deep_report_special_edition
+  - never_auto_retrain                        # 再学習は必ず Human 承認 (Ch7/9 継承)
+
+agent_authorization:
+  L1: "read_only"
+  L2: "read_only"
+  L3:
+    can_adjust: "monitor_alert_thresholds_with_prior_approval_and_appended_change_log"
+    cannot_adjust:                            # Ch8 gate 閾値は全レベル不可（Ch8 §9.9 継承）
+      - "uncertainty_stop_gate_thresholds"
+      - "domain_gap_gate_thresholds"          # Ch7 §8.5 継承
+      - "attribution_sanity_check_similarity_thresholds"   # §11.4 継承
+    cannot_use_threshold_change_to_clear_active_alert: true  # alert を隠すための閾値変更禁止
+```
+
+---
+
+## 11.10 vol-01 第6章 3 原則の深層拡張表
+
+| vol-01 3 原則 | 深層拡張（本章） |
+|---|---|
+| **疑わしいときは Human** | Ch7 domain_gap_gate + Ch8 uncertainty_stop_gate + §11.9 drift monitor が **多層で** trigger、単一 confidence 閾値に頼らない |
+| **決めるのは Human** | §11.7 `human_handback_review` で最小提示情報を規定、attribution / uncertainty / neighbors すべてを見た上での判定を強制。sanity check fail 時は attribution 非表示 |
+| **記録は改ざん不可** | §11.8 `deep_report_template` の hash chain、`once_signed_by_human` の不変性、appended change log のみ許可、agent は署名済みレポートを変更不可 |
+
+---
+
+## 11.11 失敗パターンと対策
+
+| 失敗 | 症状 / 兆候 | 対策 |
 |---|---|---|
-| 対象 | AI 生成の文献レビュー | FM 応答全般（生成 or 要約 or 抽出） |
-| Retrieval source | arXiv API | arXiv MCP + 社内 DB + Hugging Face Datasets |
-| Citation | 論文 DOI / arXiv ID | 一般化された `source_id` |
-| Hallucination 検知 | 論文の実在チェック | citation 実在 + faithfulness + confidence |
-| 監査 | 記録 | Ch10 `deep_report_template` に統合 |
-
-**共通哲学**：*生成物は生成物であって事実ではない。事実は必ず外部ソースから引く。*
-
----
-
-## 11.9 vol-02 第15章「モデル配布」との接続
-
-vol-02 第15章では「モデルを配る側」と「受け取る側」の責任分担を議論しました。FM は以下の点で特殊です：
-
-| 論点 | vol-02 一般モデル配布 | 本章 FM |
-|---|---|---|
-| 更新頻度 | 数か月〜1年 | 数週間〜数か月 |
-| 更新影響 | 特定タスク | 下流全 Skill |
-| 検証コスト | ベンチマーク再実行 | ベンチマーク + shadow deploy 必須 |
-| ライセンス | 明示的な同意プロセス | 変更されうる（Hub 上で書き換え可能） |
-| Human 承認 | 導入時のみ | 導入時 + 各更新時 |
-
-本章 `fm_update_gate` は vol-02 第15章のフレームを **FM の高頻度更新に耐える形**に強化したものです。
+| Grad-CAM を Transformer に適用して意味不明な map | attribution map が入力と無関係 | §11.5 `_validate_method_vs_architecture` で fatal |
+| Sanity check を通さず attribution を Human に提示 | Human が hallucinating attribution を信じる | §11.7 `attribution_hallucinating_samples_must_be_flagged` |
+| IG の baseline を勝手に変える | attribution 値が別物になる | provenance に必ず記録、L2 は変更不可 |
+| reliability diagram の bin 定義が ECE と食い違う | Human 資料の数字が本文と合わない | §11.6 で bin_edges strategy を明示、ECE と同一関数から生成 |
+| Human review が数秒で終わる（形式的承認） | `review_duration_seconds` が異常に短い | `human_review_time_min_seconds: 5` acceptance |
+| 深層レポートの一部セクション欠落 | 監査時に "その項目は記録されなかった" | §11.8 `never_allowed: omit_any_section` fatal |
+| 署名済みレポートを agent が上書き | 監査ログが変わる | `never_allowed: modify_prior_signed_report`、hash chain |
+| narrative を LLM 自由生成 | hallucination が監査対象に混入 | §11.8 warning、slot-fill 固定テンプレートのみ |
+| drift monitor 発動でも autonomous 継続 | Ch8 gate と同じ暴走リスク | §11.9 `freeze_agent_autonomous_decisions_at_L2` |
+| 誤判定サンプルを Human に流さず agent が押し切る | `bypass_human_handback` | §11.7 `never_allowed: auto_approve_without_human` |
+| Human が correct_label を大量に返し始めたのに再学習しない | drift 検知遅延 | §11.9 `human_correct_label_rate_spike` monitor |
+| attribution artifact のハッシュ検証をスキップ | Human に見せた map と保存された map が違う可能性 | §11.7 `displayed_attribution_hash` を UI snapshot に含める |
 
 ---
 
-## 11.10 失敗パターンと対策
+## 11.12 まとめ
 
-| 失敗 | 症状 / 兆候 | 対策（参照する契約フィールド） |
-|---|---|---|
-| `revision: "main"` / 短縮 SHA で fetch | 同じバージョン名で違う重みが降ってくる | `revision_must_be_40hex_commit_sha: true` + `hub_api_resolved_sha_must_match_revision` |
-| `.bin` / `.pt` を trust_remote_code で読む | 任意コード実行の脆弱性 | `safetensors_only` + `trust_remote_code_forbidden` + `load_bin_or_pt_files: never_allowed` |
-| ライセンス表示を Hub API から取得したが manifest と不一致 | 監査でライセンス違反発覚 | `license_from_manifest_matches_hub_advisory` + `model_card_file_sha256_matches_manifest` |
-| エージェントが自作 manifest を渡して検証をバイパス | 承認プロセス空洞化 | `manifest_from_signed_registry_only` + `manifest_approver_quorum_min: 2` |
-| Retrieval 0 件で FM 呼び出し | citation 皆無で hallucination | `insufficient_retrieval_hits` monitor（`fm_query` 事前ガード） |
-| FM 単体呼び出しで hallucination | citation なし応答が下流に流れる | `retrieval_before_fm_call: true` fatal + `call_fm_without_retrieval: never_allowed` |
-| citation が実在しない ID | ハルシネーション典型例 | `unknown_citations` を `missing_or_invalid_citation` flag に |
-| citation は real だが excerpt が主張を支持しない | subtle fabrication | `unsupported_claim_despite_citation` flag（claim-level validation） |
-| citation を後付けで貼る | プロトコル崩壊 | `post_edit_fm_response_to_add_citations: never_allowed` |
-| `fm_update_gate` の shadow deploy をスキップ | 静かな挙動変化 | `skip_shadow_deploy: never_allowed` + `min_shadow_samples_total` + `min_samples_per_stratum` |
-| FM 更新を自動 accept | 下流破壊 | `auto_accept_without_human: never_allowed` + `reviewers_min: 2` |
-| Accept 後の regression を silent downgrade | 監査不能 | `rollback_contract` + `silent_downgrade_forbidden` + `old_version_retention.minimum_days_after_accept` |
-| CrystaLLM が物理的に不整合な CIF を出力 | 対称性・密度・結合角が破綻 | `crystal_physical_validation` の 7 validator（cif_parser / charge / density / bond_length / bond_angle / symmetry / allowed_elements） |
-| Faithfulness score だけを信じて Human 送りしない | subtle hallucination を見逃す | `combined_gate` tri-state + 任意の stop 条件 で `route_to_human` |
-| MCP 経由呼び出しの監査ログが欠落 | 誰が何を FM に聞いたか追跡不能 | MCP 側で全問い合わせを **caller identity + method + decision ID + timestamp** で append-only ログに（付録B） |
-| FM が UNKNOWN を返すべき場面で無理に答える | user pleasing hallucination | system prompt で control token `{"answer_status": "unknown"}` を明示 + logprob 低下時の flag |
-| pretraining data license を manifest に書かず配布 | 下流ライセンス違反 | `pretraining_data_license` manifest 必須 |
-| FM ベンチマークが1つのタスクのみ | 特定タスクの偽陽性で accept | `min_tasks: 3` + `stratify_by` + `reduce_benchmark_min_tasks: never_allowed` |
+- Attribution は **CAM / IG / SHAP** の 3 系統。モデル系統との整合を Skill で fatal assert
+- Attribution は hallucinate しうる（Adebayo 2018）。**model / data / cascading randomization** の 3 サニティチェックを契約に組み込み、fail サンプルは Human に attribution を表示しない
+- Reliability diagram の bin は第9章 ECE と同一関数から生成。**temperature 前後を併記**
+- **`human_handback_review`** は Human が「予測 + attribution + uncertainty + 類似訓練サンプル」を見た上で判定する UX を規定。判定は改ざん不可
+- **`deep_report_template`** は Ch4-10 の全 provenance を集約。hash chain + `once_signed_by_human` で監査可能
+- **`deep_operational_monitor`** で calibration drift / correct_label 増加 / sanity check fail 率 / gate stop 増加を継続監視、alert 時は L2 → L1 一時降格
+- vol-01 第6章の 3 原則を、深層特有の **多層 gate + attribution 検証 + hash chain レポート**として拡張
 
----
+## 11.13 章末チェックリスト
 
-## 11.11 まとめ
+- [ ] `feature_attribution` は architecture-method 整合を fatal assert しているか
+- [ ] `attribution_sanity_check` の 3 テスト（model / cascading / data randomization）がすべて通っているか
+- [ ] Sanity check fail 時に attribution を Human に**見せていない**か
+- [ ] reliability diagram の bin 定義が第9章 ECE と一致しているか
+- [ ] `human_handback_review` の UI snapshot hash が provenance に記録されているか
+- [ ] `deep_report_template` の全セクションが揃っているか（omit_any_section = fatal）
+- [ ] narrative が slot-fill 固定テンプレートで生成されているか（LLM 自由生成禁止）
+- [ ] `deep_operational_monitor` の alert 発動で agent 権限が一時降格するか
+- [ ] Human review duration が min_seconds を満たしているか
+- [ ] レポート署名後の変更が append-only change log に限定されているか
 
-- Foundation Model は **vol-01 文献照合 + vol-02 モデル配布** の議論の合流点
-- **MatBERT / CrystaLLM / ChemBERTa** はタスク特性で使い分け、生成系（CrystaLLM）は物理検証必須
-- **`fm_fetch_and_verify`** は commit hash + safetensors 限定 + manifest 事前承認で pretrained weight 検証を FM に強化
-- **`fm_query`** は retrieval-augmented + citation 強制 + faithfulness で hallucination を検知
-- **`fm_update_gate`** は signature → benchmark → shadow deploy → Human 承認の 4 段階
-- MCP 経由呼び出しで **権限分離 + 監査ログ**、実装は付録B
-- FM 特有の失敗パターン 13 件を Skill 契約で予防
+## 11.14 ワーク
 
-## 11.12 章末チェックリスト
+**W10-1**: 第7章の CNN に対し `feature_attribution(method="grad_cam")` を実装し、`attribution_sanity_check` を回せ。cascading randomization で attribution similarity が単調減少することを確認し、失敗した場合は原因を書け。
 
-- [ ] FM の `revision` は commit hash か（tag / main / branch 拒否）
-- [ ] safetensors ファイルのみ許可しているか、trust_remote_code は False か
-- [ ] manifest が Human 事前承認済みで sha256 + license が固定されているか
-- [ ] `fm_query` は retrieval 前提で citation 必須か
-- [ ] hallucination_flags が複数 monitor で並置され、任意 1 つで Human 送りか
-- [ ] `post_edit_fm_response_to_add_citations` が never_allowed か
-- [ ] `fm_update_gate` は signature → benchmark → shadow deploy → Human の 4 段階を全て通っているか
-- [ ] FM 更新の shadow deploy 期間・並行比率・矛盾率閾値が契約に明記されているか
-- [ ] MCP 経由呼び出しで全問い合わせが append-only 監査ログに書かれているか
-- [ ] CrystaLLM 等の生成系で物理検証 filter を通しているか
+**W10-2**: `reliability_diagram_data` を第9章の `calibration_check` と統合し、temperature scaling 前後の 2 枚を並べた HTML を出力せよ。3 文の自動解釈を slot-fill で書け。
 
-## 11.13 ワーク
+**W10-3**: `human_handback_review` の UI モック（Streamlit / Gradio 等）を作り、`attribution_hallucinating_samples_must_be_flagged` の動作（sanity fail 時に attribution を非表示にすること）を確認せよ。
 
-**W11-1**: MatBERT を Hugging Face Hub から取得し、`fm_fetch_and_verify` の manifest 事前承認 + sha256 検証フローを実装せよ。manifest の 1 バイトを改ざんしたときに fatal assert が発火することを確認せよ。
+**W10-4**: `deep_report_template` を第6-9 章のダミー provenance で埋め、hash chain を検証するテストを書け。1 か所のフィールドを改ざんしたら chain が破綻することを示せ。
 
-**W11-2**: 材料論文の要約タスクで `fm_query` を実装し、citation 抽出と faithfulness score を計算せよ。10 件のうち何件が `route_to_human` に落ちるかを報告せよ。
+**W10-5**: `deep_operational_monitor` の 4 monitor を、ARIM 風合成データで 4 週間分シミュレートせよ。calibration drift alert が発火する条件を作為的に作り、agent 権限が L2 → L1 に降格するログを確認せよ。
 
-**W11-3**: 架空の "新バージョン MatBERT" を用意し、`fm_update_gate` の 4 段階を回して decision matrix の 4 パターン（accept / defer / reject / signature_fail）を全て再現せよ。
+## 11.15 参考資料
 
-**W11-4**: CrystaLLM で結晶構造を 100 個生成し、物理検証 filter（対称性 + 密度 + 結合角）で何個が破棄されるかを計測せよ。filter を Skill 契約に落とせ。
-
-**W11-5**: MCP 経由の `fm.query` を付録B の Python SDK 実装を使って呼び出し、監査ログが append-only で改ざん不能であることを検証するテストを書け。
-
-## 11.14 参考資料
-
-- Beltagy, I., et al. (2020). SciBERT: Pretrained Language Model for Scientific Text. EMNLP.
-- Trewartha, A., et al. (2022). Quantifying the advantage of domain-specific pre-training on named entity recognition tasks in materials science (MatBERT).
-- Antunes, L. M., Butler, K. T., & Grau-Crespo, R. (2024). Crystal structure generation with autoregressive large language modelling (CrystaLLM). Nature Communications.
-- Chithrananda, S., Grand, G., & Ramsundar, B. (2020). ChemBERTa: Large-Scale Self-Supervised Pretraining for Molecular Property Prediction. arXiv.
-- Lewis, P., et al. (2020). Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. NeurIPS.
-- Model Card guidelines — Mitchell, M., et al. (2019). Model Cards for Model Reporting. FAT*.
-- 本書 第4章（3 レイヤ provenance）、第7章（pretrained weights + Layer 4）、第10章（deep_report_template + human_handback_review）
-- vol-01 第10章（arXiv / Paper Search MCP による文献照合）
-- vol-02 第15章（モデル配布と組織的責任分担）
-- 本書 付録B（MCP Python SDK による組織内サーバ実装）
+- Adebayo, J., et al. (2018). Sanity Checks for Saliency Maps. NeurIPS.
+- Selvaraju, R. R., et al. (2017). Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization. ICCV.
+- Sundararajan, M., Taly, A., & Yan, Q. (2017). Axiomatic Attribution for Deep Networks (Integrated Gradients). ICML.
+- Lundberg, S. M., & Lee, S.-I. (2017). A Unified Approach to Interpreting Model Predictions (SHAP). NeurIPS.
+- Kokhlikyan, N., et al. (2020). Captum: A unified and generic model interpretability library for PyTorch. arXiv.
+- Poursabzi-Sangdeh, F., et al. (2021). Manipulating and Measuring Model Interpretability. CHI.
+- Guo, C., et al. (2017). On Calibration of Modern Neural Networks (reliability diagram). ICML.
+- 本書 第5章（3 レイヤ provenance）、第8章（domain_gap_gate + Layer 4）、第9章（uncertainty_stop_gate + calibration）、第10章（bayesian_inference_config）
+- vol-01 第6章（予防的 Human-in-the-loop 3 原則）
+- vol-01 第7章（provenance 5 要素）

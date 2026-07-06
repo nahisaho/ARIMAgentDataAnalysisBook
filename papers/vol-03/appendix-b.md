@@ -3,7 +3,7 @@
 > **本付録の目的**：第4-15章で頻出する PyTorch / JAX (Flax) / Hugging Face の API を **Agentic Skill の provenance・承認ゲート要件**と紐付けたチートシートにまとめ、続いて **MCP (Model Context Protocol) サーバ Python SDK による組織内サーバの最小実装**を提示します。vol-02 §15 で「MCP を作るべきかどうか」の判断基準までを扱ったのに対し、本付録は「作ると決めた後に、Agentic 承認ゲートを MCP レベルで組み込む方法」を扱います。
 
 > [!IMPORTANT]
-> チートシートは「動くコード」の羅列ではなく、**「Skill が Agentic 契約を満たすために必要な API 呼び出しと provenance 記録」**の対応表です。全コードは第4章の agent tier / 第11章の FM 検証 / 第13章の Gate1-3 / 第14章の audit を **API レベルで満たす形**に揃えています。
+> チートシートは「動くコード」の羅列ではなく、**「Skill が Agentic 契約を満たすために必要な API 呼び出しと provenance 記録」**の対応表です。全コードは第5章の agent tier / 第12章の FM 検証 / 第14章の Gate1-3 / 第15章の audit を **API レベルで満たす形**に揃えています。
 
 ---
 
@@ -11,17 +11,17 @@
 
 | 目的 | 参照するセクション | 該当章 |
 |---|---|---|
-| 決定論的な学習ループを PyTorch で書く | B.2.1 - B.2.3 | 第4章・第14章 |
-| DataLoader worker のシード伝播を正しく行う | B.2.4 | 第14章 (DG-01) |
-| Mixed Precision / DDP を有効にしつつ再現性を保つ | B.2.5 - B.2.6 | 第14章 |
-| Checkpoint を append-only で保存 | B.2.7 | 第4章・付録A |
+| 決定論的な学習ループを PyTorch で書く | B.2.1 - B.2.3 | 第5章・第15章 |
+| DataLoader worker のシード伝播を正しく行う | B.2.4 | 第15章 (DG-01) |
+| Mixed Precision / DDP を有効にしつつ再現性を保つ | B.2.5 - B.2.6 | 第15章 |
+| Checkpoint を append-only で保存 | B.2.7 | 第5章・付録A |
 | JAX / Flax で決定論的学習を書く | B.3 | 第6-9章 |
-| Hugging Face から FM を安全に取得する | B.4.1 - B.4.3 | 第11章 |
-| safetensors のみを許可する読み込みパスを組む | B.4.4 | 第11章 (AG-08) |
-| MCP サーバを組織内で最小構成で立てる | B.5.1 - B.5.3 | 第4章・vol-02 §15 |
-| MCP レベルで train / infer 権限を分離する | B.5.4 | 第4章 |
-| MCP に Human 承認 hook を組み込む | B.5.5 | 第13章 |
-| MCP サーバの provenance / audit 対応 | B.5.6 | 第14章 |
+| Hugging Face から FM を安全に取得する | B.4.1 - B.4.3 | 第12章 |
+| safetensors のみを許可する読み込みパスを組む | B.4.4 | 第12章 (AG-08) |
+| MCP サーバを組織内で最小構成で立てる | B.5.1 - B.5.3 | 第5章・vol-02 §15 |
+| MCP レベルで train / infer 権限を分離する | B.5.4 | 第5章 |
+| MCP に Human 承認 hook を組み込む | B.5.5 | 第14章 |
+| MCP サーバの provenance / audit 対応 | B.5.6 | 第15章 |
 
 > [!NOTE]
 > 本付録のコードは **PyTorch 2.x / JAX 0.4.x / transformers 4.35+ / huggingface_hub 0.20+ / mcp SDK 1.0+** を想定しています。バージョンは変わるため、実運用時は該当時点の公式ドキュメントで API 名称と署名を確認してください（変更が破壊的な場合は Skill の `framework_versions.*` を必ず provenance に記録）。
@@ -52,7 +52,7 @@ import torch
 
 def set_deterministic(seed: int) -> None:
     """
-    第4章 §4.5 の再現性条件と Ch14 DG-01 (GPU 非決定性 / cuDNN 非決定性等) 対策。
+    第5章 §5.5 の再現性条件と Ch14 DG-01 (GPU 非決定性 / cuDNN 非決定性等) 対策。
     provenance には次の 7 項目を必ず記録：
       - random_seed (vol-02)
       - numpy_seed / python_hash_seed / random_seed_per_worker (vol-03)
@@ -411,7 +411,7 @@ local_dir = snapshot_download(
 ### B.4.4 safetensors のみを許可し、tokenizer / config も hash 検証するロードパス
 
 > [!IMPORTANT]
-> **hash 検証は weights だけでは不十分**。`tokenizer.json`（BPE merges、追加 special tokens）や `config.json`（vocab_size, rope_theta, num_hidden_layers）、`generation_config.json`（sampling defaults）は改ざんで振る舞いが変わる。**Ch11 §11.4 の canonical manifest は weights + tokenizer + config + generation_config を全て file-level sha256 で pin する**。
+> **hash 検証は weights だけでは不十分**。`tokenizer.json`（BPE merges、追加 special tokens）や `config.json`（vocab_size, rope_theta, num_hidden_layers）、`generation_config.json`（sampling defaults）は改ざんで振る舞いが変わる。**Ch11 §12.4 の canonical manifest は weights + tokenizer + config + generation_config を全て file-level sha256 で pin する**。
 
 ```python
 import hashlib
@@ -745,7 +745,7 @@ def _require_non_agent_approval(
     hp_range_snapshot_hash: str,
 ) -> None:
     """
-    第13章 Gate1 を MCP レベルで強制。
+    第14章 Gate1 を MCP レベルで強制。
     - approval_record_id は 64-hex sha256（形式検証）
     - approval store から non-agent 承認済みかを取得
     - 期限内であること
@@ -793,7 +793,7 @@ def _require_non_agent_approval(
 ```
 
 > [!TIP]
-> Human 承認 UI 自体は本サーバの外部（Web UI + SSO + 電子署名）に置くのが自然です。MCP サーバは「承認済み記録の検証」だけを担当し、「承認手続きそのもの」を担わせないことで責務境界が明確になります（第15章 §15.6 の責任分担 3 分割と一致）。
+> Human 承認 UI 自体は本サーバの外部（Web UI + SSO + 電子署名）に置くのが自然です。MCP サーバは「承認済み記録の検証」だけを担当し、「承認手続きそのもの」を担わせないことで責務境界が明確になります（第16章 §16.6 の責任分担 3 分割と一致）。
 
 ### B.5.6 監査 log と cross-reference
 
@@ -812,7 +812,7 @@ AUDIT_LOG = Path("/var/log/arim-mcp/audit.jsonl")  # append-only（ext4 の chat
 
 def _log_audit_event(tool_name: str, arguments: dict, ctx: "CallerContext") -> None:
     """
-    Ch14 §14.8 audit_result_provenance の元データを吐き出す。
+    Ch14 §15.8 audit_result_provenance の元データを吐き出す。
     - append-only ファイル、prev_hash chain（tamper-evident）
     - fcntl.flock で read-prev + append の critical section を直列化
     - Ch14 canonical: registry_hash_at_run_start を出す
@@ -943,11 +943,11 @@ Client 側（agentic runner）は MCP プロトコルで tool を呼び出しま
 
 ### 本書内の該当章
 
-- 第4章：agent tier 定義、`agent_authorization`, `training_job_approval`, `approved_hp_range`
-- 第11章：Foundation Model 取得、`fm_fetch_and_verify`, `snapshot_download`
-- 第13章：Gate1/2/3 の役割、`integrated_provenance_chain`
-- 第14章：`agentic_deep_failure_audit`, `cross_reference_findings`, 5 種の外部 ledger
-- 第15章：組織 GPU 政策、`model_distribution_contract`, `responsibility_ledger`
+- 第5章：agent tier 定義、`agent_authorization`, `training_job_approval`, `approved_hp_range`
+- 第12章：Foundation Model 取得、`fm_fetch_and_verify`, `snapshot_download`
+- 第14章：Gate1/2/3 の役割、`integrated_provenance_chain`
+- 第15章：`agentic_deep_failure_audit`, `cross_reference_findings`, 5 種の外部 ledger
+- 第16章：組織 GPU 政策、`model_distribution_contract`, `responsibility_ledger`
 - 付録A：provenance 完全スキーマ、`SKILL.md` テンプレート
 
 ### 外部参考

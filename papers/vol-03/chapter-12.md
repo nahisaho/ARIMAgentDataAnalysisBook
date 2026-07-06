@@ -1,916 +1,853 @@
-# 第12章 自己教師あり学習と対比学習を Skill 化する — 「作る側」の判断契約
+# 第12章 材料 Foundation Model と MCP 連携 — Agentic 呼び出し契約
 
 > [!NOTE]
 > **本章の到達目標**
-> - **SimCLR / BYOL / MoCo** の 3 系統を区別し、材料応用における使い分けを書き分けられる
-> - **「事前学習を作る」vs「既存 Foundation Model を使う」の判断ゲート**を Skill 化できる
-> - **ラベルなし顕微鏡データからの表現学習**を、augmentation 契約・checkpoint 上書き承認・GPU 予算とセットで設計できる
-> - **小規模 SSL の限界**（GPU 1 枚 / 数千枚 / 数日）を数値で示し、エージェントに「SSL を提案する / しない」の根拠を持たせられる
-> - **`ssl_pretrain_decision`** で SSL 実行前の Human 承認ゲートを設計できる
-> - **`ssl_representation_eval`** で「事前学習が機能したか」を linear probe / kNN で客観評価できる
+> - **MatBERT / CrystaLLM / ChemBERTa** の 3 系統を区別し、材料タスクごとの使い分けを書き分けられる
+> - **Hugging Face Hub からの取得と重み署名検証**を第5章 Layer 2 の厳格版として実装できる
+> - **LLM 系 MCP との連携パターン**を、権限分離・監査ログ付きで設計できる
+> - **`fm_query` Skill** を書き、エージェントが FM に問い合わせるときの hallucination 対策プロトコル（retrieval-augmented 検証 + confidence 明示 + citation 強制）を実装できる
+> - **`fm_update_gate` 契約**を書き、Foundation Model の更新（新バージョン / 新重み）をエージェントが受け入れるかの判断ゲートを作れる
+> - vol-01 第10章の文献照合 Skill を **FM 出力の検証**に拡張できる
+> - vol-02 第16章「モデル配布の議論」を FM に適用し、**FM 特有の配布 / 更新リスク**を Skill 契約に落とせる
 >
 > **本章で扱わないこと**
-> - **既存 FM の呼び出しと重み署名検証** → **第11章**（本章は「自組織で FM を作る側」）
-> - **FM を使った capstone**（深層特徴 → PyMC 階層） → **第13章**
-> - **深層 × Agentic の特有失敗（GPU 占有・checkpoint 改ざん・augmentation 契約違反）** → **第14章**（本章は設計側の予防）
-> - **大規模 SSL（数十〜数百 GPU / 数億枚）** → 本書の想定外（Meta / DeepMind 論文を参照）
+> - **SSL / 対比学習で FM を作る側の議論** → **第13章**
+> - **FM を使った capstone**（深層特徴 → PyMC 階層） → **第14章**
+> - **FM 特有の運用失敗事例集** → **第15章**（本章は設計側の予防）
+> - **組織展開と責任分担** → **第16章**
 
 ---
 
 ## 12.1 この章で作る Skill
 
-4 つの **SSL / 対比学習用 Agentic Skill** を作ります。
+3 つの **Foundation Model 用 Agentic Skill** と 1 つの **更新受け入れゲート**を作ります。
 
 | Skill / 成果物 | 役割 | 入出力 |
 |---|---|---|
-| **`ssl_pretrain_decision`** | 「事前学習を作るべきか、既存 FM を使うべきか」を意思決定する判断ゲート | 入力: unlabeled_count + labeled_count + domain_gap + gpu_budget → 出力: `pretrain` \| `use_existing_fm` \| `defer_to_human` |
-| **`ssl_contrastive_pretrain`** | SimCLR / BYOL / MoCo で自組織の unlabeled 画像から表現を学習 | 入力: dataset + method + augmentation_config + training_job_approval → 出力: encoder checkpoint + provenance |
-| **`ssl_representation_eval`** | 学習された表現が下流タスクで機能するかを linear probe / kNN / few-shot で評価 | 入力: encoder + labeled_downstream → 出力: eval_report + representation_quality_flag |
-| **`ssl_downstream_transfer_gate`**（契約） | SSL 重みを下流 Skill の baseline と置き換えてよいかの判断 | 入力: baseline metric + ssl metric + calibration → 出力: accept \| defer_to_human \| reject |
+| **`fm_fetch_and_verify`** | Hugging Face Hub から FM を取得し、重み署名 / ライセンス / provenance を検証 | 入力: repo_id + revision → 出力: verified weights + fm_provenance |
+| **`fm_query`** | FM に問い合わせ、hallucination 対策プロトコルつきで応答を返す | 入力: prompt + retrieval sources + citation policy → 出力: response + citations + confidence |
+| **`fm_update_gate`**（契約 + Skill） | FM の新バージョン / 新重みを受け入れるかを判断 | 入力: new_fm_manifest + benchmark_results → 出力: accept / defer_to_human / reject |
+| **`fm_call_via_mcp`** | 組織内 MCP サーバ経由で LLM 系 FM を呼び出す（付録B に実装） | 入力: mcp endpoint + payload → 出力: response + audit_log |
 
-前提として、第4章 3 レイヤ provenance + Ch7 Layer 4 + Ch9 `bayesian_inference_config` + Ch10 `layer_attribution` / `layer_human_review` + Ch11 `foundation_model_provenance` を継承。**本章では SSL 用の拡張ブロック `ssl_pretrain_provenance` と `ssl_representation_eval_provenance` を導入**します（Ch11 と同じ拡張パターン）。
+前提として、第5章 3 レイヤ provenance + Ch7 Layer 4 + Ch9 `bayesian_inference_config` + Ch10 `layer_attribution` / `layer_human_review`、第11章 `deep_report_template` を継承。**本章では FM 用の拡張ブロック `foundation_model_provenance` を導入**します（Ch07 Layer 4 と同じ拡張パターン）。
 
 ---
 
-## 12.2 なぜこの章が必要か — 「作る側」に立つ判断
+## 12.2 なぜこの章が必要か — vol-01 第10章と vol-02 第16章の合流
 
-第11章までは **既存 Foundation Model を "使う側"** の設計でした。しかし、以下の場面では **自組織で SSL 事前学習を作る**方が合理的になります：
+vol-01 第10章では **arXiv / Paper Search MCP** による文献照合 Skill を作り、「AI が生成した内容を人間が検証する」プロトコルを確立しました。vol-02 第16章では「モデル配布」の判断基準（誰が配って、誰が受け取り、どう検証するか）を議論しました。
 
-- 対象がニッチで、既存 FM の pretraining data に類似データが含まれていない（例：特殊な電子顕微鏡像、特定装置固有のノイズパターン）
-- ラベルは少数しかないが、**ラベルなしデータが大量にある**（顕微鏡は画像を撮り続けている）
-- ドメインギャップが大きく（Ch7 `domain_gap_gate` で defer 判定）、fine-tune では埋まらない
+Foundation Model は、これら 2 つの議論の**合流点**です：
 
-しかし、**SSL 事前学習は GPU 予算 / 時間 / エンジニアリング工数を大きく消費**し、エージェントが自律的に「事前学習を回そう」と判断してよい範囲を厳密に定義しないと、GPU クラスタが SSL job で埋め尽くされます。
+- **FM は生成 AI であり、hallucination が起きる**（vol-01 の文献照合 Skill と同じ問題）
+- **FM は "他人の学習成果" を再配布する仕組み**（vol-02 のモデル配布の議論と同じ問題）
+- **FM は更新頻度が高く、重み差替えがエージェントの動作を静かに変える**（Ch7 の pretrained weights より頻度と影響が大きい）
+- **FM は組織内 MCP 経由で呼ばれることが多く、監査ログの設計が別途必要**
 
 ```mermaid
 flowchart TB
-    A["新しい下流タスク"] --> B["ssl_pretrain_decision"]
-    B --> C{"unlabeled 十分?<br/>domain_gap 大きい?<br/>gpu_budget OK?"}
-    C -->|"NO / 曖昧"| D["use_existing_fm<br/>(第11章に戻る)"]
-    C -->|"YES + 明確"| E["Human 承認<br/>(training_job_approval)"]
-    E -->|"approve"| F["ssl_contrastive_pretrain"]
-    E -->|"defer"| G["Human 判断待ち"]
-    F --> H["ssl_representation_eval<br/>(linear probe / kNN)"]
-    H --> I{"表現が機能?"}
-    I -->|"YES"| J["ssl_downstream_transfer_gate"]
-    I -->|"NO"| K["破棄 or 再設計<br/>(defer_to_human)"]
-    J -->|"accept"| L["下流 Skill の baseline を置換"]
-    J -->|"defer"| G
+    A["Foundation Model"] --> B{"利用形態"}
+    B -->|"エージェントが直接<br/>Hugging Face Hub から取得"| C["fm_fetch_and_verify<br/>+ 重み署名検証"]
+    B -->|"組織内 MCP サーバ経由"| D["fm_call_via_mcp<br/>+ 監査ログ"]
+    C --> E["fm_query"]
+    D --> E
+    E --> F["hallucination 対策<br/>RAG + citation + confidence"]
+    F --> G["deep_report_template に記録 (Ch10)"]
+    H["新バージョン FM リリース"] --> I["fm_update_gate"]
+    I -->|"accept"| C
+    I -->|"defer_to_human"| J["Human 判断"]
+    I -->|"reject"| K["旧バージョン継続"]
 ```
 
 > [!IMPORTANT]
-> **本章の主題は「SSL のアルゴリズム解説」ではなく「SSL を Agentic Skill として安全に回す契約」**です。SimCLR の loss 式は §12.4 で最小限、判断ゲート・augmentation 契約・GPU 予算・承認プロセスに紙面を割きます。
+> **本章は "FM を使う側" の設計の章です**。「FM が何ができるか」より「エージェントが FM を安全に呼ぶための契約と検証」が主題。FM そのものの内部理解は第13章（SSL/対比学習で FM を作る側）で扱います。
 
 ---
 
-## 12.3 SimCLR / BYOL / MoCo の位置づけ
+## 12.3 MatBERT / CrystaLLM / ChemBERTa の位置づけ
 
-SSL 対比学習の主要 3 系統：
+材料 × Foundation Model の主要 3 系統：
 
-| 手法 | Negative サンプル | Momentum encoder | Batch size 依存 | 材料応用の適性 |
-|---|---|---|---|---|
-| **SimCLR** | 同 batch 内の他サンプル | なし | **非常に強い**（4096+ 推奨） | GPU 1 枚では厳しい。中規模 SSL の入門に |
-| **BYOL** | 使わない（negative-free） | あり | 弱め（256〜） | 小規模 SSL に向く。degenerate collapse に注意 |
-| **MoCo v2/v3** | queue（大規模メモリバンク） | あり | 弱め（256〜） | GPU 1 枚でも実用的、材料 SEM で実績あり |
+| モデル | ベース | 事前学習データ | 得意タスク | ライセンス | 特徴 |
+|---|---|---|---|---|---|
+| **MatBERT** | BERT | 材料科学論文 200 万件 | 論文からの材料特性抽出、NER、テキスト分類 | Apache-2.0 系 | テキスト理解特化、生成なし |
+| **CrystaLLM** | GPT-2 系 | CIF 形式の結晶構造 100 万件 | 結晶構造生成、CIF 補完、条件付き生成 | Apache-2.0 系 | 生成モデル、hallucination 対策必須 |
+| **ChemBERTa** | RoBERTa | SMILES 77M | 分子物性予測、分子表現学習 | MIT 系 | SMILES 特化、生成能力は限定的 |
 
 ### 使い分け早見表
 
-| 条件 | 推奨手法 | 補足 |
+| タスク | 推奨 FM | 補足 |
 |---|---|---|
-| GPU 8 枚以上・batch 4096+ 可能 | **SimCLR** | 論文再現しやすい、比較のベースライン |
-| GPU 1〜4 枚・batch 256〜1024 | **MoCo v3** | Queue で negative を確保、実装成熟 |
-| GPU 1 枚・batch 256 以下 | **BYOL** | Negative 不要、ただし collapse 検知必須 |
-| 事前学習後は既存 FM と組み合わせたい | どれでも可 | 表現は encoder のみ引き継ぐ |
-| ラベルなしデータ < 5,000 枚 | SSL 非推奨 | `ssl_pretrain_decision` で `use_existing_fm` |
+| 論文から材料組成を抽出（NER） | **MatBERT** | 生成不要、埋め込み or 分類ヘッド追加 |
+| 結晶構造の候補生成 | **CrystaLLM** | 生成 → **必ず** 物理検証（対称性、密度、結合角）でフィルタ |
+| 分子から物性予測（回帰 / 分類） | **ChemBERTa** | 埋め込み → 線形 or MLP ヘッド |
+| 未知組成の合成可能性判断 | 単独 FM では不十分 | 複数 FM + retrieval + Human 承認 |
+| 論文からの引用元検索 | **MatBERT + BM25 / arXiv MCP** | vol-01 第10章の拡張 |
 
 > [!WARNING]
-> **BYOL の representation collapse** は SSL 特有の "静かな失敗" です。loss は下がるが表現は全て同一ベクトルに退化。§12.6 `ssl_representation_eval` の linear probe が chance level に留まることで検知します。
+> **CrystaLLM のような生成モデルは特に hallucination リスクが高い**です。CIF を生成しても、原子座標や対称性が物理的に整合しない場合が多い。§12.6 の hallucination 対策プロトコルは生成系 FM で必須。
 
----
+### CrystaLLM 生成物の物理検証（`crystal_physical_validation`）
 
-## 12.4 対比学習の最小定式化
-
-理解を最小限に留めるため、SimCLR の NT-Xent loss だけを示します：
-
-```
-loss_i = -log( exp(sim(z_i, z_i+) / τ) / Σ_{k≠i} exp(sim(z_i, z_k) / τ) )
-```
-
-- `z_i, z_i+`：同一画像に異なる augmentation をかけた 2 表現（**positive pair**）
-- `z_k`：batch 内他サンプル（**negative pair**）
-- `τ`：温度（0.1〜0.5、材料 SEM では 0.2〜0.3 が経験則）
-- `sim`：cosine similarity
-
-**重要な帰結**：SSL の性能は **augmentation の質**にほぼ全て依存します。augmentation が下流タスクの invariance と矛盾すると、事前学習は下流を悪化させます（例：向きが物性と結びつく材料で random rotation を強く入れると失敗）。
-
-### 材料 SEM で「使ってはいけない augmentation」
-
-| Augmentation | 一般画像では OK | 材料 SEM では |
-|---|---|---|
-| 色相反転 / channel shuffle | OK | **禁止**（グレースケール想定、意味論が崩壊） |
-| Vertical flip | OK | **タスク依存**（重力方向に意味があれば禁止） |
-| Random rotation 360° | 多くの場合 OK | **タスク依存**（結晶方位が特徴なら制限） |
-| CutMix / MixUp | 分類で OK | 表現学習では基本的に不使用（対比学習の pair 意味論を壊す） |
-| Gaussian noise | OK | OK（装置ノイズを模擬する範囲で） |
-| Random crop | OK | OK（ただし crop 後にスケールバー情報が失われる問題は別途処理） |
-
-> [!IMPORTANT]
-> **augmentation は "Skill 契約" の一部**として YAML に固定し、Human 承認なしにエージェントが変更できないようにします（§12.5 `augmentation_config_hash`）。
-
----
-
-## 12.5 `ssl_pretrain_decision` — 事前学習を "回す vs 回さない" 判断
-
-SSL 事前学習は **GPU 予算 / エンジニアリング工数 / 数日〜数週間の時間** を消費します。エージェントが自律的に「SSL を回そう」と判断してよい条件を、契約で厳密化します。
-
-### 判断ロジック
-
-```python
-# ssl_pretrain_decision.py
-from dataclasses import dataclass, field
-
-
-@dataclass
-class PretrainPlan:
-    """先に計画を立ててから gpu_hours を見積もる（決定と見積もりの分離）。"""
-    method: str                       # "simclr" | "byol" | "mocov3"
-    encoder_arch: str                 # "resnet50" | "resnet18" | "vit_b_16" ...
-    batch_size: int
-    epochs_min: int
-    image_size: int
-    expected_throughput_imgs_per_sec: float
-    hardware_profile: str             # "1x_rtx4090" | "8x_a100" ...
-    estimator_confidence: str         # "high" | "medium" | "low"
-
-
-@dataclass
-class Ch7DomainGapResult:
-    """Ch7 domain_gap_gate の完全な結果オブジェクトを引き渡す（score だけでは不十分）。"""
-    domain_gap_score: float
-    action: str                       # "allow" | "review" | "block"
-    method: str
-    calibration_set_hash: str
-    thresholds_used: dict
-    provenance_ref: str
-
-
-@dataclass
-class SSLPretrainInputs:
-    unlabeled_count: int
-    labeled_count: int
-    ch7_domain_gap_result: Ch7DomainGapResult   # score だけでなく action も含める
-    existing_fm_available: bool
-    existing_fm_provenance_ref: str | None
-    pretrain_plan: PretrainPlan | None          # 計画がないと gpu_hours は見積もれない
-    gpu_hours_available: float                  # 承認済み予算
-    labeled_downstream_dataset_id: str | None   # boolean ではなく実 ID を要求
-
-
-def _estimate_gpu_hours(plan: PretrainPlan, unlabeled_count: int) -> float:
-    """plan と unlabeled_count から GPU 時間を見積もる。式は組織で校正。"""
-    imgs = unlabeled_count * plan.epochs_min
-    return imgs / max(plan.expected_throughput_imgs_per_sec, 1.0) / 3600.0
-
-
-def ssl_pretrain_decision(inp: SSLPretrainInputs) -> dict:
-    """
-    「事前学習を作る」vs「既存 FM を使う」vs「Human 判断」vs「その他」を決める。
-
-    契約：
-      - 下流タスクの実 ID が未指定なら評価不能 → defer
-      - Ch7 action が "block" なら SSL の話以前に defer
-      - unlabeled < 5,000 かつ既存 FM あり → use_existing_fm
-      - unlabeled < 5,000 かつ既存 FM なし → defer_to_human（"do not exist" 問題の解消）
-      - pretrain_plan が無いと gpu_hours 見積もり不可 → defer
-      - GPU 予算不足 → defer
-      - existing_fm があり domain_gap < 0.4 → use_existing_fm
-      - domain_gap >= 0.6 かつ unlabeled >= 20,000 → pretrain 推奨
-      - それ以外は defer_to_human
-    """
-    reasons = []
-
-    if inp.labeled_downstream_dataset_id is None:
-        reasons.append("no_downstream_task_defined")
-        return _decision("defer_to_human", reasons)
-
-    if inp.ch7_domain_gap_result.action == "block":
-        reasons.append("ch7_domain_gap_gate_blocked")
-        return _decision("defer_to_human", reasons)
-
-    if inp.unlabeled_count < 5000:
-        if inp.existing_fm_available:
-            reasons.append("unlabeled_too_small_but_existing_fm_available")
-            return _decision("use_existing_fm", reasons)
-        else:
-            # 「存在しない FM を使え」を返さない
-            reasons.append("no_existing_fm_and_unlabeled_too_small")
-            return _decision("defer_to_human", reasons)
-
-    if inp.pretrain_plan is None:
-        reasons.append("no_pretrain_plan_for_estimation")
-        return _decision("defer_to_human", reasons)
-
-    gpu_hours_estimated = _estimate_gpu_hours(inp.pretrain_plan, inp.unlabeled_count)
-    if gpu_hours_estimated > inp.gpu_hours_available:
-        reasons.append("insufficient_gpu_budget")
-        return _decision("defer_to_human", reasons, gpu_hours_estimated=gpu_hours_estimated)
-
-    if inp.existing_fm_available and inp.ch7_domain_gap_result.domain_gap_score < 0.4:
-        reasons.append("existing_fm_close_enough")
-        return _decision("use_existing_fm", reasons, gpu_hours_estimated=gpu_hours_estimated)
-
-    if inp.ch7_domain_gap_result.domain_gap_score >= 0.6 and inp.unlabeled_count >= 20000:
-        # Ch7 action が review なら defer に降格
-        if inp.ch7_domain_gap_result.action == "review":
-            reasons.append("large_domain_gap_but_ch7_review_flag")
-            return _decision("defer_to_human", reasons, gpu_hours_estimated=gpu_hours_estimated)
-        reasons.append("large_domain_gap_and_sufficient_unlabeled")
-        return _decision("pretrain", reasons, gpu_hours_estimated=gpu_hours_estimated)
-
-    reasons.append("ambiguous_region")
-    return _decision("defer_to_human", reasons, gpu_hours_estimated=gpu_hours_estimated)
-
-
-def _decision(action: str, reasons: list[str], **extras) -> dict:
-    return {
-        "action": action,   # "pretrain" | "use_existing_fm" | "defer_to_human"
-        "reasons": reasons,
-        "requires_human_approval_before_pretrain": (action == "pretrain"),
-        **extras,
-    }
-```
-
-### 契約 YAML
+CrystaLLM の CIF 出力は必ず以下のフィルタを通す。1 つでも fail した候補は破棄：
 
 ```yaml
-# ssl_pretrain_decision.yaml
-skill: "ssl_pretrain_decision"
+# crystal_physical_validation.yaml（fm_query の生成系分岐で必須）
+skill: "crystal_physical_validation"
 version: "1.0.0"
 
-requires:
-  ch7_domain_gap_full_result_required: true          # score だけでなく action も
-  gpu_budget_pre_approved: true                      # 予算は Human 承認済みのみ
-  downstream_task_dataset_id_required: true          # boolean ではなく実 ID
-  pretrain_plan_required_before_estimation: true     # 循環見積もり防止
-
-thresholds:                                          # 開発用デフォルト。組織で校正すること
-  calibration_note: "these are defaults; each organization must calibrate on pilot runs"
-  threshold_profile_id: "default_v1"
-  unlabeled_min: 5000
-  unlabeled_pretrain_recommended: 20000
-  domain_gap_use_existing_max: 0.4
-  domain_gap_pretrain_recommended_min: 0.6
-
-decision_matrix:
-  pretrain:
-    condition: "domain_gap >= 0.6 AND unlabeled >= 20000 AND gpu_ok AND downstream_id AND ch7_action != review AND ch7_action != block"
-    always_requires_human_approval: true
-  use_existing_fm:
-    condition: "existing_fm AND (domain_gap < 0.4 OR unlabeled < 5000)"
-  defer_to_human:
-    conditions:
-      - "no downstream task ID"
-      - "ch7 action = block or review"
-      - "no existing FM AND unlabeled < 5000"
-      - "no pretrain plan for estimation"
-      - "insufficient GPU budget"
-      - "ambiguous region"
-
-agent_authorization:
-  L1: "read_decision_only"
-  L2: "read_and_prepare_pretrain_plan_but_not_launch"
-  L3:
-    can_recommend_pretrain: true
-    cannot_launch_pretrain_without_human: "forbidden_all_levels"
-    cannot_bypass_gpu_budget_check: "forbidden_all_levels"
-  never_allowed:
-    - "launch_pretrain_without_approval"
-    - "override_unlabeled_min"
-    - "invent_domain_gap_score"
-    - "silently_shrink_downstream_task"
-    - "recommend_nonexistent_fm"                     # 「存在しない FM を使え」を出さない
-
-provenance:
-  ssl_pretrain_decision_provenance:
-    unlabeled_count: "int"
-    labeled_count: "int"
-    ch7_domain_gap_result:
-      domain_gap_score: "float"
-      action: "allow | review | block"
-      method: "str"
-      calibration_set_hash: "str"
-      thresholds_used: "dict"
-      provenance_ref: "id"
-    existing_fm_available: "bool"
-    existing_fm_provenance_ref: "id (if exists)"
-    pretrain_plan:
-      method: "str"
-      encoder_arch: "str"
-      batch_size: "int"
-      epochs_min: "int"
-      image_size: "int"
-      expected_throughput_imgs_per_sec: "float"
-      hardware_profile: "str"
-      estimator_confidence: "high | medium | low"
-    gpu_hours_estimated: "float (derived from plan)"
-    gpu_hours_available: "float"
-    gpu_budget_approver_hashed: "str"
-    threshold_profile_id: "str"
-    decision: "pretrain | use_existing_fm | defer_to_human"
-    reasons: "list"
-    decision_timestamp: "iso8601"
-```
-
-> [!WARNING]
-> **`domain_gap_score` を独立計算しない**でください。第7章 `domain_gap_gate` が出した数字とその provenance を必ず引き渡します。エージェントが独立に "domain_gap は 0.3 くらい" と推定すると、SSL 判断が systematic bias を持ちます。
-
----
-
-## 12.6 `ssl_contrastive_pretrain` — augmentation 契約と checkpoint 上書き承認
-
-事前学習の実装は既存ライブラリ（`solo-learn`, `lightly`, `pytorch-lightning-bolts`）で十分ですが、**Skill として運用するには以下 4 点が本質的**です：
-
-1. **augmentation_config を YAML で固定**し、hash を provenance に残す
-2. **training_job_approval**（Ch4 §4.7 の agent authorization）で Human 承認済みでないと起動しない
-3. **checkpoint_overwrite_policy** で既存重みを勝手に上書きしない
-4. **GPU 予算 monitor** で見積もり超過時に停止
-
-### 契約 YAML
-
-```yaml
-# ssl_contrastive_pretrain.yaml
-skill: "ssl_contrastive_pretrain"
-version: "1.0.0"
-
-requires:
-  ssl_pretrain_decision_result: "pretrain"           # 直前の decision が pretrain 以外は起動不可
-  training_job_approval_signed: true                 # Human 承認済み job ID 必須
-  augmentation_config_pre_approved: true             # augmentation は Human 承認済み hash と一致
-  downstream_task_reference: true                    # 評価対象の下流タスク ID を必須引き渡し
-
-method:
-  choices: ["simclr", "byol", "mocov3"]
-  default: "mocov3"                                  # GPU 1 枚を想定
-  batch_size_min:
-    simclr: 1024
-    byol: 256
-    mocov3: 256
-  epochs_min: 200                                    # collapse リスク低減の下限
-  epochs_default: 200
-  early_stop_only_on_collapse: true                  # epochs 早期打ち切りは collapse 検知経由のみ
-
-augmentation_config:
-  required_fields:                                   # 契約が要求するフィールド一覧
-    - "resize_size"
-    - "crop_size"
-    - "crop_scale_min_max"
-    - "horizontal_flip_prob"
-    - "vertical_flip_prob"
-    - "rotation_max_deg"
-    - "gaussian_blur_sigma_min_max"
-    - "gaussian_noise_sigma_max"
-    - "config_hash"
-  enforced_values:                                   # 材料 SEM 想定の強制値
-    color_jitter_disabled_for_grayscale: true
-    config_hash_algorithm: "sha256"
-    hash_input: "canonicalized_parsed_yaml"          # 空白差で hash が変わるのを防ぐ
-
-checkpoint_policy:
-  states:                                            # ライフサイクル状態を明示
-    - "intermediate"                                 # resume 用一時 checkpoint（同 run_id で上書き可）
-    - "resumable"                                    # crash recovery 用（同 run_id 内）
-    - "budget_stopped"                               # hard_stop で強制終了、eval は許可・transfer は defer
-    - "final_accepted"                               # 評価と gate を通過したもの
-    - "discarded"                                    # collapse 等で破棄
-  final_uri_never_overwrite: true                    # final_accepted の URI は絶対上書き禁止
-  uri_pattern: "s3://ssl-checkpoints/{project}/{method}/{unlabeled_dataset_id}/{run_id}/{state}/"
-  resume_within_same_run_id_allowed: true            # crash recovery を許可
-  require_signed_run_id: true
-
-gpu_budget_monitor:
-  budget_hours: "from ssl_pretrain_decision"
-  soft_stop_at_ratio: 0.9                            # 予算の 90% 到達で warn
-  hard_stop_at_ratio: 1.0                            # 100% 到達で強制停止
-  partial_checkpoint_on_hard_stop: "budget_stopped"  # 破棄せず eval 用に保存
-  require_reapproval_if_stopped: true
-
-collapse_detection:                                  # BYOL / MoCo で必須
-  metric_layer: "backbone_output_after_global_pool"  # projection / predictor ではなく backbone 出力
-  metric: "std_of_l2_normalized_representations_per_batch"
-  stop_if_std_below: 0.01
-  min_epochs_before_check: 20                        # 初期エポックの安定期は除外
-  also_log:                                          # 診断用に他層も記録
-    - "projection_head_output_std"
-    - "predictor_output_std_if_byol"
-
-transfer_artifact_policy:
-  downstream_uses: "backbone_encoder_only"           # projection / predictor は転移しない
-  projection_and_predictor: "training_only"
-  separate_approval_required_for_projection_transfer: true
-
-agent_authorization:
-  L1: "read_config_only"
-  L2: "prepare_and_dry_run_but_not_launch"
-  L3:
-    can_launch_with_signed_approval: true
-    cannot_modify_augmentation_config: "forbidden_all_levels"
-    cannot_overwrite_final_checkpoint: "forbidden_all_levels"
-    cannot_extend_gpu_budget_without_reapproval: "forbidden_all_levels"
-  never_allowed:
-    - "launch_without_training_job_approval"
-    - "silently_change_augmentation"
-    - "overwrite_final_checkpoint_uri"
-    - "disable_collapse_detection"
-    - "continue_after_hard_gpu_stop"
-    - "transfer_projection_head_without_approval"
+validators:
+  cif_parser_valid:
+    tool: "pymatgen.io.cif.CifParser"
+    tool_version: ">=2024.6"
+    fail_label: "cif_parse_error"
+  charge_neutrality:
+    tolerance_abs_electrons: 0.05
+    fail_label: "non_neutral_composition"
+  density_range:
+    min_g_per_cm3: 0.5                              # 気相〜金属の範囲を広めに
+    max_g_per_cm3: 25.0                             # Os の理論上限を超えたら破棄
+    fail_label: "density_out_of_range"
+  bond_length_check:
+    method: "sum_of_covalent_radii * factor"
+    min_factor: 0.7                                 # 実測共有結合半径和の 70% 未満は不整合
+    max_factor: 1.5
+    fail_label: "bond_length_unphysical"
+  bond_angle_check:
+    min_deg: 40.0                                   # 40 度未満は幾何的に不整合
+    fail_label: "bond_angle_unphysical"
+  symmetry_consistency:
+    tool: "spglib"
+    symprec: 0.1
+    require_declared_spacegroup_matches: true
+    fail_label: "spacegroup_mismatch"
+  allowed_elements:
+    whitelist_or_domain_specific: true              # 組織で定義
+    fail_label: "disallowed_element"
 
 acceptance:
-  collapse_check_passed_at_end: true
-  gpu_hours_within_budget: true
-  augmentation_config_hash_matches_approved: true
-  final_checkpoint_written_to_new_uri: true
+  all_validators_pass_or_labeled: true
+  discard_on_any_fail: true
 
 provenance:
-  ssl_pretrain_provenance:                           # 拡張ブロック（Ch11 pattern）
-    method: "simclr | byol | mocov3"
-    encoder_arch: "str (e.g., resnet50, vit_b_16)"
-    projection_head_config: "dict (training-only, not transferred)"
-    unlabeled_dataset_id: "str"
-    unlabeled_dataset_snapshot:                      # Ch11 manifest registry と同水準
-      manifest_uri: "str (append-only registry)"
-      merkle_root_sha256: "str"                      # 全ファイル hash の Merkle root
-      file_count: "int"
-      approver_hashed: "str"
-    unlabeled_count: "int"
-    augmentation_config_yaml_hash:                   # 空白差を除いた canonical hash
-      hash: "sha256"
-      canonicalization: "yaml_parsed_then_json_sorted_keys"
-    batch_size: "int"
-    epochs_completed: "int"
-    checkpoint_state: "intermediate | resumable | budget_stopped | final_accepted | discarded"
-    temperature_tau: "float (SimCLR/MoCo)"
-    ema_momentum: "float (BYOL/MoCo)"
-    optimizer_config: "dict"
-    lr_schedule: "dict"
-    seed_per_worker: "list of int"
-    gpu_backend: "cuda | rocm | mps"
-    cudnn_deterministic: "bool"
-    mixed_precision: "bool"
-    gpu_hours_consumed: "float"
-    gpu_hours_budget: "float"
-    training_job_approval:                           # Ch11 と同じ signed registry
-      approval_id: "str"
-      signed_by_registry: true
-      approvers_quorum_hashed: "list (min 2)"
-      registry_signature_verified: true
-    final_checkpoint_uri: "str"
-    final_checkpoint_sha256: "str"
-    downstream_task_reference_id: "str"
-    collapse_detection:
-      final_backbone_std: "float"
-      final_projection_std: "float"
-      final_predictor_std: "float (if byol)"
+  crystal_physical_validation_provenance:
+    validator_versions: "dict of tool -> version"
+    per_validator_result: "list"
+    discarded_candidates_count: "int"
+    accepted_candidates_count: "int"
 ```
 
 > [!WARNING]
-> **`augmentation_config` を "エージェントが自律的にチューニングする" のは禁止**です。augmentation の変更は下流タスクの invariance を変えるため、Human 承認プロセスに戻す必要があります。エージェントは augmentation 案を提示できますが、変更した config で起動することは全レベル forbidden。
+> 上記の閾値は **開発用のデフォルト**です。実運用では対象元素系・空間群・温度条件でチューニングし、`crystal_physical_validation_provenance` に記録してください。
 
 ---
 
-## 12.7 `ssl_representation_eval` — 「事前学習が機能したか」を客観評価
+## 12.4 Hugging Face Hub からの取得と重み署名検証
 
-SSL は loss が下がるだけでは意味がありません。**下流タスクの少数ラベルで linear probe / kNN を回して表現の質を測る**のが標準です。
+Ch7 で pretrained weights の provenance を厳格化しましたが、FM では以下が加わります：
 
-### 評価プロトコル
+### FM 取得時の厳格チェック
+
+> [!IMPORTANT]
+> **manifest 信頼ルート（Trust Root）**：`expected_manifest` はエージェントが任意に生成できる dict ではなく、**組織の manifest レジストリ**（署名済み append-only ストア）から `manifest_id` で取得します。エージェントは承認済み manifest ID を指定するのみで、内容を書き換えることはできません。レジストリ側で `human_approver` の quorum 署名と immutable timestamp を保持します。
 
 ```python
-# ssl_representation_eval.py
-import numpy as np
-from collections import Counter
-from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.preprocessing import StandardScaler
+# fm_fetch_and_verify.py
+import hashlib
+import re
+from huggingface_hub import snapshot_download, HfApi
+
+# 40-hex 完全 SHA のみ許容（短縮 SHA / tag / branch / "main" / "latest" は全て拒否）
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
-def ssl_representation_eval(
-    encoder,                                        # backbone のみ（projection head は使わない）
-    train_loader,                                   # 固定 train split（few-shot はここから subsample）
-    val_loader,                                     # 固定 val split（評価はここで）
-    test_loader=None,                               # optional 最終評価用
-    n_labels_per_class_grid: list[int] = (5, 20, 100),
-    knn_k: int = 20,
-    knn_eval_max_samples: int = 10000,              # LOO の quadratic を防ぐ
-    linear_probe_max_iter: int = 5000,
-    subsample_seed: int = 0,                        # SSL / 対照 で共通シード
-    baseline_random_encoder_metrics: dict = None,   # 同 arch のランダム初期化 encoder の結果
+def _sha256_file(path: str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _load_approved_manifest(manifest_id: str, manifest_registry) -> dict:
+    """
+    署名済み manifest レジストリから承認済み manifest を取得。
+    レジストリ側で quorum 署名・timestamp の改ざん不能性を担保。
+    エージェントは manifest_id のみ指定でき、内容の生成はできない。
+    """
+    entry = manifest_registry.get(manifest_id)
+    assert entry is not None, f"unknown manifest_id: {manifest_id}"
+    assert manifest_registry.verify_signatures(entry), \
+        "manifest signature invalid or approver quorum not met"
+    return entry["manifest"]
+
+
+def fm_fetch_and_verify(
+    repo_id: str,
+    revision: str,                           # 40-hex 完全 commit SHA 必須
+    manifest_id: str,                        # 承認済み manifest のレジストリ ID
+    manifest_registry,                       # 署名検証機能つきレジストリ
+    hf_token: str | None = None,
 ) -> dict:
     """
-    encoder が学習した表現を、下流タスクの少数ラベルで評価。
+    Hugging Face Hub から FM を取得し、事前に承認された manifest と照合する。
 
-    重要な設計：
-      - train / val (/ test) split は呼び出し側で固定（immutable）
-      - few-shot subsample は train_loader からのみ抽出、val で評価
-      - SSL encoder と対照 encoder は同一 split・同一 subsample seed を使う
-      - encoder は backbone のみ（projection head / predictor は含めない）
+    approved manifest（レジストリから取得）例：
+      {
+        "safetensors_files": [
+          {"filename": "model.safetensors", "sha256": "abc..."},
+          {"filename": "tokenizer.json", "sha256": "def..."},
+        ],
+        "model_card_file_sha256": "...",         # ダウンロード対象の README.md 固定 hash
+        "license": "apache-2.0",
+        "pretraining_data_license": "cc-by-4.0",
+        "pretraining_data_summary": "materials science papers 2M",
+        "model_family": "matbert",
+        "revision_commit_hash": "<40-hex SHA>",
+        "human_approvers": ["hashed_id_1", "hashed_id_2"],
+        "human_approval_timestamp": "2026-...",
+      }
     """
-    encoder.eval()
-    emb_train, lbl_train = _extract_embeddings(encoder, train_loader)
-    emb_val, lbl_val = _extract_embeddings(encoder, val_loader)
+    # 1) revision は 40-hex 完全 SHA のみ許容（"main" / tag / branch / 短縮 SHA は全て fatal）
+    assert _COMMIT_SHA_RE.match(revision), \
+        f"revision must be a full 40-hex commit SHA (got: {revision!r})"
 
-    # 特徴量標準化（linear probe の収束を安定化）
-    scaler = StandardScaler().fit(emb_train)
-    emb_train_s = scaler.transform(emb_train)
-    emb_val_s = scaler.transform(emb_val)
+    # 2) manifest は必ずレジストリから取得（agent が dict を注入することは不可能）
+    expected_manifest = _load_approved_manifest(manifest_id, manifest_registry)
+    assert revision == expected_manifest["revision_commit_hash"], \
+        "revision does not match approved manifest"
 
-    # 表現の分散（collapse 判定用）— L2 正規化後の std を測る
-    emb_train_norm = emb_train / (np.linalg.norm(emb_train, axis=1, keepdims=True) + 1e-8)
-    mean_std = float(np.mean(np.std(emb_train_norm, axis=0)))
-    collapsed = mean_std < 0.01
+    # 3) Hub API 側の解決済み SHA が revision と一致することを確認
+    api = HfApi(token=hf_token)
+    model_info = api.model_info(repo_id=repo_id, revision=revision)
+    resolved_sha = getattr(model_info, "sha", None)
+    assert resolved_sha == revision, \
+        f"Hub API resolved sha mismatch: got {resolved_sha}, expected {revision}"
 
-    # クラスごとのサンプル数から adaptive な n_grid を作る
-    class_counts = Counter(lbl_train.tolist())
-    min_class_count = min(class_counts.values())
-    valid_ns = [n for n in n_labels_per_class_grid if n <= min_class_count]
-    if not valid_ns:
-        return {
-            "representation_quality_flag": "insufficient_labels_for_n",
-            "min_class_count": min_class_count,
-            "mean_embedding_std": mean_std,
-            "collapsed": collapsed,
-        }
+    # 4) Hub API の live 応答は "advisory"。承認判断は manifest 側に固定されている
+    #    ライセンス "cross-check" は Hub 側が manifest と食い違わないことのサニティチェック
+    declared_license_hub = getattr(model_info, "cardData", {}).get("license") if model_info else None
+    if declared_license_hub is not None:
+        assert declared_license_hub == expected_manifest["license"], \
+            f"license mismatch: hub says {declared_license_hub}, manifest says {expected_manifest['license']}"
 
-    results = {"linear_probe": {}, "knn": {}, "convergence": {}}
-    for n in valid_ns:
-        sub_emb, sub_lbl = _stratified_subsample(
-            emb_train_s, lbl_train, n_per_class=n, seed=subsample_seed
-        )
-        clf = LogisticRegression(max_iter=linear_probe_max_iter, solver="lbfgs")
-        clf.fit(sub_emb, sub_lbl)
-        # 評価は val split で（train データの再スコアではない）
-        val_acc = clf.score(emb_val_s, lbl_val)
-        results["linear_probe"][n] = float(val_acc)
-        results["convergence"][n] = {
-            "n_iter": int(getattr(clf, "n_iter_", [linear_probe_max_iter])[0]),
-            "converged": bool(
-                getattr(clf, "n_iter_", [linear_probe_max_iter])[0] < linear_probe_max_iter
-            ),
-        }
+    # 5) 重み + tokenizer + model card ファイルを download（allow_patterns で厳格制限）
+    files_to_fetch = [f["filename"] for f in expected_manifest["safetensors_files"]] + ["README.md"]
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        allow_patterns=files_to_fetch,
+        token=hf_token,
+    )
 
-    # kNN 評価：train を index、val をクエリ（LOO ではなく train→val 方向）
-    # 大規模データセット用に上限を設ける
-    if len(emb_train) > knn_eval_max_samples:
-        idx = np.random.default_rng(subsample_seed).choice(
-            len(emb_train), size=knn_eval_max_samples, replace=False
-        )
-        knn_train_emb, knn_train_lbl = emb_train[idx], lbl_train[idx]
-    else:
-        knn_train_emb, knn_train_lbl = emb_train, lbl_train
-    knn = KNeighborsClassifier(n_neighbors=knn_k)
-    knn.fit(knn_train_emb, knn_train_lbl)
-    results["knn"][knn_k] = float(knn.score(emb_val, lbl_val))
+    # 6) safetensors 以外の形式（.bin, .pt, .ckpt）は絶対に読まない
+    for entry in expected_manifest["safetensors_files"]:
+        assert entry["filename"].endswith(".safetensors") or entry["filename"] == "tokenizer.json", \
+            f"only .safetensors and tokenizer.json allowed, got {entry['filename']}"
 
-    # baseline_delta（provided されていれば計算）
-    baseline_delta = None
-    if baseline_random_encoder_metrics is not None:
-        top_n = max(valid_ns)
-        baseline_delta = {
-            f"linear_probe_{top_n}": (
-                results["linear_probe"][top_n]
-                - baseline_random_encoder_metrics["linear_probe"][top_n]
-            )
-        }
+    # 7) 全ファイルの sha256 を expected と照合（重み + tokenizer）
+    verified_files = []
+    for entry in expected_manifest["safetensors_files"]:
+        path = f"{local_dir}/{entry['filename']}"
+        actual = _sha256_file(path)
+        assert actual == entry["sha256"], \
+            f"sha256 mismatch for {entry['filename']}: expected {entry['sha256']}, got {actual}"
+        verified_files.append({"filename": entry["filename"], "sha256": actual, "path": path})
 
-    # convergence check：どれか未収束なら flag を defer 相当に
-    any_non_converged = not all(c["converged"] for c in results["convergence"].values())
-
-    n_classes = int(len(set(lbl_val)))
-    chance = 1.0 / n_classes
-    # chance-scale threshold：chance が高い（少クラス）場合は絶対マージンも要求
-    top_n = max(valid_ns)
-    lp_top = results["linear_probe"][top_n]
-    scale_margin = max(chance * 0.5, 0.1)             # chance の 50% 上 or 絶対 10pt のうち大きい方
-
-    if collapsed:
-        flag = "collapsed"
-    elif any_non_converged:
-        flag = "non_converged_defer_to_human"
-    elif lp_top < chance + scale_margin:
-        flag = "collapsed"
-    elif baseline_delta is not None and list(baseline_delta.values())[0] < 0.05:
-        flag = "marginal"                             # ランダム encoder より 5pt 未満
-    else:
-        flag = "good"
+    # 8) model card 本体（README.md）の hash も固定 — Hub 上で書き換え可能なため
+    #    live API の cardData ではなく、pinned revision の README.md ファイル hash で照合
+    readme_path = f"{local_dir}/README.md"
+    readme_hash = _sha256_file(readme_path)
+    assert readme_hash == expected_manifest["model_card_file_sha256"], \
+        f"model card file hash mismatch: expected {expected_manifest['model_card_file_sha256']}, got {readme_hash}"
 
     return {
-        "n_used_grid": valid_ns,
-        "linear_probe_val_acc_by_n": results["linear_probe"],
-        "linear_probe_convergence": results["convergence"],
-        "knn_val_acc": results["knn"],
-        "mean_embedding_std_l2_normalized": mean_std,
-        "collapsed": collapsed,
-        "baseline_delta": baseline_delta,
-        "representation_quality_flag": flag,
-        "chance_level": chance,
-        "scale_margin_used": scale_margin,
-        "min_class_count": min_class_count,
+        "local_dir": local_dir,
+        "verified_files": verified_files,
+        "revision": revision,
+        "manifest_id": manifest_id,
+        "declared_license_from_manifest": expected_manifest["license"],
+        "manifest_used": expected_manifest,
+        "model_card_file_sha256": readme_hash,
     }
 ```
 
-### 契約 YAML（要旨）
+### 契約 YAML
 
 ```yaml
-# ssl_representation_eval.yaml
-skill: "ssl_representation_eval"
+# fm_fetch_and_verify.yaml
+skill: "fm_fetch_and_verify"
 version: "1.0.0"
 
 requires:
-  encoder_provenance_ref: true                       # どの pretrain 実行に対する評価か
-  labeled_downstream_dataset_id: true
-  labeled_downstream_split_immutable: true           # train/val(/test) split は固定・共通
-  baseline_random_encoder_comparison: true           # ランダム encoder との比較必須
-  baseline_random_encoder_uses_same_split_and_seed: true  # 交絡防止
-  encoder_input_is_backbone_only: true               # projection head 含めない
+  revision_must_be_40hex_commit_sha: true         # fatal on 'main' / tag / branch / 短縮 SHA
+  hub_api_resolved_sha_must_match_revision: true  # HfApi.model_info().sha == revision
+  manifest_from_signed_registry_only: true        # agent-supplied dict 禁止
+  manifest_approver_quorum_min: 2                 # 承認者は 2 名以上
+  safetensors_only: true                          # .bin / .pt / .ckpt 拒否
+  trust_remote_code_forbidden: true               # HF の任意コード実行禁止
 
-evaluation:
-  n_labels_per_class_grid_default: [5, 20, 100]      # few-shot 3 段階（adaptive で縮小可）
-  adaptive_grid_on_class_imbalance: true             # min_class_count 未満の n はスキップ
-  knn_k: 20
-  knn_eval_max_samples: 10000                        # LOO の quadratic を回避
-  linear_probe_max_iter: 5000                        # 収束確認と併用
-  require_feature_standardization: true              # StandardScaler 適用
-  require_convergence_check: true                    # n_iter_ < max_iter を verify
-  collapse_metric: "std_of_l2_normalized_embeddings"
-  collapse_std_threshold: 0.01
-  marginal_baseline_delta_max: 0.05                  # 5pt 未満は marginal
-  chance_scale_margin: "max(chance * 0.5, 0.10)"     # クラス数に応じたスケール補正
-
-decision:
-  quality_flag_mapping:
-    good: "representation is usable"
-    marginal: "may be usable but does not clearly beat random encoder"
-    collapsed: "representation degenerated, discard checkpoint"
-    non_converged_defer_to_human: "linear probe did not converge; results unreliable"
-    insufficient_labels_for_n: "downstream has fewer labels than min grid; recompute"
+acceptance:
+  all_file_sha256_match: true
+  model_card_file_sha256_matches_manifest: true   # pinned README.md の hash 照合
+  license_from_manifest_matches_hub_advisory: true  # Hub は advisory、決定は manifest
+  no_unknown_files_downloaded: true               # allow_patterns で厳格制限
 
 agent_authorization:
-  L1: "read_eval_report"
-  L2: "run_eval_on_approved_downstream"
+  L1: "fetch_and_report"
+  L2: "fetch_and_load_for_inference"
   L3:
-    can_recommend_transfer: true
-    cannot_hide_marginal_or_collapsed_result: "forbidden_all_levels"
-    cannot_use_different_split_between_ssl_and_baseline: "forbidden_all_levels"
+    can_propose_new_manifest: true
+    cannot_bypass_manifest_check: "forbidden_all_levels"
   never_allowed:
-    - "cherry_pick_downstream_task_to_hide_collapse"
-    - "compare_ssl_encoder_to_untrained_baseline_only"
-    - "silently_drop_low_n_results"
-    - "evaluate_on_train_split"
-    - "include_projection_head_in_transfer_eval"
+    - "fetch_without_manifest"
+    - "load_bin_or_pt_files"
+    - "trust_remote_code_true"
+    - "auto_update_revision"
 
 provenance:
-  ssl_representation_eval_provenance:
-    encoder_provenance_ref: "id"
-    encoder_input: "backbone_only"
-    labeled_downstream_dataset_id: "str"
-    labeled_downstream_split_manifest_hash: "sha256"
-    subsample_seed: "int"
-    n_used_grid: "list"
-    linear_probe_val_acc_by_n: "dict"
-    linear_probe_convergence: "dict of {n: {n_iter, converged}}"
-    knn_val_acc: "dict"
-    mean_embedding_std_l2_normalized: "float"
-    baseline_random_encoder_metrics: "dict (same split, same seed)"
-    baseline_delta: "dict"
-    representation_quality_flag: "good | marginal | collapsed | non_converged_defer_to_human | insufficient_labels_for_n"
-    chance_level: "float"
-    scale_margin_used: "float"
-    eval_timestamp: "iso8601"
+  foundation_model_provenance:                    # 第5章 3 レイヤ + Ch7 Layer 4 + Ch9 + Ch10 と同じ
+                                                  # 「追加ブロック」パターン
+    repo_id: "str"
+    revision_commit_hash: "str (40-hex SHA)"
+    hub_api_resolved_sha: "str"                   # 検証済み一致
+    declared_license: "str (from manifest, not live API)"
+    pretraining_data_license: "str"
+    pretraining_data_summary: "str"
+    model_family: "matbert | crystallm | chemberta | other"
+    files_with_sha256: "list[{file, kind, sha256}]"    # kind ∈ {weights, tokenizer, config, generation_config}
+    # 派生ビュー（読み取り専用）：kind == 'weights' の filter
+    safetensors_files_with_sha256: "list (derived view of files_with_sha256 where kind='weights')"
+    model_card_file_sha256: "str"                 # pinned README.md の hash
+    manifest_id: "str (registry ID)"
+    manifest_approvers_hashed: "list (quorum >= 2)"
+    manifest_approval_timestamp: "iso8601"
+    fetch_timestamp: "iso8601"
 ```
 
 > [!IMPORTANT]
-> **`baseline_random_encoder_comparison` を義務化**する理由は、ランダム初期化の同一アーキテクチャ encoder でも意外に高い linear probe accuracy が出ることがあるためです。**「事前学習が効いた」ことを示すには、必ずランダム encoder との差分**を報告します。
-
----
-
-## 12.8 `ssl_downstream_transfer_gate` — 下流 baseline 置換の判断
-
-SSL encoder が eval で "good" と出ても、**下流 Skill の baseline を置き換えるかは別判断**です。以下 5 条件で判定：
-
-| 条件 | 閾値 | 補足 |
-|---|---|---|
-| 下流 primary metric の改善 | CI 下限 > task-specific margin | 単純な point estimate ではなく統計的下限 |
-| Calibration（Ch8 ECE）の悪化なし | `ece_abs_increase_max` かつ `ece_relative_increase_max` の両方 | ECE ≈ 0 付近での相対比較の不安定性を回避 |
-| 評価サンプル数 | `min_eval_samples_per_class` 以上 | 少数サンプルの偽陽性を防ぐ |
-| Representation quality flag | `good` のみ acceptable | marginal / collapsed / non_converged は不可 |
-| Human 承認 | 必須（automated accept 禁止） | Ch11 fm_update_gate と同水準 |
-
-### 契約 YAML（要旨）
-
-```yaml
-# ssl_downstream_transfer_gate.yaml
-skill: "ssl_downstream_transfer_gate"
-version: "1.0.0"
-
-requires:
-  baseline_downstream_metrics: true
-  ssl_encoder_downstream_metrics: true
-  calibration_delta_from_ch8: true                   # ECE 絶対 + 相対両方
-  ssl_representation_eval_result: "good"
-  primary_metric_specified: true
-  evaluation_uses_immutable_test_split: true
-
-metric_schema:                                       # metric の方向・スケール曖昧性を排除
-  primary_metric:
-    name: "str (e.g., accuracy, macro_f1, auroc, rmse)"
-    direction: "higher_is_better | lower_is_better"
-    absolute_or_relative: "absolute | relative"
-  secondary_metrics:                                 # 参考値、決定には使わない
-    type: "list of metric_schema"
-
-decision_matrix:
-  metric_improvement:
-    minimum_absolute_or_relative_by_task: "task-specific margin (approved separately)"
-    require_ci_lower_bound_above_margin: true        # point estimate ではなく CI 下限
-    ci_method: "paired_bootstrap"
-    ci_level: 0.95
-    bootstrap_samples: 1000
-    min_eval_samples_per_class: 50
-  calibration_guard:
-    ece_abs_increase_max: 0.02                       # 絶対値の上昇上限（epsilon floor）
-    ece_relative_increase_max: 0.20                  # 相対値の上昇上限
-    both_must_pass: true                             # 絶対 + 相対の両方
-  representation_quality_required: "good"
-  human_approval_required: true
-  reviewers_min: 2
-
-  outcomes:
-    accept: "全条件クリア + Human approve (reviewers >= 2)"
-    defer_to_human: "1 条件でも境界、CI 下限が margin をまたぐ、または marginal representation"
-    reject: "metric CI 下限が悪化 or ECE 絶対 or 相対が上限超過 or collapsed"
-
-agent_authorization:
-  L3:
-    can_recommend_transfer: true
-    cannot_switch_baseline_without_human: "forbidden_all_levels"
-    cannot_silently_downgrade_calibration: "forbidden_all_levels"
-    cannot_use_point_estimate_only: "forbidden_all_levels"
-  never_allowed:
-    - "auto_replace_baseline"
-    - "cherry_pick_metric_to_hide_ece_regression"
-    - "ignore_marginal_representation"
-    - "skip_ci_computation"
-    - "use_train_split_for_transfer_decision"
-
-provenance:
-  ssl_downstream_transfer_gate_decision:
-    primary_metric_schema: "dict"
-    baseline_metric: "float"
-    ssl_metric: "float"
-    metric_improvement: "float"
-    baseline_ece: "float"
-    ssl_metric: "float"
-    metric_improvement_point_estimate: "float"
-    metric_improvement_ci_lower_95: "float"
-    metric_improvement_ci_upper_95: "float"
-    task_specific_margin: "float"
-    bootstrap_samples: "int"
-    eval_samples_per_class: "dict"
-    baseline_ece: "float"
-    ssl_ece: "float"
-    ece_absolute_change: "float"
-    ece_relative_change: "float"
-    representation_quality_flag: "str"
-    decision: "accept | defer_to_human | reject"
-    human_reviewers_hashed: "list (min 2)"
-    decision_timestamp: "iso8601"
-```
-
----
-
-## 12.9 小規模 SSL の限界 — GPU 1 枚で何ができるか
-
-材料研究室で現実的な設定を数値で示します。以下の値は **参考目安**であり、image_size / precision / dataloader IO / storage throughput / optimizer に強く依存します：
-
-| 資源 | 条件 | 実務目安 |
-|---|---|---|
-| GPU 1 枚（RTX 4090 相当、mixed precision, 224x224） | MoCo v3 / ResNet-50 / batch 256 | 100k 枚 × 200 epoch で **約 5〜7 日** |
-| 同上 | MoCo v3 / ResNet-50 / batch 256 | 10k 枚 × 200 epoch で **約 12〜18 時間** |
-| 同上 | BYOL / ResNet-18 / batch 256 | 5k 枚 × 300 epoch で **約 6〜10 時間** |
-| GPU 8 枚（A100 相当、LARS optimizer 必須） | SimCLR / ResNet-50 / batch 4096 | 100k 枚 × 200 epoch で **約 1 日** |
-
-> [!IMPORTANT]
-> 上記は **image_size=224x224 / mixed precision / SSD ストレージ / prefetch 十分**の前提。画像サイズ 512 以上、fp32、HDD ストレージ、IO ボトルネックあり等の条件では **2〜5 倍伸びる**ことがあります。実測 throughput は `pretrain_plan.expected_throughput_imgs_per_sec` に記録してください。
-
-**含意**：
-
-- **GPU 1 枚では 5,000〜100,000 枚が現実的な上限**。それ以下は既存 FM、それ以上はクラスタ SSL を検討
-- **ViT-B クラス以上の SSL は GPU 1 枚では基本的に非推奨**（batch サイズ確保が困難）。ただし **ViT-S / DINO-style / gradient accumulation 併用**で 1 枚でも成立する場合があり、`pretrain_plan` に throughput 実測を残せば検討可能
-- **大 batch SSL（>= 1024）は LARS / LAMB optimizer が事実上必須**（`optimizer_config` に記録）
-- **200 epoch 未満で打ち切ると collapse リスクが上がる**（early stop は collapse 検知経由で行う）
-- **ストレージ IO ボトルネック**は SSL では顕在化しやすい。100k 枚 × 224x224 × 3ch で数十 GB、prefetch 不足でも GPU が待ち時間になる
+> **`files_with_sha256` が正本**です（付録B B.4.4 の manifest schema と一致）。**tokenizer / config / generation_config も weights と同じ file-level sha256 で pin**します（tokenizer / config が改ざんされると同一重みでも挙動が変わるため——付録B B.4.4 rubber-duck 修正 Blocking-3 参照）。`safetensors_files_with_sha256` は後方互換のための派生ビューで、`files_with_sha256` の `kind='weights'` サブセットに等しくなります。
 
 > [!WARNING]
-> **エージェントが "とりあえず SSL を回してみる" と提案するのは危険**です。GPU 1 枚を 1 週間占有する判断は、`ssl_pretrain_decision` の `pretrain` 分岐 + Human 承認を必ず通します。
+> **`revision: "main"` や tag での取得は禁止**です。tag / branch は後から書き換え可能で、同じ「バージョン」で違う重みが降ってくる可能性があります。**必ず commit hash（SHA）を manifest に固定**してください。
 
 ---
 
-## 12.10 エージェントが SSL 起動を提案してよい場面
+## 12.5 LLM 系 MCP との連携パターン
 
-`ssl_pretrain_decision` が `pretrain` を返しても、それは **推奨** であって **起動命令ではありません**。エージェントが SSL 起動を **人間に提案してよい**具体シーン：
+組織内で FM を運用する場合、直接 Hub から fetch するのではなく **組織内 MCP サーバ経由**で呼び出す構成が一般的です。これにより：
 
-| シーン | エージェントの提案内容 |
-|---|---|
-| 新しい装置で unlabeled 画像が 5 万枚溜まった | 「既存 FM の domain_gap は 0.7 で大きい。MoCo v3 で ResNet-50 の SSL を提案。GPU 予算見積 60 時間」 |
-| 下流タスクで既存 FM の linear probe が chance level ギリギリ | 「既存 FM の表現が下流に効いていない可能性。SSL 事前学習を検討値としてご提案」 |
-| ラベルは 100 枚しかないが unlabeled が 20 万枚ある | 「few-shot linear probe を最終評価にする前提で、MoCo v3 SSL を提案」 |
+- **権限分離**：エージェントは直接重みに触れず、MCP が推論結果のみ返す
+- **監査ログ**：全問い合わせ / 応答が MCP で記録される
+- **RAG の埋め込み**：MCP が retrieval を先に実行し、context を prompt に埋め込む
+- **rate limit / cost 管理**：GPU 資源を organization レベルで統制
 
-**逆に、エージェントが SSL を提案してはいけない場面**：
+```mermaid
+flowchart LR
+    A["Agent (L2)"] -->|"fm_call_via_mcp"| B["組織内 MCP サーバ"]
+    B --> C["auth 検証<br/>rate limit<br/>audit log"]
+    C --> D["retrieval layer<br/>(arXiv MCP / 社内 DB)"]
+    D --> E["prompt 組立"]
+    E --> F["FM 推論"]
+    F --> G["応答検証<br/>(citation / confidence)"]
+    G --> H["監査ログ書き込み"]
+    H -->|"response + citations"| A
+    G -->|"policy 違反"| I["Human エスカレーション"]
+```
 
-- unlabeled が 5,000 未満（`ssl_pretrain_decision` が却下）
-- GPU 予算が未承認
-- 下流タスクが未定義
-- 既存 FM の linear probe が既に "good"
-- 現在の期限内に評価まで完走できない見込み
+### MCP レベルの権限分離
+
+| MCP メソッド | エージェント権限（Ch4 §5.7） | 呼び出し条件 |
+|---|---|---|
+| `fm.query` | L1〜L3 全員可（推論のみ） | — |
+| `fm.embed` | L1〜L3 全員可 | — |
+| `fm.finetune` | L3 + 事前承認ワークフロー必須 | 承認済み finetune 計画 ID |
+| `fm.load_weights` | エージェント直接呼び出し禁止（MCP 管理者のみ） | MCP admin token 必須 |
+| `fm.list_versions` | L1〜L3（読み取りのみ） | — |
+| `fm.set_default_version` | 全レベル禁止（`fm_update_gate` の Human 承認経由のみ） | **署名済み `fm_update_gate_decision` ID + reviewer quorum 署名**が payload に含まれ、MCP サーバ側で検証。エージェント経由の chain-call でも通らない |
+
+> [!IMPORTANT]
+> **MCP サーバ側の enforcement**：`fm.set_default_version` は decision ID 検証ポリシーを MCP server-side で保持し、agent がどのレベルからも indirect に成功しないようにします。全呼び出しで **caller identity + method + decision ID + timestamp** を append-only ログに記録し、エージェントの権限昇格を検出可能にします。
+
+付録B で **MCP Python SDK による実装ミニマル例**を示します。
 
 ---
 
-## 12.11 失敗パターンと対策
+## 12.6 `fm_query` — hallucination 対策プロトコル
+
+FM に問い合わせるときの Skill。**vol-01 第10章文献照合 Skill を FM 出力に適用**します。
+
+### プロトコル 4 原則
+
+1. **Retrieval-augmented 前提**：FM 単体には答えさせない。関連文献 / 社内 DB を retrieval し context に埋める
+2. **Citation 強制**：応答の各 claim に retrieval 結果へのポインタを要求
+3. **Confidence 明示**：FM に「わからない場合は "unknown"」と答える権利を与え、Human 側で dispatch
+4. **Verification loop**：FM 応答を retrieval 結果と再照合し、矛盾があれば flag
+
+### 実装
+
+```python
+# fm_query.py
+from dataclasses import dataclass
+
+
+@dataclass
+class RetrievalHit:
+    source_id: str        # 例: arxiv:2401.xxxxx, internal_doc:12345
+    excerpt: str
+    chunk_id: str         # corpus 内 chunk の一意 ID
+    chunk_sha256: str     # 本文の hash（再現性）
+    embedding_model_id: str
+    embedding_index_version: str
+    corpus_snapshot_id: str
+    rank: int
+    score: float
+    retrieved_at: str
+
+
+def _lexical_faithfulness(
+    text: str,
+    cited_ids: list[str],
+    hits: list[RetrievalHit],
+    ngram_size: int = 3,
+) -> float:
+    """
+    faithfulness score ∈ [0.0, 1.0]（値が大きいほど retrieval と整合）。
+
+    定義：
+      1. text から claim 文を抽出（`.` / `。` / `\\n` 区切り）
+      2. 各文について、その文が引用している source_id に対応する excerpt を集める
+      3. 文の n-gram（token 単位、Unicode 対応の正規化後）と excerpt の n-gram の Jaccard 類似度を計算
+      4. 全 claim 文についての平均を返す（citation を持たない文は 0 として平均に含める）
+
+    Calibration：
+      - 参照実装は SciBERT tokenizer + n=3 token n-gram + Jaccard
+      - Domain 別に閾値（threshold_stop）は再校正すること（本 skill 契約の 0.4 は開発用）
+
+    Fallback：
+      - retrieval hits が空、あるいは cited_ids が空の場合は 0.0 を返す
+      - 文抽出に失敗した場合は `NaN` を返さず 0.0（安全側 = route_to_human 側）
+    """
+    # 実装骨子は本文参照。参照実装は付録B（materials_fm_helpers.py）
+    ...
+
+
+def fm_query(
+    prompt: str,
+    retrieve_fn,                            # (prompt) -> list[RetrievalHit]
+    fm_call_fn,                             # (system, prompt) -> {"text": ..., "logprobs": ...}
+    response_language: str = "ja",          # 応答言語（system prompt に注入）
+    max_hits: int = 8,
+    retrieval_min_hits: int = 3,            # 契約と一致させる
+    require_citations: bool = True,
+    faithfulness_stop_threshold: float = 0.4,
+    confidence_warn_threshold: float = 0.6,
+) -> dict:
+    """
+    hallucination 対策プロトコルつきの FM 呼び出し。
+    """
+    hits = retrieve_fn(prompt)[:max_hits]
+
+    # 事前ガード：retrieval hit が最小要件を満たさない場合、FM を呼ばず Human 送り
+    if len(hits) < retrieval_min_hits:
+        return {
+            "response_text": "",
+            "citations": [],
+            "hallucination_flags": ["insufficient_retrieval_hits"],
+            "confidence_estimate": 0.0,
+            "faithfulness_score": 0.0,
+            "combined_gate": "stop",
+            "action": "route_to_human_no_source_available",
+        }
+
+    context = _format_hits_with_ids(hits)
+
+    # answer_status は機械可読な control token として固定（言語に依存させない）
+    system = (
+        f"You are a materials science assistant. "
+        f"Answer in {response_language}. "
+        f"Answer ONLY from the provided sources. "
+        f"Every factual claim MUST cite one of the provided source_ids in the form [source_id]. "
+        f'If the sources do not contain the answer, respond with exactly this JSON: '
+        f'{{"answer_status": "unknown"}}'
+    )
+    full_prompt = f"{context}\n\nQuestion: {prompt}"
+    response = fm_call_fn(system=system, prompt=full_prompt)
+    text = response["text"]
+
+    # UNKNOWN 応答は control token（JSON）で検出、言語に依存しない
+    if _is_unknown_control_token(text):
+        return {
+            "response_text": text,
+            "citations": [],
+            "hallucination_flags": [],
+            "confidence_estimate": 0.0,
+            "faithfulness_score": 0.0,
+            "combined_gate": "warn",           # 応答なしはハルシネーションではない
+            "action": "route_to_human_no_source_available",
+        }
+
+    # citation 抽出 + retrieval 照合
+    cited_ids = _extract_bracketed_source_ids(text)
+    known_ids = {h.source_id for h in hits}
+    unknown_citations = [cid for cid in cited_ids if cid not in known_ids]
+
+    # 「引用のない claim」を粗く検出（各文が [source_id] を含むか）
+    uncited_claim_sentences = _detect_uncited_claim_sentences(text)
+
+    # claim-level validation：各文の主張が、実際に cited excerpt によって支持されているか
+    #   citation が real でも、excerpt に書かれていない主張は「unsupported claim」として別扱い
+    unsupported_claims = _detect_unsupported_claims(text, cited_ids, hits)
+
+    hallucination_flags = []
+    missing_or_invalid = require_citations and (unknown_citations or uncited_claim_sentences)
+    if missing_or_invalid:
+        hallucination_flags.append("missing_or_invalid_citation")
+    if unsupported_claims:
+        hallucination_flags.append("unsupported_claim_despite_citation")
+
+    # verification loop: 各 citation が対応 excerpt と語彙的に整合するか（faithfulness 近似）
+    faithfulness = _lexical_faithfulness(text, cited_ids, hits)
+    if faithfulness < faithfulness_stop_threshold:
+        hallucination_flags.append("low_lexical_faithfulness")
+
+    # confidence は logprob と faithfulness の組合せ（実装は簡易）
+    logprob_confidence = response.get("mean_logprob_confidence", 0.5)
+    confidence_estimate = 0.5 * logprob_confidence + 0.5 * faithfulness
+
+    # Ch08 uncertainty_stop_gate 互換の tri-state 統合ゲート
+    #   stop 優先：任意の stop 条件で stop、warn は confidence のみで昇格
+    combined_gate = "pass"
+    if hallucination_flags or missing_or_invalid:
+        combined_gate = "stop"
+    elif confidence_estimate < confidence_warn_threshold:
+        combined_gate = "warn"
+
+    return {
+        "response_text": text,
+        "citations": cited_ids,
+        "retrieval_hits_used": [h.source_id for h in hits],
+        "unknown_citations": unknown_citations,
+        "uncited_claim_sentences": uncited_claim_sentences,
+        "unsupported_claims": unsupported_claims,
+        "hallucination_flags": hallucination_flags,
+        "faithfulness_score": faithfulness,
+        "confidence_estimate": confidence_estimate,
+        "combined_gate": combined_gate,                 # "pass" | "warn" | "stop"
+        "action": (
+            "route_to_human" if combined_gate == "stop"
+            else "review_recommended" if combined_gate == "warn"
+            else "continue"
+        ),
+    }
+```
+
+### 契約 YAML
+
+```yaml
+# fm_query.yaml
+skill: "fm_query"
+version: "1.0.0"
+
+requires:
+  retrieval_before_fm_call: true                  # RAG 必須。FM 単体呼び出しは fatal
+  retrieval_min_hits: 3                           # hit 0 では回答させない
+  citation_required_in_response: true
+  unknown_response_allowed_and_encouraged: true
+
+hallucination_gate:
+  monitors:
+    - metric: "insufficient_retrieval_hits"
+      action_if_present: "route_to_human_no_source_available"
+      description: "hits < retrieval_min_hits の場合、FM を呼ばず即 Human 送り"
+    - metric: "missing_or_invalid_citation"
+      action_if_present: "route_to_human"
+    - metric: "unsupported_claim_despite_citation"
+      action_if_present: "route_to_human"
+      description: "citation は real でも excerpt に主張が支持されない claim（fabrication）"
+    - metric: "faithfulness_score"
+      threshold_stop: 0.4                         # 40% 未満なら停止
+      direction: "higher_is_safer"
+    - metric: "confidence_estimate"
+      threshold_warn: 0.6
+
+combined_gate:                                    # Ch08 uncertainty_stop_gate と同じ tri-state
+  states: ["pass", "warn", "stop"]
+  stop_precedence: true                           # 任意の stop 条件で stop
+  warn_only_condition: "confidence_estimate < 0.6 かつ他の stop 条件なし"
+  pass_condition: "全 stop 条件回避 かつ confidence >= warn 閾値"
+
+acceptance:
+  every_claim_has_citation: true
+  citations_resolve_to_retrieval_hits: true
+  claims_supported_by_cited_excerpts: true        # claim-level validation
+  no_fabricated_source_ids: true
+
+agent_authorization:
+  L1: "query_and_report_only"
+  L2: "query_and_use_response_within_domain_scope"
+  L3:
+    can_query_extended_scope: "with_prior_approval"
+    cannot_disable_hallucination_gate: "forbidden_all_levels"
+  never_allowed:
+    - "call_fm_without_retrieval"
+    - "post_edit_fm_response_to_add_citations"
+    - "silently_drop_uncited_sentences"
+
+provenance:
+  fm_query_provenance:
+    prompt_hash: "sha256"
+    response_language: "str (e.g., ja, en)"
+    retrieval_hits:                               # 各 hit の再現性フィールドを列挙
+      - source_id: "str"
+        chunk_id: "str"
+        chunk_sha256: "str"
+        embedding_model_id: "str"
+        embedding_index_version: "str"
+        corpus_snapshot_id: "str"
+        retriever_config_hash: "str"
+        rank: "int"
+        score: "float"
+    fm_response_text_hash: "sha256"
+    citations_extracted: "list"
+    unknown_citations: "list"
+    unsupported_claims: "list"
+    hallucination_flags: "list"
+    faithfulness_score: "float"
+    confidence_estimate: "float"
+    combined_gate: "pass | warn | stop"
+    action_taken: "continue | review_recommended | route_to_human | route_to_human_no_source_available"
+    fm_model_provenance_ref: "id (from fm_fetch_and_verify)"
+```
+
+> [!IMPORTANT]
+> **`post_edit_fm_response_to_add_citations` の禁止**は極めて重要です。エージェントが「citation なしの claim」に事後で citation を貼ると、検証プロトコル全体が崩壊します。**FM の生 response と、citation 抽出結果は分けて保存**し、後付けでは editable にしません。
+
+---
+
+## 12.7 `fm_update_gate` — FM 更新の受け入れ判断
+
+FM は数週間〜数か月で新バージョンが出ます。エージェントが自動で受け入れると、下流タスクの動作が静かに変わります。
+
+### 判断フロー
+
+```mermaid
+flowchart TB
+    A["新バージョン FM 検出"] --> B["fm_fetch_and_verify で候補取得"]
+    B --> C{"重み署名 + license OK?"}
+    C -->|"NO"| Z["reject"]
+    C -->|"YES"| D["ベンチマーク実行<br/>(社内タスク N 種)"]
+    D --> E{"全ベンチマーク<br/>tolerance 内?"}
+    E -->|"NO"| F["Human 判断へ<br/>(defer_to_human)"]
+    E -->|"YES, かつ<br/>差分小"| G["shadow deploy<br/>(候補と旧を並行実行)"]
+    G --> H{"shadow N 日で<br/>矛盾率 < 閾値?"}
+    H -->|"NO"| F
+    H -->|"YES"| I["Human 最終承認"]
+    I -->|"approve"| J["accept<br/>本番切替"]
+    I -->|"defer"| F
+    F --> K["Human が承認 or 却下"]
+```
+
+### 契約 YAML
+
+```yaml
+# fm_update_gate.yaml
+skill: "fm_update_gate"
+version: "1.0.0"
+
+trigger:
+  new_revision_detected: true
+  scheduled_review_interval_days: 30
+
+verification_pipeline:
+  step_1_signature:
+    reference: "fm_fetch_and_verify.yaml"
+    fatal_on_fail: true
+  step_2_benchmarks:
+    tasks: "organization_defined_benchmark_suite"
+    min_tasks: 3
+    per_task_tolerance:
+      metric_delta_max_relative: 0.05         # ベースライン比 ±5% 内
+    stratify_by: ["instrument", "task_type"]
+  step_3_shadow_deploy:
+    sampling_semantics:
+      mode: "duplicated_shadow_traffic"           # 本番 request を「複製」して両モデルで実行
+      user_facing_traffic_uses: "old_only"        # 新 FM は user 応答には未反映
+      eligible_traffic_filter: "production_queries_of_the_target_task"
+    parallel_call_ratio: 0.1                      # 本番 request の 10% を複製して並行実行
+    duration_days: 7
+    min_shadow_samples_total: 5000                # 期間だけでなく最小サンプル数を要求
+    min_samples_per_stratum: 200                  # instrument / task_type の各層で
+    stratify_by: ["instrument", "task_type"]
+    disagreement_metric:
+      formula: "1 - agreement_rate"
+      agreement_rate: "count(old.answer == new.answer) / count(both_answered)"
+      denominator_excludes: ["both_returned_unknown", "either_errored"]
+      confidence_interval: "wilson_95pct"
+      max_disagreement_rate: 0.05                 # CI 上限が 0.05 を超えたら fail
+    expected_baseline_disagreement: 0.02          # 事前想定
+    detectable_effect_size: 0.03                  # 検出したい実効差
+    early_stop_if_worse: true
+    early_stop_trigger: "wilson_lower_ci > max_disagreement_rate"
+  step_4_human_approval:
+    required: true
+    reviewers_min: 2
+    provenance_snapshot_shown: true
+    downstream_impact_analysis_shown: true    # 依存 Skill の影響予測
+
+decision_matrix:
+  all_steps_pass_and_human_approve: "accept"
+  benchmark_fail_or_shadow_fail: "defer_to_human"
+  signature_fail: "reject"
+  human_reject: "reject_and_log_rationale"
+
+rollback_contract:                                # accept 後の regression 対応
+  monitored_metrics_after_accept:
+    - "downstream_hallucination_flag_rate"
+    - "downstream_confidence_distribution_shift"
+    - "downstream_review_duration"                # Ch10 の QC signal
+  rollback_trigger:
+    hallucination_flag_rate_relative_increase_max: 0.20
+    monitoring_window_days: 7
+  rollback_procedure:
+    who_can_trigger: "MCP admin OR on-call engineer with quorum >= 2"
+    action: "fm.set_default_version <- previous_approved_version"
+    requires_signed_emergency_decision: true      # rollback も fm_update_gate_decision の一種
+    audit_event: "fm_rollback (append-only)"
+  old_version_retention:
+    minimum_days_after_accept: 30                 # rollback 可能な期間
+  silent_downgrade_forbidden: true
+
+agent_authorization:
+  L1: "read_only_report"
+  L2: "run_verification_pipeline_but_not_switch"
+  L3:
+    can_recommend_accept: true
+    cannot_switch_production_without_human: "forbidden_all_levels"
+  never_allowed:
+    - "auto_accept_without_human"
+    - "skip_shadow_deploy"
+    - "reduce_benchmark_min_tasks"
+    - "silently_downgrade_after_accept"
+
+provenance:
+  fm_update_gate_decision:
+    old_fm_provenance_ref: "id"
+    new_fm_provenance_ref: "id"
+    benchmark_results_hash: "sha256"
+    shadow_deploy_disagreement_rate: "float"
+    human_reviewers_hashed: "list"
+    decision: "accept | defer_to_human | reject"
+    decision_timestamp: "iso8601"
+    downstream_impact_summary_ref: "id"
+```
+
+> [!WARNING]
+> **FM 更新の "静かな受け入れ" は最も危険な失敗モードの 1 つ**です。新 FM は同じインタフェースで違う応答を返し、下流の Skill・レポート・Human 判断がすべて "旧 FM の癖" に依存している可能性があります。`fm_update_gate` は Ch7 `pretrained_weights` の pre-check より **一段厳しく**設計（shadow deploy を挟む）。
+
+---
+
+## 12.8 vol-01 第10章文献照合 Skill との接続
+
+vol-01 第10章では arXiv / Paper Search MCP を使い、AI 生成テキストの各主張を論文と照合しました。本章 `fm_query` はこれを **FM 出力に対する retrieval + citation + faithfulness** に拡張しています。
+
+| 論点 | vol-01 第10章 | vol-03 第12章 |
+|---|---|---|
+| 対象 | AI 生成の文献レビュー | FM 応答全般（生成 or 要約 or 抽出） |
+| Retrieval source | arXiv API | arXiv MCP + 社内 DB + Hugging Face Datasets |
+| Citation | 論文 DOI / arXiv ID | 一般化された `source_id` |
+| Hallucination 検知 | 論文の実在チェック | citation 実在 + faithfulness + confidence |
+| 監査 | 記録 | Ch10 `deep_report_template` に統合 |
+
+**共通哲学**：*生成物は生成物であって事実ではない。事実は必ず外部ソースから引く。*
+
+---
+
+## 12.9 vol-02 第16章「モデル配布」との接続
+
+vol-02 第16章では「モデルを配る側」と「受け取る側」の責任分担を議論しました。FM は以下の点で特殊です：
+
+| 論点 | vol-02 一般モデル配布 | 本章 FM |
+|---|---|---|
+| 更新頻度 | 数か月〜1年 | 数週間〜数か月 |
+| 更新影響 | 特定タスク | 下流全 Skill |
+| 検証コスト | ベンチマーク再実行 | ベンチマーク + shadow deploy 必須 |
+| ライセンス | 明示的な同意プロセス | 変更されうる（Hub 上で書き換え可能） |
+| Human 承認 | 導入時のみ | 導入時 + 各更新時 |
+
+本章 `fm_update_gate` は vol-02 第16章のフレームを **FM の高頻度更新に耐える形**に強化したものです。
+
+---
+
+## 12.10 失敗パターンと対策
 
 | 失敗 | 症状 / 兆候 | 対策（参照する契約フィールド） |
 |---|---|---|
-| unlabeled < 5000 で SSL 起動 | collapse か chance level | `ssl_pretrain_decision.thresholds.unlabeled_min` + `override_unlabeled_min: never_allowed` |
-| augmentation を勝手にチューニング | 下流 invariance が壊れる | `augmentation_config_pre_approved` + `silently_change_augmentation: never_allowed` |
-| checkpoint を既存 URI に上書き | 前回実行の重みが失われる | `checkpoint_overwrite_policy.never_overwrite_existing_uri` + `overwrite_checkpoint_uri: never_allowed` |
-| BYOL representation collapse を見逃す | loss は下がるが linear probe が chance | `collapse_detection.stop_if_std_below: 0.01` + `ssl_representation_eval.collapsed` flag |
-| GPU 予算超過で silent に継続 | 他ジョブ圧迫、クラスタ運用崩壊 | `gpu_budget_monitor.hard_stop_at_ratio: 1.0` + `continue_after_hard_gpu_stop: never_allowed` |
-| ランダム encoder 比較なしで "SSL 成功" と報告 | 事前学習効果が測れていない | `baseline_random_encoder_comparison: true` + `compare_ssl_encoder_to_untrained_baseline_only: never_allowed` |
-| Marginal representation で下流置換 | 実質改善なしで運用切替 | `ssl_downstream_transfer_gate.representation_quality_required: "good"` + `ignore_marginal_representation: never_allowed` |
-| ECE 悪化を隠して metric 改善だけ報告 | Calibration が退化 | `ece_relative_increase_max: 0.20` + `cherry_pick_metric_to_hide_ece_regression: never_allowed` |
-| SSL 起動時に downstream task 未定義 | 評価軸なしで GPU 消費 | `downstream_task_defined: true` + `no_downstream_task_defined` を defer 直行 |
-| domain_gap を独立推定 | systematic bias で SSL 判断歪む | `domain_gap_score_from_ch7_domain_gap_gate: true` + `invent_domain_gap_score: never_allowed` |
-| 色相 augmentation を SEM に適用 | グレースケール仮定崩壊、SSL 学習不成立 | `color_jitter_disabled_for_grayscale: true` |
-| Human 承認なしで training job 起動 | 権限逸脱・監査崩壊 | `training_job_approval_signed: true` + `launch_without_training_job_approval: never_allowed` |
-| Pretraining unlabeled と downstream test が重複 | ラベル漏洩、SSL が実質 "test を見て" 学習 | `unlabeled_dataset_snapshot` の Merkle root と downstream split manifest を比較する pre-eval check |
-| Encoder eval 時に BN が train mode | val 上のバッチ統計が推論に混入 | `encoder.eval()` を eval Skill 冒頭で強制、`evaluate_in_train_mode: never_allowed` |
-| 大 batch SSL で LARS/LAMB 未使用 | 収束せず collapse・時間浪費 | `optimizer_config` に `optimizer_type` を必須記録、batch >= 1024 で SGD/Adam は warn |
-| Unlabeled と labeled で domain 分布が異なる | SSL 表現が下流に効かない | Ch7 `domain_gap_gate` を **unlabeled → downstream 方向でも実行** し、gap 大なら pretrain を defer |
-| 転移時に projection head も持ち出す | 学習時 head の副作用が下流に持ち込まれる | `transfer_artifact_policy.downstream_uses: backbone_encoder_only` + `transfer_projection_head_without_approval: never_allowed` |
-| Linear probe が未収束のまま "SSL 成功" と報告 | 表現の質を測れていない | `require_convergence_check: true` + `non_converged_defer_to_human` flag |
-| Point estimate だけで下流置換 | ノイズで偽の改善が accept | `require_ci_lower_bound_above_margin: true` + `skip_ci_computation: never_allowed` |
+| `revision: "main"` / 短縮 SHA で fetch | 同じバージョン名で違う重みが降ってくる | `revision_must_be_40hex_commit_sha: true` + `hub_api_resolved_sha_must_match_revision` |
+| `.bin` / `.pt` を trust_remote_code で読む | 任意コード実行の脆弱性 | `safetensors_only` + `trust_remote_code_forbidden` + `load_bin_or_pt_files: never_allowed` |
+| ライセンス表示を Hub API から取得したが manifest と不一致 | 監査でライセンス違反発覚 | `license_from_manifest_matches_hub_advisory` + `model_card_file_sha256_matches_manifest` |
+| エージェントが自作 manifest を渡して検証をバイパス | 承認プロセス空洞化 | `manifest_from_signed_registry_only` + `manifest_approver_quorum_min: 2` |
+| Retrieval 0 件で FM 呼び出し | citation 皆無で hallucination | `insufficient_retrieval_hits` monitor（`fm_query` 事前ガード） |
+| FM 単体呼び出しで hallucination | citation なし応答が下流に流れる | `retrieval_before_fm_call: true` fatal + `call_fm_without_retrieval: never_allowed` |
+| citation が実在しない ID | ハルシネーション典型例 | `unknown_citations` を `missing_or_invalid_citation` flag に |
+| citation は real だが excerpt が主張を支持しない | subtle fabrication | `unsupported_claim_despite_citation` flag（claim-level validation） |
+| citation を後付けで貼る | プロトコル崩壊 | `post_edit_fm_response_to_add_citations: never_allowed` |
+| `fm_update_gate` の shadow deploy をスキップ | 静かな挙動変化 | `skip_shadow_deploy: never_allowed` + `min_shadow_samples_total` + `min_samples_per_stratum` |
+| FM 更新を自動 accept | 下流破壊 | `auto_accept_without_human: never_allowed` + `reviewers_min: 2` |
+| Accept 後の regression を silent downgrade | 監査不能 | `rollback_contract` + `silent_downgrade_forbidden` + `old_version_retention.minimum_days_after_accept` |
+| CrystaLLM が物理的に不整合な CIF を出力 | 対称性・密度・結合角が破綻 | `crystal_physical_validation` の 7 validator（cif_parser / charge / density / bond_length / bond_angle / symmetry / allowed_elements） |
+| Faithfulness score だけを信じて Human 送りしない | subtle hallucination を見逃す | `combined_gate` tri-state + 任意の stop 条件 で `route_to_human` |
+| MCP 経由呼び出しの監査ログが欠落 | 誰が何を FM に聞いたか追跡不能 | MCP 側で全問い合わせを **caller identity + method + decision ID + timestamp** で append-only ログに（付録B） |
+| FM が UNKNOWN を返すべき場面で無理に答える | user pleasing hallucination | system prompt で control token `{"answer_status": "unknown"}` を明示 + logprob 低下時の flag |
+| pretraining data license を manifest に書かず配布 | 下流ライセンス違反 | `pretraining_data_license` manifest 必須 |
+| FM ベンチマークが1つのタスクのみ | 特定タスクの偽陽性で accept | `min_tasks: 3` + `stratify_by` + `reduce_benchmark_min_tasks: never_allowed` |
 
 ---
 
-## 12.12 まとめ
+## 12.11 まとめ
 
-- SSL は **「作る側」の判断が主題**：`ssl_pretrain_decision` で SSL を回すか既存 FM を使うかを厳格化
-- **SimCLR / BYOL / MoCo** は GPU 予算・batch サイズで使い分け、GPU 1 枚なら **MoCo v3 が第一候補**
-- **augmentation は Skill 契約の一部**、Human 承認なしにエージェントが変更できない
-- **checkpoint 上書き禁止**、GPU 予算 hard_stop、collapse 検知を契約で強制
-- **`ssl_representation_eval`** はランダム encoder との比較を義務化し、"効いた" を客観化
-- **`ssl_downstream_transfer_gate`** は metric 改善 + calibration 悪化なし + Human 承認の 3 点セット
-- SSL 特有の失敗パターン 12 件を Skill 契約で予防
+- Foundation Model は **vol-01 文献照合 + vol-02 モデル配布** の議論の合流点
+- **MatBERT / CrystaLLM / ChemBERTa** はタスク特性で使い分け、生成系（CrystaLLM）は物理検証必須
+- **`fm_fetch_and_verify`** は commit hash + safetensors 限定 + manifest 事前承認で pretrained weight 検証を FM に強化
+- **`fm_query`** は retrieval-augmented + citation 強制 + faithfulness で hallucination を検知
+- **`fm_update_gate`** は signature → benchmark → shadow deploy → Human 承認の 4 段階
+- MCP 経由呼び出しで **権限分離 + 監査ログ**、実装は付録B
+- FM 特有の失敗パターン 13 件を Skill 契約で予防
 
-## 12.13 章末チェックリスト
+## 12.12 章末チェックリスト
 
-- [ ] `ssl_pretrain_decision` を通してから SSL 起動しているか（自律起動禁止）
-- [ ] `domain_gap_score` は第7章 `domain_gap_gate` の出力を使っているか（独立推定禁止）
-- [ ] `augmentation_config` の hash が Human 承認済みと一致しているか
-- [ ] `checkpoint_overwrite_policy.never_overwrite_existing_uri` が有効か
-- [ ] GPU 予算の soft_stop / hard_stop が設定され、hard_stop 後の継続禁止か
-- [ ] BYOL / MoCo で `collapse_detection` が有効か
-- [ ] `ssl_representation_eval` でランダム encoder との比較をしているか
-- [ ] linear probe / kNN / few-shot の 3 種を並行報告しているか
-- [ ] `ssl_downstream_transfer_gate` の 4 条件（metric / ECE / quality / Human）を全部通っているか
-- [ ] SEM グレースケール想定なら `color_jitter_disabled_for_grayscale: true` か
-- [ ] Unlabeled と downstream test の重複チェック（Merkle root 比較）が済んでいるか
-- [ ] 転移するのは backbone のみか（projection head / predictor は含めない）
-- [ ] 大 batch (>= 1024) の場合、`optimizer_config` に LARS / LAMB を明示しているか
-- [ ] 下流評価は immutable な train/val/test split で、SSL と対照 encoder が同一 split・同一 seed を使っているか
-- [ ] Linear probe の convergence check + feature standardization が有効か
-- [ ] Transfer gate で point estimate ではなく CI 下限で判定しているか
-- [ ] ECE guard は絶対値 + 相対値の両方を通しているか
+- [ ] FM の `revision` は commit hash か（tag / main / branch 拒否）
+- [ ] safetensors ファイルのみ許可しているか、trust_remote_code は False か
+- [ ] manifest が Human 事前承認済みで sha256 + license が固定されているか
+- [ ] `fm_query` は retrieval 前提で citation 必須か
+- [ ] hallucination_flags が複数 monitor で並置され、任意 1 つで Human 送りか
+- [ ] `post_edit_fm_response_to_add_citations` が never_allowed か
+- [ ] `fm_update_gate` は signature → benchmark → shadow deploy → Human の 4 段階を全て通っているか
+- [ ] FM 更新の shadow deploy 期間・並行比率・矛盾率閾値が契約に明記されているか
+- [ ] MCP 経由呼び出しで全問い合わせが append-only 監査ログに書かれているか
+- [ ] CrystaLLM 等の生成系で物理検証 filter を通しているか
 
-## 12.14 ワーク
+## 12.13 ワーク
 
-**W12-1**: `ssl_pretrain_decision` を実装せよ。unlabeled = {3k, 10k, 50k}, domain_gap = {0.2, 0.5, 0.8}, existing_fm = {True, False}, gpu_hours_available/estimated = {50/30, 20/30} の全組合せで decision と reasons を出力し、判断表を作成せよ。
+**W11-1**: MatBERT を Hugging Face Hub から取得し、`fm_fetch_and_verify` の manifest 事前承認 + sha256 検証フローを実装せよ。manifest の 1 バイトを改ざんしたときに fatal assert が発火することを確認せよ。
 
-**W12-2**: ARIM 風合成 SEM 画像（vol-02 の `data/synthetic-hierarchy/` を拡張）で unlabeled 5,000 枚を用意し、MoCo v3 で ResNet-18 を SSL せよ。GPU 1 枚での実測時間・GPU 使用率・最終 collapse std を報告せよ。
+**W11-2**: 材料論文の要約タスクで `fm_query` を実装し、citation 抽出と faithfulness score を計算せよ。10 件のうち何件が `route_to_human` に落ちるかを報告せよ。
 
-**W12-3**: W12-2 の encoder を `ssl_representation_eval` で評価せよ。同アーキのランダム encoder と比較し、few-shot linear probe (5/20/100 labels/class) の改善幅を報告せよ。
+**W11-3**: 架空の "新バージョン MatBERT" を用意し、`fm_update_gate` の 4 段階を回して decision matrix の 4 パターン（accept / defer / reject / signature_fail）を全て再現せよ。
 
-**W12-4**: BYOL を意図的に collapse させる augmentation（例：identity 変換を positive pair に使う）で実行し、`ssl_representation_eval.collapsed` flag が発火することを確認せよ。
+**W11-4**: CrystaLLM で結晶構造を 100 個生成し、物理検証 filter（対称性 + 密度 + 結合角）で何個が破棄されるかを計測せよ。filter を Skill 契約に落とせ。
 
-**W12-5**: `ssl_downstream_transfer_gate` の decision matrix を実装し、accept / defer_to_human / reject の 3 パターンをそれぞれ再現するテストケースを書け（metric improvement, ECE regression, quality flag の組合せで）。
+**W11-5**: MCP 経由の `fm.query` を付録B の Python SDK 実装を使って呼び出し、監査ログが append-only で改ざん不能であることを検証するテストを書け。
 
-## 12.15 参考資料
+## 12.14 参考資料
 
-- Chen, T., Kornblith, S., Norouzi, M., & Hinton, G. (2020). A Simple Framework for Contrastive Learning of Visual Representations (SimCLR). ICML.
-- Grill, J.-B., et al. (2020). Bootstrap Your Own Latent (BYOL): A New Approach to Self-Supervised Learning. NeurIPS.
-- He, K., Fan, H., Wu, Y., Xie, S., & Girshick, R. (2020). Momentum Contrast for Unsupervised Visual Representation Learning (MoCo v1). CVPR.
-- Chen, X., Xie, S., & He, K. (2021). An Empirical Study of Training Self-Supervised Vision Transformers (MoCo v3). ICCV.
-- Ericsson, L., Gouk, H., Loy, C. C., & Hospedales, T. M. (2022). Self-Supervised Representation Learning: Introduction, Advances, and Challenges. IEEE SPM.
-- solo-learn ライブラリ: https://github.com/vturrisi/solo-learn
-- lightly ライブラリ: https://github.com/lightly-ai/lightly
-- 本書 第7章（domain_gap_gate）、第8章（calibration/ECE）、第10章（deep_report_template）、第11章（fm_fetch_and_verify との対比）
-- vol-01 第6章（Human-in-the-loop 承認プロセス）
-- vol-02 第13章（合成階層データ）
-- 本書 第13章（capstone で SSL encoder → PyMC 階層に接続する可能性）
+- Beltagy, I., et al. (2020). SciBERT: Pretrained Language Model for Scientific Text. EMNLP.
+- Trewartha, A., et al. (2022). Quantifying the advantage of domain-specific pre-training on named entity recognition tasks in materials science (MatBERT).
+- Antunes, L. M., Butler, K. T., & Grau-Crespo, R. (2024). Crystal structure generation with autoregressive large language modelling (CrystaLLM). Nature Communications.
+- Chithrananda, S., Grand, G., & Ramsundar, B. (2020). ChemBERTa: Large-Scale Self-Supervised Pretraining for Molecular Property Prediction. arXiv.
+- Lewis, P., et al. (2020). Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. NeurIPS.
+- Model Card guidelines — Mitchell, M., et al. (2019). Model Cards for Model Reporting. FAT*.
+- 本書 第5章（3 レイヤ provenance）、第8章（pretrained weights + Layer 4）、第11章（deep_report_template + human_handback_review）
+- vol-01 第10章（arXiv / Paper Search MCP による文献照合）
+- vol-02 第16章（モデル配布と組織的責任分担）
+- 本書 付録B（MCP Python SDK による組織内サーバ実装）

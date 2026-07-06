@@ -1,647 +1,475 @@
-# 第8章　解釈可能性とレポート化
+# 第8章 モデル選択・交差検証・データリーク検知
+
+> **本章の到達目標**
+> - k-fold / stratified / group / time-series の CV を、データ性質から**機械的に**選び分けられる
+> - **同一試料・同一ロット・時系列**の 3 種の group leak を、`GroupKFold` / `TimeSeriesSplit` で予防できる
+> - **前処理・特徴量選択・欠損補完・ハイパーパラメータ探索**を、Pipeline + `GridSearchCV` / ネスト CV で fold 内実施できる
+> - ハイパーパラメータ探索と本評価を **ネスト CV** で分離し、独立テストへの過剰参照を防げる
+> - AI エージェント特有のリーク（**会話コンテキスト経由の情報伝播・後付け特徴量追加・test スコア駆動探索**）を検知できる
+> - 本章末の **CV 設計チェックリスト** を、以降すべての Skill 実装で使う
+>
+> **本章で扱わないこと**
+> - モデル自体の解釈（SHAP / PDP / permutation importance） → **第9章**
+> - PyMC / ベイズ推論の診断（$\hat{R}$ / ESS / PPC） → **第11章・第13章**
+> - 深層学習の CV（early stopping、時間軸に沿った検証） → 本書外
+> - 統計的検定（多重比較補正の理論） → 統計学の教科書に譲る。ただし多重比較の実務的落とし穴は本章 §8.7 で言及
+
+---
+
+## 8.1 なぜこの章か——第6章の「とりあえず KFold」の限界
+
+第6章では、Skill 構造を示すために `KFold(n_splits=5, shuffle=True)` を素で使いました。しかし、次のような場面では **これだけでは不十分** です：
+
+- **同一試料の反復測定が train と test に分かれて入る** → CV スコアが良くても実運用では悪化（第6章 §6.9 の代表症状）
+- **同一ロットの試料が分割違反** → 「見たことのある組成領域」で評価してしまう
+- **時系列データで未来を先に見る** → CV では「予測できた」ように見えるが、実運用では成立しない
+- **前処理を全データで実施** → CV の各 fold で微妙にリーク
+- **ハイパーパラメータを何度も試して、独立テストで確認** → 独立テストが「本当の独立」ではなくなる
+
+**第8章は、「どう推定するか」だけに集中します**。第6章・第7章では「何を予測するか」「何を成功とみなすか」が主題でしたが、ここでは **推定手続きそのものの正しさ** を問います。
 
 > [!IMPORTANT]
-> **本章の到達目標**
->
-> - **なぜ解釈するのか**を、Human-in-the-loop の質を上げる視点で言語化できる
-> - **permutation importance / PDP / SHAP** の 3 手法の使い分けと落とし穴を説明できる
-> - **物理知見との突き合わせ**を仕様書に組み込める
-> - **統計的有意 ≠ 物理的意義**の区別を Skill レベルで担保できる
-> - 解釈可能性 Skill の 6 要素仕様を書ける
-> - 再現可能な解釈レポートを Provenance 付きで生成できる
-
-## 本章で扱わないこと
-
-- **因果推論・因果効果推定**：SHAP 値は因果効果ではない。因果は vol-04 で扱う
-- **深層学習モデルの解釈**（Grad-CAM, Attention 可視化等）：vol-03 の範疇
-- **LIME**：SHAP に統合されている実務では優先度が低い（比較のみ触れる）
-- **公平性・バイアス検知**：関連するが独立トピックで、本書では扱わない
+> **第8章はすべての教師あり／教師なし Skill の共通規律**です。ここを飛ばして第9章以降に進むと、以降の章の成果物すべての信頼性が損なわれます。Route C（sklearn のみ）読者にとっては本章が **必読** です（第2章 §2.6）。
 
 ---
 
-## 8.1 なぜ解釈するのか——Human-in-the-loop の質
+## 8.2 CV の 4 分類と選択マップ
 
-材料研究で ML を使う目的は多くの場合、**予測そのものではなく「なぜそうなるか」を人間が判断・議論するため**です。予測が当たっても、次の実験計画・論文執筆・共同研究者との合意形成には**理由**が必要です。
+scikit-learn の `model_selection` には 20 以上の splitter がありますが、**実務で覚えるべきは 4 分類**です：
 
-エージェント時代には、この「解釈」自体が新しいリスクを持ちます：
-
-| リスク | 例 |
-|---|---|
-| **もっともらしい解釈のハルシネーション** | 「SHAP 値が高い＝物理的に重要」とエージェントが断言 |
-| **解釈手法の選択自体が結果を歪める** | permutation vs SHAP で「重要な特徴」が違う |
-| **統計的有意を物理的意義と混同** | p 値が小さい ≠ 材料設計に使える寄与 |
-| **解釈が意思決定を後押しする方向にドリフト** | 「解釈できたから採用」の逆算 |
-
-本章の目的は、**解釈手法を Skill として仕様化することで、これらのリスクを事前に封じる**ことです。
-
----
-
-## 8.2 3 つの解釈手法：使い分けマップ
-
-実務で最初に覚える 3 手法：
-
-| 手法 | 何を測るか | 計算コスト | 主な用途 | 主な落とし穴 |
-|---|---|---|---|---|
-| **Permutation Importance** | 特徴量をシャッフルした際の予測性能低下 | O(n_features × n_repeats) | どの特徴量がモデルに効いているかの全体像 | 特徴量間の相関に弱い（相関特徴量は互いに importance を下げ合う） |
-| **PDP（Partial Dependence Plot）** | 特徴量を変化させたときの平均予測 | O(n_features × grid) | 「その特徴量を増やすとどう変わるか」の可視化 | 特徴量間の相関を無視した外挿を含む |
-| **SHAP** | 各サンプル・各特徴量の寄与を Shapley 値で分解 | O(n_samples × モデル依存) | 局所（1 サンプルごと）と大域の両方 | 計算コスト大、tree ベース以外は近似が必要 |
+| 分類 | Splitter | 使う場面 |
+|---|---|---|
+| **一般 CV** | `KFold`, `ShuffleSplit`, `RepeatedKFold` | データが i.i.d.、識別子・時系列・グループ構造なし |
+| **層化 CV** | `StratifiedKFold`, `StratifiedShuffleSplit` | 分類、クラス不均衡あり |
+| **グループ CV** | `GroupKFold`, `GroupShuffleSplit`, `LeaveOneGroupOut`, `StratifiedGroupKFold` | 反復測定・ロット・被験者・機器などのグループ構造あり |
+| **時系列 CV** | `TimeSeriesSplit`（scikit-learn 標準）、rolling / expanding window（自作 or `sktime`） | 時系列データ |
 
 ### 選択マップ
 
 ```mermaid
 flowchart TD
-    A[解釈したい] --> B{何を知りたい?}
-    B -->|全体で効く特徴量| C{相関特徴量が多い?}
-    C -->|Yes| D[グループ化 permutation importance]
-    C -->|No| E[permutation importance]
-    B -->|特徴量→予測の関数形| F{特徴量間相関が弱い?}
-    F -->|Yes| G[PDP]
-    F -->|No| H[ALE Accumulated Local Effects]
-    B -->|1 サンプルごとの説明| I[SHAP local]
-    B -->|大域の要約| J[SHAP global mean-abs]
+    A[データを準備] --> B{時間順序に依存?}
+    B -->|Yes| B2{同一試料/ロット/被験者<br/>が時系列で複数測定?}
+    B2 -->|Yes| B3["Group-aware TimeSeriesSplit<br/>／panel split／自作 splitter<br/>（標準では不足）"]
+    B2 -->|No| C[TimeSeriesSplit / rolling]
+    B -->|No| D{同一試料/ロット/被験者<br/>が複数レコード?}
+    D -->|Yes| E{分類 + クラス不均衡?}
+    E -->|Yes| F[StratifiedGroupKFold]
+    E -->|No| G[GroupKFold]
+    D -->|No| H{分類 + クラス不均衡?}
+    H -->|Yes| I[StratifiedKFold]
+    H -->|No| J[KFold shuffle=True]
 ```
 
-> [!NOTE]
-> **ALE**（Accumulated Local Effects）は相関特徴量に強く PDP の代替として推奨されますが、scikit-learn 標準ではないため、本書では概念のみ紹介し、実装は SHAP または `alibi` パッケージを推奨します。
+> [!WARNING]
+> **時間順序 + グループ構造の併存**は標準 splitter だけでは対応不能な場合が多く、`LeaveOneGroupOut` + 時間順序制約や、`sktime` の panel splitter、または自作 splitter が必要になります。「同一試料を時系列で繰り返し測定」「ロット別の経時変化」などが該当します。
 
-### 3 手法は「一致すべき」ではない
+### 4 分類の意思決定を仕様書に書く
 
-読者の直感に反しますが、**3 手法の結果は必ずしも一致しません**。それぞれ**測っているものが違う**からです：
-
-- **permutation importance**：「その特徴量が使えなくなったらどれだけ性能が落ちるか」（モデル性能への貢献）
-- **PDP**：「その特徴量を変えたら予測平均はどう動くか」（関数形）
-- **SHAP**：「予測値のうちその特徴量が寄与している分」（予測値への貢献）
-
-3 手法で異なる結論が出た場合、それは**モデルが特徴量間の複雑な相互作用を捉えている**サインで、無理に一致させるのではなく**それぞれの解釈**を仕様書に書き込むのが正しい対応です。
-
----
-
-## 8.3 permutation importance の Skill 化
-
-### 基本と落とし穴
-
-scikit-learn 標準の `permutation_importance`：
-
-```python
-from sklearn.inspection import permutation_importance
-
-result = permutation_importance(
-    pipeline, X_test, y_test,
-    n_repeats=30, random_state=42, n_jobs=-1,
-    scoring="neg_root_mean_squared_error",
-)
-
-importances = pd.DataFrame({
-    "feature":       X_test.columns,
-    "importance":    result.importances_mean,
-    "std":           result.importances_std,
-}).sort_values("importance", ascending=False)
-```
-
-**落とし穴**：
-
-1. **test セットで計算する**（train で計算するとリークした特徴量が過大評価される）
-2. **`n_repeats`**：scikit-learn デフォルトは 5 ですが、安定した順位を得るには `n_repeats=30` 程度を実務標準として推奨します（データサイズ・モデル計算コストと相談）
-3. **相関特徴量問題**：`x1` と `x2` が強く相関している場合、片方をシャッフルしても他方から情報が復元でき、両方の importance が過小評価される
-4. **符号の読み方**：`permutation_importance` は「baseline_score - permuted_score」を返します。`scoring="neg_root_mean_squared_error"` の場合、`baseline=-1.0, permuted=-1.4` なら `importance = -1.0 - (-1.4) = +0.4`。**重要な特徴量ほど `importances_mean` は正に大きい**ため、順位付けはそのまま `importances_mean` 降順で行います（符号反転しない）
-5. **CV との併用**：CV の各 fold で計算し、fold 間で集約するのが最も安定（第7章 §7.5 と同じ発想）
-6. **不確かさの表現**：`importances_std` に加えて、bootstrap で 95% CI を出す（サンプル bootstrap を n_repeats と組み合わせる、または重複を許した resample）。第9章への橋渡し
-
-### 相関特徴量問題の対処
-
-```python
-# 相関の強い特徴量をグループ化
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import squareform
-
-corr = np.abs(X_test.corr().fillna(0).values)   # 定数列で NaN が出る場合の保険
-dist = 1 - corr
-np.fill_diagonal(dist, 0)
-Z = linkage(squareform(dist), method="average")
-cluster_ids = fcluster(Z, t=0.3, criterion="distance")
-# ↑ t=0.3 は「結合距離の目安」であり、|r|>=0.7 相当を狙う設定。
-#   ただし method="average" では、クラスタ内全ペアが |r|>=0.7 になることは
-#   保証しない（平均距離での結合のため低相関ペアが混入しうる）。
-#   保証したい場合は method="complete" を使う。
-
-# クラスタごとに 1 つずつ「代表特徴量」を選び、それで importance を計算
-```
-
-またはシンプルに、**相関 |r| > 0.7 の特徴量ペアがある場合、片方を落としてから計算**する方針もあります。この判断は仕様書に書き込みます。
-
-### Skill 仕様書（抜粋、①〜⑥ は第4章 §4.3 と対応）
+Skill 仕様書 ⑥ 再現性条件の `cv_scheme` フィールドに、**選択根拠**まで書きます：
 
 ```yaml
-skill: permutation_importance_v1
-
-# ① 目的
-purpose: モデルの大域的な特徴量重要度を、test set で評価する
-
-# ② 入力条件
-inputs:
-  fitted_pipeline: sklearn Pipeline （fit 済み）
-  X_test:  pandas.DataFrame
-  y_test:  pandas.Series
-  correlation_policy:
-    threshold: 0.7
-    action:    drop_one_of_pair   # または: group_cluster / warn_only
-
-# ③ 出力形式
-outputs:
-  importance_table:  CSV（feature, importance_mean, importance_std, ci_low, ci_high, rank）
-  importance_plot:   PNG
-  provenance:        YAML（後述）
-
-# ④ 成功条件（method-agreement ではなく method-internal な安定性で判定）
-success_criteria:
-  primary:
-    - 上位 k 特徴量の Spearman's ρ ≥ 0.7 (seed 3 通り以上での順位安定性)
-    - importance の 95% CI を bootstrap で算出済み
-  secondary:
-    - top-5 Jaccard overlap ≥ 0.6 (補助指標)
-    - importance_std / |importance_mean| < 0.3 (変動係数)
-
-# ⑤ 禁止事項（severity 付き）
-forbidden:
-  - item: train セットでの計算
-    severity: fatal
-  - item: 相関 0.7 超のペアを未処理のまま計算
-    severity: audit_violation
-  - item: baseline_score を provenance に記録せず importance のみ報告
-    severity: audit_violation
-
-# ⑥ 再現性条件
-reproducibility:
-  n_repeats:    30    # 標準推奨。小データ・重いモデルでは 10 まで許容
-  random_seed:  仕様書 ⑥ に固定
-  bootstrap:
-    n_bootstrap: 1000
-    ci_level:    0.95
-  package_versions: scikit-learn>=1.3
+cv_scheme:
+  type: GroupKFold
+  n_splits: 5
+  group_column: specimen_id
+  rationale: |
+    RRUFF データは同一標本 (specimen) に対して複数のスペクトルを持つため、
+    KFold では標本レベル leak が起きる。GroupKFold で標本単位の分割を強制。
+    scikit-learn の RepeatedGroupKFold は存在しないため、繰り返しは
+    n_splits を大きく取るか seed を変えて自作する。
 ```
+
+**「後から `TimeSeriesSplit` に変えました」は audit violation**（第5章 §5.5 分類 B）です。CV スキーム自体も凍結対象です。
 
 ---
 
-## 8.4 PDP の Skill 化
+## 8.3 グループリークと `GroupKFold`
 
-### 基本
+### グループリークの定義
 
-```python
-from sklearn.inspection import PartialDependenceDisplay
+**同じ "実体" に由来する複数のレコードが train と test の両方に入ることを、group leak と呼びます**。実体としてよくあるもの：
 
-fig, ax = plt.subplots(1, 3, figsize=(15, 4))
-PartialDependenceDisplay.from_estimator(
-    pipeline, X_test, features=["feat_a", "feat_b", ("feat_a", "feat_b")],
-    ax=ax, grid_resolution=50,
-)
-```
-
-### 落とし穴
-
-1. **外挿問題**：`feat_a` のグリッドを [min, max] で切ると、実際には出現しない組み合わせでの予測を含む
-2. **相関特徴量問題**：`feat_a` を変えるとき `feat_b` は固定される → 相関があると非現実的な組み合わせを評価
-3. **ICE（Individual Conditional Expectation）との併用**：平均だけ見ると Simpson's paradox 的な誤解を招く
-4. **`grid_resolution`**：デフォルト 100 は多すぎることが多い、50〜100 で十分
-
-### ICE との併用が必須の場面
-
-**「特徴量の効果はサンプルによって符号が違う」**ような相互作用が強い場合、PDP の平均線だけでは真実を隠します：
-
-```python
-PartialDependenceDisplay.from_estimator(
-    pipeline, X_test, features=["feat_a"],
-    kind="both",   # "average" (PDP) + "individual" (ICE) を両方描く
-    subsample=200,
-)
-```
-
-**ICE 線が交差する**なら相互作用あり、**全 ICE 線が平行**なら平均代表性が高い、というのが実務判断です。
-
-> [!NOTE]
-> `kind="both"` および `kind="individual"` は **1 特徴量 PDP のみ** で有効です。2 特徴量 PDP（`("feat_a", "feat_b")`）では `kind="average"` のみサポートされます。
-
-### PDP の代替：ALE
-
-相関特徴量が多い場合、**ALE（Accumulated Local Effects）** の方が現実的な解釈を与えます。scikit-learn 標準にはないため、以下のいずれかを推奨：
-
-- `alibi` パッケージ：`from alibi.explainers import ALE`
-- `PyALE` パッケージ：軽量な独立実装
-
-「PDP と ALE の結果が乖離する ＝ 相関特徴量の影響が強い」という診断としても使えます。
-
----
-
-## 8.5 SHAP の Skill 化
-
-### 基本
-
-```python
-import shap
-
-# 前処理と model を分離
-preprocessor = pipeline[:-1]
-model        = pipeline.named_steps["model"]
-
-# 前処理後空間に移してから explainer に渡す
-X_test_transformed = preprocessor.transform(X_test)
-# ColumnTransformer / OneHotEncoder を含む場合、列数は元の X_test と一致しないため
-# get_feature_names_out() で正しい名前を取得する
-feature_names = preprocessor.get_feature_names_out()
-
-# tree ベースモデルなら TreeExplainer（厳密・高速）
-explainer   = shap.TreeExplainer(model)
-shap_values = explainer.shap_values(X_test_transformed)
-
-# 大域：feature importance
-shap.summary_plot(shap_values, X_test_transformed,
-                  feature_names=feature_names, plot_type="bar")
-
-# 局所：1 サンプル（shap_values の形状に応じて index する。次の落とし穴 4 も参照）
-shap.waterfall_plot(shap.Explanation(
-    values=shap_values[0], base_values=explainer.expected_value,
-    data=X_test_transformed[0], feature_names=feature_names,
-))
-```
-
-> [!TIP]
-> scikit-learn 1.2+ では `pipeline.set_output(transform="pandas")` を使うと transform 結果が DataFrame になり、列名が保持されます。sparse 出力が必要な場合（OneHot が多い等）は pandas 化できないため、`get_feature_names_out()` で明示的に取得します。
-
-### 落とし穴と実務判断
-
-1. **モデルタイプで explainer を選ぶ**：
-   - tree（RF, GBM, XGBoost, LightGBM, CatBoost）→ `TreeExplainer`（厳密・高速）
-   - 線形 → `LinearExplainer`
-   - それ以外（NN, SVM, カスタム）→ `KernelExplainer`（近似・遅い）または `Explainer`（自動選択）
-2. **前処理後の空間で計算する**：`preprocessor.transform(X_test)` で前処理後空間に移す。**feature name の取得は `preprocessor.get_feature_names_out()` を必ず使う**（OneHot 展開で列数が変わるため、元の `X_test.columns` を渡すとサイレントに誤名が付く）
-3. **相関特徴量問題は SHAP でも残る**：
-   - `feature_perturbation="tree_path_dependent"`：**背景データ不要**、tree の構造を使うので相関に堅牢
-   - `feature_perturbation="interventional"`：**背景データ必須**（100〜1000 サンプル程度）、独立性を仮定
-   ```python
-   background = shap.sample(X_train_transformed, 100, random_state=42)
-   explainer  = shap.TreeExplainer(
-       model, data=background,
-       feature_perturbation="interventional",
-       model_output="raw",   # or "probability" (binary tree のみ、近似)
-   )
-   ```
-4. **`shap_values` の形状**（SHAP 0.45+ 前提。バージョンで挙動が変わるため、実行時に `np.asarray(shap_values).shape` を provenance に必ず記録）：
-
-   | モデル | 返り値の形状 |
-   |---|---|
-   | 回帰 | `(n_samples, n_features)` |
-   | 二値分類（sklearn tree） | `(n_samples, n_features, 2)` になる場合あり |
-   | 二値分類（XGBoost / LightGBM raw） | `(n_samples, n_features)`（logit 空間） |
-   | 多クラス分類 | `(n_samples, n_features, n_classes)` |
-
-5. **加法性（additivity）は `model_output` の空間で成立**：
-   - 回帰：`shap_values.sum(axis=-1) + expected_value == model.predict(X)`（厳密一致）
-   - 二値分類 raw：logit 空間で加法性、`predict_proba` の確率とは直接一致しない（sigmoid 変換が必要）
-   - 「SHAP 値の合計 = 予測値 - base_value」は**説明対象の output space に依存する**
-6. **符号の意味**：`model_output="raw"` の場合、SHAP 値は生スコア（回帰なら y の単位、分類なら logit）への寄与。確率の解釈をしたい場合は `model_output="probability"` を明示的に指定（対応モデル限定）
-
-### Skill 仕様書（抜粋、①〜⑥ は第4章 §4.3 と対応）
-
-```yaml
-skill: shap_interpretation_v1
-
-# ① 目的
-purpose: モデルの局所・大域の解釈を SHAP 値で生成する
-
-# ② 入力条件
-inputs:
-  fitted_pipeline: sklearn Pipeline （fit 済み）
-  X_test:                  pandas.DataFrame
-  model_type:              "tree" | "linear" | "kernel"   # explainer 選択根拠
-  feature_perturbation:    "tree_path_dependent" | "interventional"
-  background_data:         X_train_transformed のサンプル（interventional 時必須）
-  model_output:            "raw" | "probability"          # additivity の成立空間
-
-# ③ 出力形式
-outputs:
-  shap_values:      npz（形状 = np.asarray(shap_values).shape を provenance に記録）
-  feature_names:    preprocessor.get_feature_names_out() の結果
-  summary_plot:     PNG（bar + beeswarm）
-  waterfall_plots:  PNG × N（代表 N サンプル）
-  provenance:       YAML
-
-# ④ 成功条件（method-agreement は成功条件にしない：§8.2 参照）
-success_criteria:
-  primary:
-    - shap_values の形状と model_output 空間が provenance に記録済み
-    - waterfall で報告される特徴量の符号と絶対値順位を出力
-    - additivity が model_output 空間で検証済み（回帰なら誤差 < 1e-6）
-  secondary:
-    - test サンプルの bootstrap で SHAP mean-abs の 95% CI を算出
-
-# ⑤ 禁止事項（severity 付き）
-forbidden:
-  - item: 前処理を含まない空間で explainer に渡す
-    severity: fatal
-  - item: get_feature_names_out() を使わずに元の X_test.columns を渡す
-    severity: fatal
-  - item: feature_perturbation="interventional" を背景データなしで指定
-    severity: fatal
-  - item: モデルタイプ未確認のまま KernelExplainer を default で使う
-    severity: audit_violation
-  - item: shap_values の平均絶対値だけで「重要度」と単独で呼ぶ（分布を無視）
-    severity: audit_violation
-  - item: 二値分類で logit 空間の SHAP を「確率への寄与」と説明する
-    severity: audit_violation
-
-# ⑥ 再現性条件
-reproducibility:
-  random_seed:      42
-  shap_version:     ">=0.45"  # 形状が list → ndarray に変わったため
-  sample_selection: 独立テストから固定 index（seed 42, 100 サンプル）
-  background_seed:  42
-```
-
----
-
-## 8.6 物理知見との突き合わせ
-
-材料科学の解釈は、**統計的重要度と物理的意義の合致・乖離**の両方が意味を持ちます：
-
-| 状況 | 意味 | 対応 |
+| データ型 | 実体 | group 列の候補 |
 |---|---|---|
-| 統計的に重要 + 物理的に既知 | 妥当性の確認 | 「モデルは既知物理を捉えている」と報告 |
-| 統計的に重要 + 物理的に未知 | **仮説発見**の候補 | 追実験・文献調査で検証 |
-| 統計的に非重要 + 物理的に既知 | **モデル設計の問題** | 特徴量表現・データ量・モデル種類を再検討 |
-| 統計的に非重要 + 物理的に非重要 | ノイズ / 無関係 | 特徴量から除外を検討 |
+| 反復測定 | 同一試料 | `sample_id`, `specimen_id` |
+| 合成条件 | 同一ロット | `batch_id`, `lot_id` |
+| ユーザー研究 | 同一被験者 | `subject_id` |
+| 装置・時期 | 同一機器・同日 | `instrument_id`, `session_date` |
+| スペクトル群 | 同一 RRUFF entry | `rruff_id` |
+
+**group leak があると、CV スコアが実運用より過大**になります。理由：test の「未知試料」が実は train と関連する試料であり、「初見データ」の予測タスクではなくなるためです。
+
+### `GroupKFold` の使い方
+
+```python
+from sklearn.model_selection import GroupKFold, cross_validate
+
+cv = GroupKFold(n_splits=5)
+scores = cross_validate(
+    pipeline, X_train, y_train,
+    groups=groups_train,               # ここが重要
+    cv=cv,
+    scoring=["neg_root_mean_squared_error", "r2"],
+    return_indices=True,
+)
+```
+
+**`groups` パラメータを渡し忘れると `GroupKFold` は使えません**。エージェントが `cross_validate` を書く場合、Skill 仕様書に `group_column` があれば **必ず `groups` を渡す**ように指示するテンプレートを用意します（§8.8 チェックリスト）。
+
+### 分類 + グループの場合：`StratifiedGroupKFold`
+
+分類タスクで **クラス不均衡** かつ **グループ構造** がある場合、`GroupKFold` だけではクラスが偏ります。`StratifiedGroupKFold` で両立します：
+
+```python
+from sklearn.model_selection import StratifiedGroupKFold
+
+cv = StratifiedGroupKFold(n_splits=5)
+for train_idx, test_idx in cv.split(X_train, y_train, groups=groups_train):
+    ...
+```
+
+### 反復回数を増やす場合
+
+`RepeatedKFold` / `RepeatedStratifiedKFold` は sklearn 標準にありますが、**`RepeatedGroupKFold` は存在しません**。反復が必要なら次のいずれか：
+
+- `n_splits` を大きくする（データが許す範囲で）
+- **`GroupShuffleSplit(n_splits=多い, random_state=seed)`** を使う（重複を許すため厳密な k-fold ではないが、実務ではこれが最も安全）
+- **ユニーク group ID をシャッフルして fold に割り当てる自作 splitter**（サンプル ↔ グループの alignment を保ったまま）
+
+> [!WARNING]
+> **`groups` ベクトル自体をシャッフルするコードは書かないでください**。サンプルと group ID の対応関係が壊れ、無効な分割になります。反復するのは「ユニーク group ID の割り当て順」であって、サンプルレベルの `groups` 列ではありません。scikit-learn 1.4 以降で `GroupKFold(shuffle=True, random_state=...)` が導入されているため、環境が許すならこれを使うのが最も簡潔です。
+
+---
+
+## 8.4 時系列リークと rolling / expanding CV
+
+### 時系列 CV の原則
+
+**train は test より過去でなければならない**。これは第6章 §6.2 で最小 holdout として扱いましたが、CV では「複数の window で繰り返し評価」する必要があります。
+
+主な設計：
+
+| 方式 | 特徴 | 使う場面 |
+|---|---|---|
+| **Expanding window（`TimeSeriesSplit`）** | 各 fold で train が拡大、test は次の window | データ蓄積とともに精度が向上する状況 |
+| **Rolling window** | train の window サイズを固定、両者をスライド | データ分布が時期で変化する状況 |
+| **Blocked K-Fold**（時系列内の独立 block を仮定） | train/test に時間ギャップを挟む | 系列内相関が短距離、独立性を仮定できる |
+| **Purged K-Fold**（金融時系列向け） | train/test の境界で系統的除外 | 特徴量計算のウィンドウが未来を含みうる |
+
+### `TimeSeriesSplit` の使用例
+
+```python
+from sklearn.model_selection import TimeSeriesSplit
+
+cv = TimeSeriesSplit(n_splits=5, gap=0, test_size=None)
+for train_idx, test_idx in cv.split(X_sorted):
+    # 事前に timestamp でソートしておく必要がある
+    ...
+```
+
+**注意点**：
+
+- **`X_sorted` は timestamp 昇順にソート済み**であることが前提。ソートを忘れると意味を成さない
+- **`gap` パラメータ**（scikit-learn 0.24+）：train と test の間に空ける index 数。系列内相関が長い場合や、遅延特徴量を使う場合は `gap > 0` にする
+- **`test_size` を指定しない**とデータ量から自動計算。実務では明示的に指定推奨
+
+### 遅延特徴量の未来参照リーク
+
+「t 時点の予測に t-1 以前の値を使う」ような遅延特徴量では、**特徴量計算のウィンドウが時点 t 自身を含む**と現在情報のリークになります。pandas の `rolling` はデフォルトで**trailing window（過去方向）**なので、それ自体が未来を含むわけではありませんが、**時点 t の特徴量として時点 t の値を含めてしまう**と、y_t の予測に y_t 由来の情報が入ります（以下 `value` は目的変数、または予測時点では未観測となる系列を想定します。予測時点で確定している外生変数はこの制約の対象外です）：
+
+```python
+# 悪い例 1：対称移動平均は未来を含む
+df["ma_10"] = df["value"].rolling(10, center=True).mean()
+
+# 悪い例 2：時点 t の特徴量に value_t を含めてしまう
+#   （rolling(10) は t-9 〜 t の平均。y_t の予測に value_t が入る）
+df["ma_10"] = df["value"].rolling(10).mean()
+
+# 良い例：予測時点 t の特徴量は t-1 以前のみを見る
+df["ma_10"] = df["value"].shift(1).rolling(10).mean()
+```
+
+**時系列予測では `shift(1)` を挟むのが基本**です。`shift(1).rolling(10)` は「時点 t の特徴量として t-1 〜 t-10 の平均」を計算します（timestamp 昇順が前提）。
+
+---
+
+## 8.5 前処理・特徴量選択のリークを Pipeline で封じる
+
+### 全データ fit の落とし穴
+
+以下はすべて **fold ごとに train のみで fit** すべきものです：
+
+1. `StandardScaler` / `MinMaxScaler` / `RobustScaler`
+2. `PCA` / `TruncatedSVD`
+3. `SimpleImputer` / `KNNImputer` / `IterativeImputer`（欠損補完）
+4. `SelectKBest` / `SelectPercentile` / `RFE`（特徴量選択）
+5. カテゴリ変数の `TargetEncoder`（scikit-learn 1.3+。目的変数を使う。特にリークしやすい）
+6. カテゴリ変数の `OrdinalEncoder` / `OneHotEncoder`（train に無いカテゴリの扱い）
+
+**Pipeline に入れれば、`cross_validate` が自動的に fold ごとに fit** してくれます。**Pipeline に入れず手書きすると全部リークします**。
+
+### `ColumnTransformer` で列ごとの前処理
+
+異なる列に異なる前処理を適用する場合、`ColumnTransformer` を使います：
+
+```python
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+
+numeric_cols = ["temperature", "pressure", "concentration"]
+categorical_cols = ["method", "substrate"]
+
+preprocessor = ColumnTransformer([
+    ("num", Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  StandardScaler()),
+    ]), numeric_cols),
+    ("cat", Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot",  OneHotEncoder(handle_unknown="ignore")),
+    ]), categorical_cols),
+])
+
+pipeline = Pipeline([
+    ("preprocess", preprocessor),
+    ("model",      RandomForestRegressor(random_state=42)),
+])
+```
+
+**`OneHotEncoder(handle_unknown="ignore")` は重要**：train に無いカテゴリが test に現れると、無指定ではエラーになります。
+
+### 特徴量選択も fold 内で
+
+特徴量選択を全データで実施してから CV を回す（＝「予選」的な使い方）は、**特徴量選択のリーク**として広く知られています：
+
+```python
+# 悪い例：全データで SelectKBest してから CV
+selector = SelectKBest(k=20).fit(X, y)
+X_reduced = selector.transform(X)
+scores = cross_validate(model, X_reduced, y, cv=5)   # リーク
+
+# 良い例：Pipeline 内で fold ごとに選択
+pipeline = Pipeline([
+    ("selector", SelectKBest(k=20)),
+    ("model",    RandomForestRegressor(random_state=42)),
+])
+scores = cross_validate(pipeline, X, y, cv=5,
+                        return_indices=True)   # OK（provenance 付き）
+```
 
 > [!NOTE]
-> 二値（重要/非重要、既知/未知）の分類は初期整理には有効ですが、実務では**確信度（confidence / evidence level）**を持たせるとより実効的です。仕様書では次のように書きます：
-> ```yaml
-> physical_interpretation:
->   - feature: feat_a
->     statistical_importance:   high   # high / medium / low
->     statistical_ci_width:     0.06 eV
->     physical_prior_strength:  medium
->     literature_support:       weak
->     decision:                 hypothesis_candidate
-> ```
+> 第6章 §6.2 の方針に従い、本章でも `cross_validate(..., return_indices=True)` を推奨します（scikit-learn 1.3+）。`cross_val_score` は簡略例で使いますが、実務では `cross_validate` に統一してください。
 
-**エージェントに解釈を丸投げしない**ためのプロトコル：
+---
 
-1. 解釈結果を**まず数値・図として提示させる**（言葉での「この特徴量が重要」を先に出させない）
-2. 人間が**物理的意義との照合**を行う
-3. エージェントには**照合結果を仕様書に書く支援**を依頼する
-4. **統計的有意を「物理的意義」と読み替える解釈をエージェントが提示したら訂正**する。Skill spec で半自動化可能：
-   ```yaml
-   forbidden:
-     - item: '"statistical importance implies physical importance" 型の文を未レビューで出力'
-       severity: audit_violation
-     - item: reviewed_by が未記録のまま report を final 扱いにする
-       severity: audit_violation
-   ```
+## 8.6 ネスト CV：ハイパーパラメータ探索と本評価の分離
+
+### なぜネスト CV か
+
+**同じ CV でハイパーパラメータ選択と汎化性能推定を両方行うと、性能推定が楽観バイアスを持つ**——これは統計学・ML の古典的な問題です（Cawley & Talbot 2010）。理由：CV スコアで選ばれたハイパーパラメータは、その CV スコアに対して過剰適合しているため。
+
+**ネスト CV** は、外側 CV で汎化性能を推定し、内側 CV でハイパーパラメータを選ぶ構造です：
+
+```
+外側 CV (5-fold): 各 fold で
+  ├─ train_outer (80%)
+  │   └─ 内側 CV (5-fold) で GridSearchCV → best hyperparams
+  │       └─ train_outer 全体で best hyperparams で refit
+  └─ test_outer (20%)
+      └─ refit したモデルで評価
+```
+
+### `GridSearchCV` + `cross_val_score` によるネスト CV
+
+**乱数を持つ splitter（`KFold(shuffle=True)` 等）の場合**の最小例：
+
+```python
+from sklearn.model_selection import GridSearchCV, cross_val_score, KFold
+
+param_grid = {"model__n_estimators": [100, 300], "model__max_depth": [5, 10, None]}
+inner_cv = KFold(n_splits=5, shuffle=True, random_state=42)
+outer_cv = KFold(n_splits=5, shuffle=True, random_state=1)
+
+grid = GridSearchCV(pipeline, param_grid, cv=inner_cv,
+                    scoring="neg_root_mean_squared_error", n_jobs=-1)
+nested_scores = cross_val_score(grid, X_train, y_train, cv=outer_cv,
+                                 scoring="neg_root_mean_squared_error")
+
+print(f"ネスト CV RMSE: {-nested_scores.mean():.3f} ± {nested_scores.std():.3f}")
+```
+
+**外側 CV の平均が「モデル選択手続き全体の汎化性能推定値」**、独立テストは **最後に 1 回だけ** 評価する保険の位置づけです。
 
 > [!IMPORTANT]
-> **解釈は final locked model の説明であり、解釈をもとに再設計する場合は Skill version を上げ、別 split / ネスト CV に戻る**（第7章 §7.7 の「test スコア駆動探索」と同じ発想）。test set 上での解釈結果で特徴量削除・モデル変更を行うと、独立テストへの過剰適応になります。
+> **ネスト CV の各 outer fold で選ばれる `best_params_` は異なり得ます**。外側スコアは「モデル選択手続き全体」の汎化性能推定であり、最終運用モデルは全 training データで同じ探索空間を再 fit して決めます（`GridSearchCV.fit(X_train, y_train).best_estimator_`）。「唯一の best_params が得られる」という誤解に注意してください。
 
-### 解釈レポートの書き方
+### グループ・時系列でのネスト CV
 
-解釈結果を書くときは、**測ったもの・測っていないものを明示**します：
+`GroupKFold` / `TimeSeriesSplit` を内側 CV に組み込むと、`GridSearchCV` の内側で `groups` を自動伝播できないケースがあり、`cross_val_score(grid, ..., groups=groups)` では**外側にしか `groups` が伝わらず内側 CV が失敗するリスク**があります。**手動 outer loop** が安全です：
 
-- ❌ 「`bandgap_expt` が最も重要な特徴量」
-- ✅ 「`bandgap_expt` は permutation importance で 1 位（±0.03 eV、95% CI [0.24, 0.32]）だが、`element_composition` との相関が |r|=0.72 と強く、この 2 つは分離できていない可能性がある」
+```python
+from sklearn.model_selection import GroupKFold
+from sklearn.base import clone
+
+outer_cv = GroupKFold(n_splits=5)
+inner_cv = GroupKFold(n_splits=5)
+
+outer_scores = []
+best_params_list = []
+for train_idx, test_idx in outer_cv.split(X, y, groups):
+    X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
+    X_te, y_te = X.iloc[test_idx], y.iloc[test_idx]
+    g_tr = groups.iloc[train_idx]
+
+    grid = GridSearchCV(clone(pipeline), param_grid, cv=inner_cv,
+                        scoring="neg_root_mean_squared_error")
+    grid.fit(X_tr, y_tr, groups=g_tr)   # 内側にも groups を渡す
+    outer_scores.append(grid.score(X_te, y_te))
+    best_params_list.append(grid.best_params_)
+
+# scoring="neg_root_mean_squared_error" のため grid.score も負値。
+# 実際の RMSE で報告する場合は符号反転する。
+rmse_outer = -np.mean(outer_scores)
+print(f"Nested CV RMSE: {rmse_outer:.3f} ± {np.std(outer_scores):.3f}")
+```
+
+**注意**：
+
+- **`GroupKFold` / `TimeSeriesSplit` には乱数がない**ため、「内側と外側で `random_state` を変える」は**不要 / 無効**です。この指示は `KFold(shuffle=True)` / `ShuffleSplit` / `StratifiedKFold(shuffle=True)` 等の**乱数を持つ splitter 限定**です。
+- 時系列では `outer_cv = inner_cv = TimeSeriesSplit(...)` としつつ、内側は「外側 train 内で expanding」となるように outer loop で切り出したデータに再適用します。
+
+### いつネスト CV が必要か
+
+| 状況 | ネスト CV が必要か |
+|---|---|
+| 独立テストを持たない | **必要** |
+| 独立テストがあり、ハイパーパラメータ空間が小さい（3〜5 通り以下） | 単純 CV でも大きな bias は出にくい |
+| ハイパーパラメータ空間が広い（10 通り以上）| **必要** |
+| モデル種類自体を探索する（RF vs GBM vs Ridge…）| **必要** |
+
+**探索空間が広いのに単純 CV で最良を選び、独立テストで評価すると、独立テストが探索の一部になっている**（テストの複数回参照、第5章 §5.5 の B）ことに注意します。
 
 ---
 
-## 8.7 統計的有意 ≠ 物理的意義
+## 8.7 AI エージェント特有のリーク
 
-第9章の入り口として、本章でも触れておくべき論点です。**エージェントが「有意差あり」を「意味がある」に読み替える**のは、実務で最頻の失敗です：
+AI エージェントを使う分析では、**従来の統計/ML にはなかったタイプのリーク**が発生します。これは vol-01 第14章の「循環設計問題」を統計/ML の文脈で具体化したものであり、**第5章 §5.5 の禁止事項 6 項目を、エージェント運用時にどう発生するかへ展開したもの**です。Ch4 との重複ではなく、実行時の具体形として補完的に読んでください。
 
-| 概念 | 定義 | 材料研究での意味 |
+### エージェント特有リーク・カタログ
+
+| # | リーク源 | 具体例 | 予防策 |
+|---|---|---|---|
+| 1 | **会話コンテキスト経由の情報伝播** | 独立テストのスコアをエージェントに見せた後で、「もっと良いモデルを試して」と依頼 → エージェントがテスト結果を暗黙に参照 | 独立テスト評価は最終 1 回、その結果を別セッション化 |
+| 2 | **後付け特徴量追加** | CV スコアが悪い → エージェントが自動で新特徴量を提案 → CV を回し直す（探索と本評価の混同） | 特徴量集合を仕様書 ⑥ で凍結、追加は Skill バージョンを上げて別実行 |
+| 3 | **test スコア駆動探索** | 「独立テストが悪い、改善方法は？」→ 改善案 → 適用 → 独立テスト再評価 のループ | test は 1 回のみ、悪ければ Skill 再設計 |
+| 4 | **ハイパーパラメータの後付け拡張** | GridSearch の範囲を、結果を見た後で広げる | パラメータ範囲を仕様書で凍結、拡張は audit violation |
+| 5 | **モデル選択の後付け** | RF で悪かったので GBM に切り替える → GBM のスコアだけ報告 | 探索空間を仕様書で凍結、モデル種類の切り替えも Skill バージョン管理 |
+| 6 | **多重比較の暗黙化** | 20 通りの分析を試して、有意だった 1 つを報告 | **予測モデルなら**：事前凍結、ネスト CV、独立テスト 1 回。**統計的検定を伴うなら**：Bonferroni / FDR（第10章で扱う範囲、本章では対象外） |
+| 7 | **チャットログ・メモリ・RAG への混入** | エージェントの会話履歴・メモリ・RAG コーパスに test 結果や holdout 情報が残り、次回の分析提案に混入する（LLM 重みの学習というより、実行時コンテキストの残留が現実的リスク） | チャットログは分析ログとして残すが、RAG コーパス化やメモリ登録は明示的に許可されたもの限定 |
+
+### 予防：エージェントに渡す情報の設計
+
+- **CV スコア** はエージェントに見せて OK（探索の材料）
+- **独立テストスコア** はエージェントに見せる前に「これで確定します」と宣言してから見せる、または別セッションで確定させる
+- **チャットで発見された "改善案"** は、その場では採用せず、**次バージョンの仕様書更新提案として記録**する（第5章 §5.4 の運用ルールを継承）
+
+### provenance の役割
+
+エージェント特有リークの検知には、**分析 provenance の完全記録**が必須です：
+
+- 各 Skill 実行の入力・出力・パラメータ
+- チャットセッションの ID と該当メッセージ
+- 特徴量集合・モデル種類のバージョン変更履歴
+- 独立テスト評価回数（1 を超えたら警告）
+
+---
+
+## 8.8 CV 設計チェックリスト（本章の主成果物）
+
+以降のすべての Skill 実装で、**このチェックリストを通過してから独立テストに進む** ようにします。各項目には severity（🔴 fatal / 🟡 audit violation / 🔵 warning）を付与しました。
+
+### 事前設計チェック（Skill 仕様書段階）
+
+- [ ] 🔴 `task_type` を明記した（regression / classification / clustering / anomaly_detection / bayesian）
+- [ ] 🔴 `cv_scheme.type` を選択根拠付きで書いた（§8.2 選択マップに基づく）
+- [ ] 🔴 グループ構造がある場合、`group_column` を指定した
+- [ ] 🔴 時系列の場合、`timestamp_column` を指定し、`gap` を設計した
+- [ ] 🟡 クラス不均衡の場合、`Stratified*` を選んだ
+- [ ] 🟡 ハイパーパラメータ探索空間を仕様書で凍結した
+- [ ] 🟡 独立テストは 1 回のみ評価するルールを仕様書 ⑤ に明記した（複数回参照は第5章 §5.5 分類 B: audit violation）
+
+### 実装チェック（コード段階）
+
+- [ ] 🔴 前処理・欠損補完・特徴量選択・スケーリングを **すべて Pipeline 内**に配置した
+- [ ] 🔴 `cross_validate` に `groups=` を渡した（`GroupKFold` 使用時）
+- [ ] 🔴 時系列データを timestamp でソート済み
+- [ ] 🔴 `TargetEncoder`（scikit-learn 1.3+）を使う場合、fold 内で fit されるよう Pipeline 化した
+- [ ] 🟡 `OneHotEncoder(handle_unknown="ignore")` を設定した
+- [ ] 🟡 `return_indices=True`（scikit-learn 1.3+）で `data_split` を provenance に保存した
+- [ ] 🟡 ネスト CV を使うなら、内側・外側の splitter が独立している（乱数を持つ splitter の場合は `random_state` も別、`GroupKFold` / `TimeSeriesSplit` は該当なし）
+
+### 事後検証チェック（実行後）
+
+- [ ] 🔴 **`sample_id_train / sample_id_test` に重複が無い**（識別子レベルの overlap を検査。目的変数 `y_train / y_test` の値重複は正常なので対象外）
+- [ ] 🔴 `GroupKFold` 使用時：**各 fold ごとに `group_id_train / group_id_test` に overlap が無い**
+- [ ] 🔵 fold ごとの学習/検証スコアが極端に乖離していない（train >> test は過学習）
+- [ ] 🔵 fold 間の分散が想定内（1 つの fold だけ極端なら分割違反の疑い）
+- [ ] 🟡 独立テスト評価は 1 回のみ実施（第5章 §5.5 分類 B と整合）
+- [ ] 🟡 provenance に `cv_scheme` / `data_split` / `metric_definition` が全て記録された
+- [ ] 🟡 エージェントとのチャットで「独立テスト後の探索」が発生していない
+
+**severity 定義**（第5章 §5.5 と整合）：
+
+| severity | 意味 | 対応 |
 |---|---|---|
-| **統計的有意** | 帰無仮説の下でその差以上が観測される確率が低い | 「偶然ではなさそう」 |
-| **効果量** | 差の大きさ（Cohen's d, r², 説明分散等） | 「どれくらい大きい差か」 |
-| **物理的意義** | 材料設計・実験計画への影響 | 「その差を活かせるか」 |
-
-**Skill 仕様書 ⑤ 禁止事項**に次を必ず入れます：
-
-- p 値のみで「意味がある」と結論しない
-- 効果量とその不確かさを併記する
-- 物理的閾値（例：「合成再現性の範囲は ±0.1 eV」）を仕様書 ④ の成功条件に書く
-
-### 頻度論での効果量 CI の算出（第9章への橋渡し）
-
-効果量 + 95% CI を要求するからには、頻度論の枠内でも計算手段を明示します：
-
-| 対象 | CI 算出方法 |
-|---|---|
-| permutation importance | サンプル bootstrap で `n_bootstrap=1000` を回し、`importances_mean` の 95% 分位点 |
-| PDP の関数値 | fold / bootstrap resample で PDP を複数本描き、各 grid 点の 95% 分位点 |
-| SHAP global mean-abs | test サンプルの bootstrap で `mean(\|shap\|)` の 95% 分位点 |
-| 予測誤差（RMSE 等） | K-fold の fold ごとの値 + `t.interval` または bootstrap |
-
-**ここでの CI は「サンプリング不確かさ」のみ**で、モデル選択・前処理選択の不確かさは含まない、という限界を第9章で Bayesian 版と対比します。
-
-### 有意 vs 効果量のワークシート
-
-解釈レポートには、次の 3 列を必ず併記します：
-
-| 特徴量 | 効果推定値 | 95% CI | 物理的閾値 | 判断 |
-|---|---|---|---|---|
-| `feat_a` | +0.05 eV | [+0.02, +0.08] | ±0.10 eV | 有意だが閾値未満 → 参考 |
-| `feat_b` | +0.30 eV | [+0.20, +0.40] | ±0.10 eV | 有意かつ閾値超 → **設計に反映** |
-| `feat_c` | +0.15 eV | [-0.05, +0.35] | ±0.10 eV | 閾値超だが不確か → 追実験 |
+| 🔴 fatal | データ流路の漏洩・仕様違反。結果は無効 | 即修正、既存結果は破棄 |
+| 🟡 audit violation | 評価基準の後付け・provenance 欠損。監査で指摘 | Skill バージョンを上げて再実行、または過去実行を audit に記録 |
+| 🔵 warning | 分割違反や過学習の兆候。要調査 | 原因調査、必要なら仕様書 ⑥ を強化 |
 
 ---
 
-## 8.8 再現可能な解釈レポート
+## 8.9 章末ワーク
 
-解釈は **Skill 実行の provenance に必ず添付**されるべき成果物です。Appendix A の provenance スキーマ拡張：
-
-```yaml
-interpretation_report:
-  methods_used: [permutation_importance, pdp, shap]        # ALE を実施した場合は追加
-  method_versions:
-    scikit_learn: 1.5.0
-    shap:         0.45.0
-    ale_package:  PyALE 1.2.0   # ALE 実施時
-
-  permutation_importance:
-    file:                       artifacts/permimp.csv     # .github/skills/<name>/artifacts/ 配下（付録A §A.1.1）
-    n_repeats:                  30
-    scoring:                    neg_root_mean_squared_error
-    baseline_score:             -0.85     # 符号込みで記録（§8.3 落とし穴 4）
-    correlation_policy_applied: drop_one_of_pair
-    bootstrap:
-      n_bootstrap: 1000
-      ci_level:    0.95
-
-  pdp:
-    features:          [feat_a, feat_b, "(feat_a, feat_b)"]
-    ice_included:      true
-    grid_resolution:   50
-
-  ale:
-    used:              true                # false の場合は ale_not_run_reason を必須
-    features:          [feat_a, feat_b]
-    package:           PyALE
-    rationale:         correlation_detected_|r|>0.7
-
-  shap:
-    explainer:                 TreeExplainer
-    feature_perturbation:      tree_path_dependent
-    model_output:              raw
-    additivity_verified:       true
-    shap_values_shape:         [100, 15]   # np.asarray(shap_values).shape を記録
-    feature_names_source:      preprocessor.get_feature_names_out()
-    n_samples:                 100
-    sample_selection_seed:     42
-    background_data_seed:      42          # interventional 時のみ
-
-  cross_method_agreement:
-    top5_jaccard_permimp_shap:            0.60
-    spearman_rho_full_rank_permimp_shap:  0.72
-    note: "disagreement is treated as diagnostic (§8.2), NOT as failure"
-
-  physical_interpretation:
-    - feature:                  feat_a
-      statistical_importance:   high
-      statistical_ci_width:     0.06
-      physical_prior_strength:  medium
-      literature_support:       weak
-      decision:                 hypothesis_candidate
-    reviewed_by:                "PI name"
-    review_date:                2026-XX-XX
-    review_status:              final       # draft の場合は final 扱い禁止
-```
-
-> [!IMPORTANT]
-> **cross_method_agreement は「診断シグナル」であり、成功条件ではありません**（§8.2 参照）。3 手法が食い違うのは、モデルが特徴量間の相互作用や相関を捉えているサインで、無理に一致させるのではなく **「なぜ乖離しているか」を分析する材料** として使います。
-
-**ランキング一致度の指標選択**：
-
-| 状況 | 推奨指標 |
-|---|---|
-| 全特徴量の順位が得られる（数十程度） | **Spearman's ρ** または Kendall's τ（tie に強いのは τ） |
-| top-k のみ比較（k=5〜10） | **Jaccard overlap**（top-k の集合類似度） + rank-biased overlap（RBO） |
-| tie が多い / 重複順位あり | Kendall's τ_b（tie 補正版） |
-
-Kendall's τ を top-k に単独適用すると、非共通特徴量や tie に弱く解釈が不安定になるため、**Jaccard + Spearman の併記**を推奨します。
-
-### レポート生成の Skill 化
-
-解釈レポート生成自体を Skill にすることで、**エージェントに毎回同じ形式で書かせる**：
-
-```yaml
-skill: interpretability_report_v1
-purpose: 3+ 手法（permutation / PDP / (ALE) / SHAP）の結果と物理知見の照合を統合レポートにする
-
-inputs:
-  permimp_result:    permutation_importance_v1 の出力
-  pdp_result:        pdp_v1 の出力
-  shap_result:       shap_interpretation_v1 の出力
-  ale_result:        ale_v1 の出力（オプション、相関検知時は必須）
-  physical_priors:   YAML（既知物理・閾値）
-
-outputs:
-  interpretation_report:  Markdown + PDF
-  cross_method_table:     CSV（特徴量 × 手法の順位表、Jaccard + Spearman）
-  discrepancy_flags:      YAML（手法間乖離 / 物理知見乖離 / diagnostic 扱い）
-
-success_criteria:
-  primary:
-    - 各手法が測っている量が明記され、順位・符号・不確かさ(CI)が provenance に記録
-    - 手法間の乖離があれば、相関・相互作用・外挿・前処理影響のいずれかを候補として記録
-    - 効果量 + 95% CI + 物理的閾値が全上位特徴量で埋まっている
-  secondary:
-    - 上記 4 象限（統計 × 物理）のすべてに 1 件以上が分類されている（偏りは分析不足のサイン）
-    - PI レビュー済み（review_date と review_status: final が記録されている）
-
-forbidden:
-  - item: p 値のみで「意味がある」と結論する
-    severity: audit_violation
-  - item: SHAP の絶対値平均を「特徴量重要度」と単独で呼ぶ
-    severity: audit_violation
-  - item: 効果量と不確かさを併記せずに「重要度ランキング」を出す
-    severity: audit_violation
-  - item: 手法間乖離を無視して単一ランキングに統合する
-    severity: audit_violation
-  - item: test set 上の解釈結果を根拠に特徴量削除・モデル変更を行う（別 split に戻らずに）
-    severity: fatal
-```
+1. **自分のデータで CV 選択マップ（§8.2）を辿り、`cv_scheme` を仕様書に書き下す**：選択根拠まで含めて 3〜5 行
+2. **意図的なリーク作りとその検知**：
+   - 全データで `StandardScaler.fit` → CV スコアの過大化を観察
+   - `GroupKFold` を `KFold` に変える → スコアの変化と分割違反を確認
+   - 特徴量選択を CV 外で実施 → スコアの変化を確認
+3. **ネスト CV を実装**し、単純 CV の best score との差を測定する（この差が「楽観バイアス」の実測値）
+4. **エージェントとのチャットログから、`§8.7` のリーク・カタログ 7 項目を検知するチェックリストを 1 つ選び、自分の運用に組み込む**
+5. **CV 設計チェックリスト（§8.8）を第6章・第7章の 3 ハンズオンすべてに適用**し、通らなかった項目を仕様書に反映
 
 ---
 
-## 8.9 章末チェックリスト
+## 8.10 本章のまとめ
 
-**解釈手法選択チェック**（severity 付き）：
-
-- [ ] 🔴 test セットで計算した（train ではない）
-- [ ] 🔴 前処理後の空間で SHAP に渡した（`preprocessor.transform`）
-- [ ] 🔴 **前処理後特徴量名 `get_feature_names_out()` と SHAP 配列の列数が一致**している
-- [ ] 🔴 SHAP `feature_perturbation="interventional"` を使う場合、背景データを指定した
-- [ ] 🟡 permutation importance の `n_repeats` を仕様書で凍結（標準推奨 30、小データでは 10 まで許容）
-- [ ] 🟡 相関特徴量ペア（|r| > 0.7）の処理方針を仕様書に書いた
-- [ ] 🟡 PDP と ICE を併用（相互作用が疑われる場合、1 特徴量 PDP のみで有効）
-- [ ] 🟡 SHAP explainer をモデルタイプに応じて選んだ（`Explainer` の自動選択に頼らない）
-
-**解釈結果の書き方チェック**：
-
-- [ ] 🔴 効果量と 95% CI を必ず併記（bootstrap による CI 算出方法を provenance に記録）
-- [ ] 🔴 物理的閾値を仕様書 ④ の成功条件に書いた
-- [ ] 🔴 SHAP の `model_output` 空間と additivity 検証結果を provenance に記録した
-- [ ] 🔴 **手法間乖離を無視して単一ランキングに統合していない**（乖離は diagnostic として記録）
-- [ ] 🟡 手法間一致度を Jaccard overlap + Spearman's ρ の両方で算出（Kendall's τ 単独は避ける）
-- [ ] 🟡 統計 × 物理の 4 象限 + confidence（high/medium/low）で特徴量を分類した
-- [ ] 🟡 PI / 共同研究者のレビュー日付を provenance に記録
-
-**エージェント運用チェック**：
-
-- [ ] 🔴 エージェントに数値・図を先に出させ、言葉での「重要」判定は最後
-- [ ] 🔴 **test set 上の解釈結果で特徴量削除・モデル変更を行わない**（Ch7 §7.7 test 駆動探索禁止と整合）
-- [ ] 🟡 統計的有意を「物理的意義」に読み替える解釈を検知したら訂正（Skill spec で禁止文検出可能）
-- [ ] 🟡 OneHot / scaling / imputation 後の feature lineage を provenance に保存
-- [ ] 🟡 SHAP values / transformed X / feature_names を cache 化し、再描画で再計算しない
-- [ ] 🟡 解釈レポート生成自体を Skill 化した
-
----
-
-## 8.10 章末ワーク
-
-1. **手法間乖離の測定**：第5章 §5.7（MatBench）または §5.8（RRUFF）のデータで、permutation / PDP / SHAP の上位 5 特徴量ランキングを Jaccard overlap + Spearman's ρ で比較。乖離が大きい場合、その原因候補（相関・相互作用・外挿・前処理）を分析して provenance の `discrepancy_flags` に記録
-2. **相関特徴量ペアの検知**：`|r| > 0.7` の特徴量ペアを列挙し、片方削除 or クラスタ化 or 併存の 3 案の効果を比較。`method="average"` と `"complete"` のクラスタ化結果の違いも確認
-3. **統計 × 物理 4 象限 + confidence 分類**：自分のドメインの既知物理を持ち込み、モデルの上位特徴量を 4 象限に振り分け、さらに `statistical_importance` / `physical_prior_strength` の high/medium/low を付与
-4. **効果量 + 95% CI + 物理的閾値のワークシート**：§8.7 の表を、自分のプロジェクトの 3 特徴量で埋める（bootstrap CI も含めて）
-5. **解釈レポート Skill を実装**：§8.8 の `interpretability_report_v1` を実装し、第5章のいずれかのハンズオンに適用。`review_status: final` になるまで PI レビュー loop を回す
-
----
-
-## 8.11 本章のまとめ
-
-- 解釈の目的は **Human-in-the-loop の質を上げる**こと。予測性能とは独立の Skill 責務
-- **3 手法**（permutation / PDP / SHAP、必要に応じて ALE）は測っているものが違うため、一致しないのが自然。乖離は **診断シグナル（diagnostic）** として記録し、成功条件にはしない
-- **相関特徴量問題**は 3 手法すべてに影響。事前の処理方針を仕様書で凍結
-- **feature name の保持**（`get_feature_names_out()`）が SHAP + Pipeline で最も壊れやすい実装上の落とし穴
-- **物理知見との突き合わせ**を統計 × 物理 × confidence（high/medium/low）で行う。エージェント任せにしない
-- **統計的有意 ≠ 物理的意義**。効果量 + 95% CI + 物理的閾値の 3 点セットを仕様書 ④ に組み込む
-- **頻度論の CI（bootstrap）とその限界**を明示し、次章（第9章）で Bayesian による不確かさ表現に橋渡しする
-- 解釈レポート自体を Skill 化し、`provenance.interpretation_report` に完全記録する（review_status: final まで）
-- **test set 上の解釈結果で再設計をしない**（Ch7 §7.7 の test 駆動探索禁止と整合）
+- CV の 4 分類（一般 / 層化 / グループ / 時系列）を、データ性質から機械的に選ぶ（§8.2 マップ）
+- **グループリーク** は同一試料・同一ロット・同一被験者・同一機器が train/test に分散した際に発生。`GroupKFold` / `StratifiedGroupKFold` で予防
+- **時系列リーク** は未来参照から発生。`TimeSeriesSplit` + `gap` + timestamp ソート、遅延特徴量は `shift(1)` が基本
+- **前処理・特徴量選択・欠損補完・スケーリング**は必ず Pipeline 内で fold ごとに fit
+- **ネスト CV** で「ハイパーパラメータ探索」と「汎化性能推定」を分離。独立テストは最終 1 回のみ
+- **AI エージェント特有のリーク** 7 種を明示的に予防：会話コンテキスト、後付け特徴量、test スコア駆動探索、パラメータ後付け拡張、モデル選択後付け、多重比較の暗黙化、**チャットログ・メモリ・RAG への混入**
+- 本章末の **CV 設計チェックリスト** を、以降のすべての Skill 実装で使う
 
 ---
 
 ## 参考資料
 
 ### 本書内の該当章
-
-- 第4章 §4.5：Skill 設計の禁止事項（解釈手法にも適用）
-- 第7章 §7.5, §7.7：Pipeline による前処理リーク防止、エージェント特有リーク（test 駆動探索）
-- 第9章：頻度論と Bayesian の橋、効果量の不確かさ表現へ
-- 第14章：解釈の失敗パターン（vol-01 第14章の統計版）
-- 付録A：provenance スキーマ拡張（`interpretation_report` 含む）
+- [第5章 統計/ML 分析用 Skill の設計原則](./chapter-05.md)（禁止事項 6 項目）
+- [第6章 教師あり学習を Skill 化する](./chapter-06.md)（anti-leakage split contract）
+- [第7章 教師なし学習を Skill 化する](./chapter-07.md)（bootstrap 安定性評価）
+- 第9章 解釈可能性とレポート化（次章）
+- 第15章 統計/ML 特有の失敗パターン（本章の禁止事項の事例集）
+- 付録B Scikit-learn チートシート（CV splitter リファレンス）
 
 ### 外部参考
-
-<a id="ref-8-1">[8-1]</a> Molnar, C. (2022). *Interpretable Machine Learning*. 2nd ed. [https://christophm.github.io/interpretable-ml-book/](https://christophm.github.io/interpretable-ml-book/) — 本章の理論的土台
-<a id="ref-8-2">[8-2]</a> Lundberg, S. M., & Lee, S.-I. (2017). A Unified Approach to Interpreting Model Predictions. *NeurIPS*, 30. — SHAP 原論文
-<a id="ref-8-3">[8-3]</a> Fisher, A., Rudin, C., & Dominici, F. (2019). All Models are Wrong, but Many are Useful: Learning a Variable's Importance by Studying an Entire Class of Prediction Models Simultaneously. *JMLR*, 20(177), 1–81. — permutation importance の理論
-<a id="ref-8-4">[8-4]</a> Apley, D. W., & Zhu, J. (2020). Visualizing the effects of predictor variables in black box supervised learning models. *JRSS-B*, 82(4), 1059–1086. — ALE の原典
-<a id="ref-8-5">[8-5]</a> Wasserstein, R. L., & Lazar, N. A. (2016). The ASA Statement on p-Values: Context, Process, and Purpose. *The American Statistician*, 70(2), 129–133. — 統計的有意の限界
-<a id="ref-8-6">[8-6]</a> SHAP 公式ドキュメント：[https://shap.readthedocs.io/](https://shap.readthedocs.io/)
-<a id="ref-8-7">[8-7]</a> SHAP Release Notes（形状・API 変更の追跡）：[https://github.com/shap/shap/releases](https://github.com/shap/shap/releases) — 0.42+ で multi-output の返り値が list → ndarray に変更
-<a id="ref-8-8">[8-8]</a> scikit-learn Inspection モジュール：[https://scikit-learn.org/stable/modules/inspection.html](https://scikit-learn.org/stable/modules/inspection.html)
-<a id="ref-8-9">[8-9]</a> Webber, W., Moffat, A., & Zobel, J. (2010). A similarity measure for indefinite rankings. *ACM TOIS*, 28(4), 1–38. — Rank-biased overlap の原典
+- scikit-learn User Guide - Cross-validation: <https://scikit-learn.org/stable/modules/cross_validation.html>
+- scikit-learn User Guide - Grid Search: <https://scikit-learn.org/stable/modules/grid_search.html>
+- Cawley, G. C., & Talbot, N. L. C. "On Over-fitting in Model Selection and Subsequent Selection Bias in Performance Evaluation." *Journal of Machine Learning Research* **11**, 2079–2107 (2010). — ネスト CV の必要性を示す古典
+- Kapoor, S., & Narayanan, A. "Leakage and the reproducibility crisis in machine-learning-based science." *Patterns* **4**, 100804 (2023). <https://doi.org/10.1016/j.patter.2023.100804> — データリークの類型化
+- Varma, S., & Simon, R. "Bias in error estimation when using cross-validation for model selection." *BMC Bioinformatics* **7**, 91 (2006). — 楽観バイアスの初期実証
+- Roberts, D. R. et al. "Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure." *Ecography* **40**, 913–929 (2017). — 構造化データの CV 設計
+- de Prado, M. L. *Advances in Financial Machine Learning*. Wiley, 2018. — Purged K-Fold（金融時系列向け）の解説

@@ -1,936 +1,695 @@
-# 第10章 深層モデルの検証・可視化・レポート化 — Human-in-the-loop 拡張
+# 第10章 MC-Dropout と Bayesian Neural Net を Skill 化する — 手法選択の判断表
 
 > [!NOTE]
 > **本章の到達目標**
-> - **Grad-CAM / Integrated Gradients / SHAP for deep** の 3 系統を区別し、それぞれの前提と限界を書き分けられる
-> - **`feature_attribution` Skill** を実装し、attribution そのものの信頼性を測るサニティチェック（sanity checks for saliency maps）を契約に組み込める
-> - **attribution hallucination の対策プロトコル**（model randomization test, data randomization test, cascading randomization）を Skill 化できる
-> - **reliability diagram** を深層モデルに適用し、第8章 `calibration_check` の出力を Human 説明資料に接続できる
-> - **Human-in-the-loop 拡張**：誤判定サンプルを Human に流し戻し、Human が attribution を検証してラベル修正案を返す UX を Skill 契約に落とせる
-> - **深層レポートテンプレート**（環境固定 + weights sha + augmentation config + attribution artifacts + Human review log）を書ける
-> - vol-01 第6章「予防的 Human-in-the-loop 3 原則」を**深層モデル特有の誤判定流し戻し UX**として拡張できる
+> - **MC-Dropout** の理論的位置づけ（近似ベイズ推論としての解釈）と実務上の限界を説明できる
+> - **MC-Dropout Skill** を実装し、第9章の `uncertainty_stop_gate` に流し込める
+> - **BNN**（Bayes by Backprop / Variational Inference / SG-MCMC）の 3 系統を区別し、選ぶ理由を書き分けられる
+> - **`bnn_uncertainty` Skill**（Bayes by Backprop の最小実装）を、承認ゲート付きで書ける
+> - **vol-02 第11-13章 PyMC/NumPyro**（本格ベイズ）と本章 BNN（近似ベイズ）の**接続と使い分け**を説明できる
+> - **conformal prediction** の位置づけ（分布仮定に頼らない校正法）を把握し、比較表に組み込める
+> - **「BNN vs Deep Ensemble vs MC-Dropout vs Conformal」**の 4 手法使い分け表を Skill 選択に使える
+> - エージェントが **不確かさ推定手法を提案するときの判断基準**（コスト × 精度 × Human 解釈しやすさ × 停止ゲートとの相性）を YAML 契約に落とせる
 >
 > **本章で扱わないこと**
-> - **Foundation Model の hallucination** → **第11章**（LLM/FM 特有の retrieval-augmented 検証）
-> - **SSL / 対比学習の attribution** → **第12章**（表現空間の解釈）
-> - **CAM 系の理論詳細**（Grad-CAM++ / Score-CAM / Ablation-CAM 等） → 参考文献
-> - **深層一般 × Agentic 失敗事例集** → **第14章**（本章では設計側の予防を扱う）
+> - **PyMC / NumPyro の本格 MCMC** → **vol-02 第11-13章**（本章では接続点のみ）
+> - **Deep Ensemble の詳細** → **第9章**
+> - **conformal prediction の完全実装** → 位置づけと比較表のみ、詳細は付録・第11章 reliability diagram で補足
+> - **Foundation Model の不確かさ** → **第12章**（LLM/FM 特有の hallucination 対策）
+> - **Grad-CAM / attribution** → **第11章**
 
 ---
 
 ## 10.1 この章で作る Skill
 
-3 つの **解釈・検証 Agentic Skill** と 1 つの **深層レポートテンプレート**を作ります。
+2 つの **不確かさ Agentic Skill** と 1 つの **判断表** を作ります。
 
 | Skill / 成果物 | 役割 | 入出力 |
 |---|---|---|
-| **`feature_attribution`** | Grad-CAM / IG / SHAP の 3 手法を統一 API で呼び出し、attribution artifact を保存 | 入力: model + sample + method → 出力: attribution map + provenance |
-| **`attribution_sanity_check`** | attribution の hallucination を検出（model randomization / data randomization） | 入力: 元 attribution + 乱数化後 attribution → 出力: similarity score + pass/fail |
-| **`human_handback_review`**（契約 + Skill） | 誤判定・不確かさ超過サンプルを Human に流し戻し、Human 判定・ラベル修正案を回収 | 入力: flagged sample + attribution + uncertainty → 出力: Human review record（ラベル修正 / 保留 / 却下） |
-| **`deep_report_template`** | 環境・重み・augmentation・attribution・Human review をまとめた再現可能レポート | 入力: 全 provenance → 出力: HTML / PDF レポート |
+| **`mc_dropout_predict`** | 学習済みモデルに dropout を推論時にも有効化し T 回サンプリングで不確かさを推定 | 入力: model with dropout + T + data → 出力: mean_probs / predictive_entropy / mutual_information |
+| **`bnn_uncertainty`**（Bayes by Backprop 最小実装） | 重みを分布として学習し posterior サンプリング | 入力: model factory + prior + data → 出力: posterior sample の平均予測 / 分解 |
+| **`uncertainty_method_selection_table`**（判断表） | 手法選択の Skill レベル決定支援 | 入力: 対象データ / GPU 予算 / Human 解釈要求 → 出力: 推奨手法 + 理由 |
 
-前提として、第4章 3 レイヤ provenance + 第7章 Layer 4 + 第9章 `bayesian_inference_config`、第8章 `uncertainty_stop_gate`、第7章 `domain_gap_gate` を継承します。**本章のレポートは第4-9 章のすべての契約状態を集約する監査可能ドキュメント**として設計します。
+前提として、第5章 provenance 3 レイヤ（GPU / 事前学習重み / 学習・推論設定）+ 第8章 Layer 4（転移学習拡張）、第5-8 章の契約群、第9章の `uncertainty_stop_gate` を継承します。**本章では BNN 用の拡張ブロック `bayesian_inference_config` を第5章スキーマに追加します（Ch07 が Layer 4 を追加したのと同じ拡張パターン）**。本章で作る Skill の出力はすべて第9章 gate に流し込める形式に揃えます（`mean_probs`, `predictive_entropy_normalized`, `mutual_information`）。ただし Conformal Prediction は予測集合を返すため別 monitor 扱いにします（§10.9 / §10.10）。
 
 ---
 
-## 10.2 なぜこの章が必要か — vol-01 第6章の深層拡張
+## 10.2 なぜこの章が必要か — Deep Ensemble だけでは足りない理由
 
-vol-01 第6章では「予防的 Human-in-the-loop 3 原則」を導入しました：**(1) 疑わしいときは Human**、**(2) 決めるのは Human**、**(3) 記録は改ざん不可**。深層モデルではこれが以下の理由で不十分になります：
+第9章で Deep Ensemble を推奨しましたが、実務では以下の制約に直面します：
 
-- **モデルの内部が説明不能**：Human が「なぜこの予測になったか」を理解できないと、判定を信頼できず、フィードバックもできない
-- **attribution 自体が hallucinate する**：Grad-CAM や SHAP の出力が「モデルの真の依存性」ではなく、単に "それらしい" 領域をハイライトすることがある（Adebayo et al., 2018）
-- **誤判定サンプルの Human 流し戻し UX がない**：第8章 gate で "route_to_human" と言われても、Human 側に「何を見て、何を判定し、どう記録するか」の構造がなければ機能しない
-- **深層レポートは事後再現が困難**：重み・環境・augmentation・attribution 生成条件がすべて揃わないと、6 か月後の監査に耐えない
+- **GPU 予算**：M=5 の Deep Ensemble は学習コスト × 5、推論コスト × 5。**ARIM 施設の共有 GPU では現実的でないケース**が多い
+- **単一 checkpoint のみ許可**：組織の運用ポリシー・監査対応上、モデル配布は 1 個に絞りたい
+- **posterior の解釈が欲しい**：Human に「重みそのものの分布」を提示したい（BNN）
+- **分布仮定を置きたくない**：どんなモデルでも valid な予測区間が欲しい（conformal prediction）
+
+これらの制約に対して、選択肢は 4 つあります：
 
 ```mermaid
 flowchart TB
-    A["推論結果<br/>+ uncertainty (Ch8/9)"] --> B{"gate 判定"}
-    B -->|"pass"| C["自律決定"]
-    B -->|"review / stop"| D["human_handback_review"]
-    D --> E["attribution 生成<br/>+ sanity check"]
-    E --> F["Human UI:<br/>予測 + attribution + uncertainty + 類似訓練サンプル"]
-    F --> G{"Human 判定"}
-    G -->|"承認"| H["ラベル確定・agent 続行"]
-    G -->|"修正"| I["ラベル修正案 + 再学習トリガ (L3 承認)"]
-    G -->|"保留"| J["queue に戻し・別 Human 再確認"]
-    H & I & J --> K["deep_report_template<br/>にすべて記録"]
+    A["不確かさが欲しい"] --> B{"GPU 予算 M 倍<br/>確保できる？"}
+    B -->|"Yes"| C["Deep Ensemble<br/>（第9章）"]
+    B -->|"No"| D{"再学習コスト<br/>払える？"}
+    D -->|"No"| E["MC-Dropout<br/>（本章 §10.3-9.5）"]
+    D -->|"Yes, 重みの分布が<br/>欲しい"| F["BNN<br/>（本章 §10.6-9.8）"]
+    D -->|"No, とにかく valid な<br/>予測区間"| G["Conformal Prediction<br/>（本章 §10.9）"]
+    C --> H["uncertainty_stop_gate"]
+    E --> H
+    F --> H
+    G --> H
 ```
 
 > [!IMPORTANT]
-> **本章は "解釈可能性" ではなく "検証可能性 + Human へ流し戻す UX + 再現可能レポート" の章です**。Grad-CAM の理論よりも、**attribution を Human が信じるための担保**と、**流し戻し後の Human 判定を Skill に組み込む方法**が主題です。
+> **本章の位置づけ**：4 手法は**排他ではなく組み合わせ可能**です。実務では「MC-Dropout で日次監視 + 月次で Deep Ensemble 再校正 + 予測区間は Conformal で保証」のような多層構成が現実的。**エージェントには "どの層を今回使うか" を判断させる**ための表を §10.10 で作ります。
 
 ---
 
-## 10.3 Attribution 3 系統の位置づけ
+## 10.3 MC-Dropout の理論的位置づけ
 
-深層モデルの特徴 attribution 手法は大きく 3 系統：
+**MC-Dropout**（Gal & Ghahramani, 2016）は、dropout を**推論時にも有効化**し、$T$ 回サンプリングして予測分布を得る手法です。
 
-| 系統 | 代表手法 | 対象モデル | 計算コスト | Human 直感性 |
-|---|---|---|---|---|
-| **CAM 系**（勾配 × 活性化） | Grad-CAM, Grad-CAM++, Score-CAM | CNN（局所受容野） | 低（forward + 1 backward） | 高（ヒートマップ） |
-| **勾配積分系** | Integrated Gradients (IG), SmoothGrad | 任意の微分可能モデル | 中（N 個の interpolation） | 中〜高 |
-| **摂動系** | SHAP (DeepSHAP / KernelSHAP), Occlusion, LIME | 任意（black-box 可） | 高（N 個の摂動サンプル） | 中（シャップ値の解釈が必要） |
+### 3 行で書くとこう
 
-### 使い分け早見表
+1. 学習時と同じく dropout を **推論時にも on** にする（`model.train()` ではなく、dropout 層のみ選択的に on）
+2. 同じ入力 $x$ に対して $T$ 回 forward し、$T$ 個の予測 $\{p^{(t)}(y|x)\}_{t=1}^T$ を得る
+3. 平均・分散・エントロピー分解を計算（式は第9章 §9.6 の Deep Ensemble と同一）
 
-| 目的 | 推奨 |
-|---|---|
-| CNN の畳み込み層で「どの空間領域が効いた」を見る | **Grad-CAM** |
-| axiomatic な性質（completeness, sensitivity）が欲しい | **Integrated Gradients** |
-| モデル非依存で shapley 値ベースの寄与を出したい | **SHAP** |
-| CNN 以外の Transformer / MLP 系 | IG または SHAP（Grad-CAM は不適） |
-| Human に「ここが根拠」と直感的に示したい | Grad-CAM ヒートマップ + IG による細部確認 |
+### 理論的裏付け（近似ベイズ）
+
+Gal & Ghahramani は、dropout つき NN の学習は**特定の事前分布を置いた Bayesian NN の変分推論と数学的に等価**であることを示しました。ゆえに MC-Dropout の $T$ 回サンプルは近似的な posterior sample と解釈できます。
 
 > [!WARNING]
-> **Grad-CAM は Transformer 系に "そのままでは" 適用できません**。Vision Transformer には attention rollout や Transformer-specific CAM 変種を使います。契約で「モデル系統に応じた手法選択」を強制すること（§10.5）。
+> **この "等価" は仮定込みです**：dropout rate が特定の precision parameter に対応する、prior が Gaussian、活性化関数が特定の条件を満たす、などの前提があります。**「MC-Dropout = 完全なベイズ」とは主張しない**でください。実務上は「安価な epistemic uncertainty の proxy」と扱うのが健全です。
 
----
+### Deep Ensemble との違い
 
-## 10.4 Attribution hallucination — 3 つのサニティチェック
-
-**Adebayo et al. (2018) "Sanity Checks for Saliency Maps"** が示した重要な指摘：一部の attribution 手法は、**モデルの重みをランダム化しても** / **ラベルをランダム化してもほぼ同じ attribution map を出す**。つまり "モデルの依存性" ではなく **単なる入力の edge / texture** を可視化しているだけの場合がある。
-
-### 3 つのサニティチェック
-
-| チェック | 手順 | 期待される結果 |
+| 観点 | MC-Dropout | Deep Ensemble |
 |---|---|---|
-| **Model randomization test** | 学習済み重みを層ごとにランダム重みに置換し、attribution を再計算 | ランダム化した層以下の attribution が**大きく変わる**（similarity 低下） |
-| **Cascading randomization** | 出力層から順に層をランダム化していき、attribution の遷移を見る | ランダム化が進むにつれ attribution が**段階的に劣化** |
-| **Data randomization test** | ラベルをランダムシャッフルして学習し、attribution を比較 | ランダムラベル学習モデルの attribution は元モデルと**似ていない**べき |
-
-### 実装（`attribution_sanity_check`）
-
-```python
-# attribution_sanity_check.py
-import copy
-import torch
-import torch.nn as nn
-from typing import Callable
-
-
-def _spearman_correlation(a: torch.Tensor, b: torch.Tensor) -> dict:
-    """
-    Tie-aware Spearman rank correlation between two flattened attribution maps.
-    return:
-      rho: float or NaN
-      valid: bool  (False if either input is degenerate: too few unique values or ~0 variance)
-    Saliency maps の類似度としては **abs(rho)** を使うこと（符号反転も依存性を意味しうる）。
-    """
-    import numpy as np
-    a_np = a.detach().cpu().numpy().ravel().astype(np.float64)
-    b_np = b.detach().cpu().numpy().ravel().astype(np.float64)
-
-    # degenerate 検出：unique value 数が極端に少ないか std がほぼ 0 のマップは信頼できない
-    def _degenerate(x):
-        return len(np.unique(x)) < 10 or x.std() < 1e-8
-    if _degenerate(a_np) or _degenerate(b_np):
-        return {"rho": float("nan"), "valid": False, "reason": "degenerate_map"}
-
-    # scipy が利用可能なら scipy.stats.spearmanr（tie 対応）。ここでは numpy でランク平均で代替。
-    try:
-        from scipy.stats import rankdata
-        a_rank = rankdata(a_np, method="average")
-        b_rank = rankdata(b_np, method="average")
-    except ImportError:
-        a_rank = a_np.argsort().argsort().astype(np.float64)
-        b_rank = b_np.argsort().argsort().astype(np.float64)
-
-    a_c = a_rank - a_rank.mean()
-    b_c = b_rank - b_rank.mean()
-    denom = np.linalg.norm(a_c) * np.linalg.norm(b_c)
-    if denom < 1e-12:
-        return {"rho": float("nan"), "valid": False, "reason": "zero_variance"}
-    rho = float((a_c * b_c).sum() / denom)
-    return {"rho": rho, "valid": True, "reason": None}
-
-
-def model_randomization_test(
-    model: nn.Module,
-    x: torch.Tensor,
-    attribution_fn: Callable[[nn.Module, torch.Tensor], torch.Tensor],
-    layers_to_randomize: list[str],
-    seed: int = 0,
-) -> dict:
-    """
-    元モデルの attribution と、指定層をランダム化したモデルの attribution を比較。
-    重要：
-      - GPU parameter には GPU 側 generator を使う（device 不一致回避）
-      - BatchNorm running stats 等の buffer もランダム化対象に含めるかを契約で明示
-      - サニティ判定は abs(rho) を使う（符号反転も saliency の依存性として扱う）
-    return:
-      original_attribution, randomized_attribution, similarity, pass
-      randomized_layer_names, randomized_buffer_names, seed
-    """
-    original_attr = attribution_fn(model, x).detach()
-
-    randomized_model = copy.deepcopy(model)
-    randomized_params: list[str] = []
-    randomized_buffers: list[str] = []
-
-    def _gen_for(device):
-        g = torch.Generator(device=device)
-        g.manual_seed(seed)
-        return g
-
-    with torch.no_grad():
-        for name, p in randomized_model.named_parameters():
-            if any(name.startswith(prefix) for prefix in layers_to_randomize):
-                g = _gen_for(p.device)
-                p.copy_(torch.empty_like(p).normal_(generator=g))
-                randomized_params.append(name)
-        # BatchNorm 等の running stats（buffer）もランダム化対象に含める
-        for name, buf in randomized_model.named_buffers():
-            if any(name.startswith(prefix) for prefix in layers_to_randomize):
-                if buf.dtype.is_floating_point and buf.numel() > 0:
-                    g = _gen_for(buf.device)
-                    buf.copy_(torch.empty_like(buf).normal_(generator=g))
-                    randomized_buffers.append(name)
-
-    randomized_attr = attribution_fn(randomized_model, x).detach()
-    sim = _spearman_correlation(original_attr, randomized_attr)
-    similarity_abs = abs(sim["rho"]) if sim["valid"] else float("nan")
-
-    return {
-        "original_attribution": original_attr,
-        "randomized_attribution": randomized_attr,
-        "spearman_similarity": sim["rho"],
-        "spearman_similarity_abs": similarity_abs,
-        "similarity_valid": sim["valid"],
-        "invalid_reason": sim["reason"],
-        "pass": bool(sim["valid"] and similarity_abs < 0.3),
-        "randomized_params": randomized_params,
-        "randomized_buffers": randomized_buffers,
-        "seed": seed,
-    }
-```
-
-### 契約 YAML
-
-```yaml
-# attribution_sanity_check.yaml
-skill: "attribution_sanity_check"
-version: "1.0.0"
-
-requires:
-  attribution_method: "grad_cam | integrated_gradients | shap_deep"
-  reference_model: "trained_model_frozen"
-  randomization_seed: "recorded_in_provenance"
-
-tests:
-  - name: "model_randomization_top_layer"
-    layers: ["classifier", "head"]
-    similarity_max: 0.3
-  - name: "model_randomization_cascading"
-    strategy: "top_down_layer_by_layer"
-    trend_expected: "monotonic_decrease"
-  - name: "data_randomization"
-    procedure: "retrain_with_shuffled_labels_to_fit_criterion"
-    fit_criterion:
-      train_loss_ratio_max: 1.5              # 元モデルの train loss × 1.5 以下まで学習させる
-                                             # （"short epochs" だと単にアンダーフィットで sanity check 無効）
-      min_epochs_fraction: 0.5               # 少なくとも元モデル epoch の 50%
-    similarity_max: 0.3                      # |rho| で判定
-  - name: "buffer_randomization_required"
-    include_running_stats: true              # BatchNorm running_mean/var も randomization 対象
-    documented_in_provenance: true
-
-acceptance:
-  all_tests_must_pass: true
-  reject_attribution_if_any_test_fails: true
-
-agent_authorization:
-  L1: "run_and_report"
-  L2: "run_and_report"
-  L3: "modify_similarity_thresholds_with_prior_approval"
-
-provenance:
-  record_all_similarity_scores: true
-  record_seed: true
-  record_reference_attribution_hash: true
-  record_randomization_hash: true
-```
-
-> [!IMPORTANT]
-> **`similarity_max: 0.3` は暫定値**です。手法・タスク・モデルアーキテクチャで適切な閾値は変わります。**新規タスクでは "既知の spurious correlation を仕込んだ toy example" で校正**すること。エージェントが閾値を勝手に変えることは L3 でも事前承認必須。
+| **多様性の源** | 同一重みからの dropout mask のランダム性 | 初期化・data order・augmentation の違いによる異なる収束点 |
+| **学習コスト** | × 1（1 モデルのみ学習） | × M |
+| **推論コスト** | × T（同一モデルで T 回 forward） | × M |
+| **メモリ** | × 1 | × M |
+| **epistemic 表現力** | 弱い（1 つの mode 周辺のみ） | 強い（複数 mode を捉えうる） |
+| **実装難度** | 極低（既存モデルにフラグ 1 つ） | 中（M 個の学習パイプライン） |
 
 ---
 
-## 10.5 `feature_attribution` Skill の統一 API
+## 10.4 MC-Dropout Skill の実装
 
-3 系統を統一 API で呼び出し、attribution artifact + サニティチェック結果を保存します。
+### モデル前提
+
+対象モデルが **dropout 層を含んでいる**必要があります。含まないモデルには MC-Dropout は適用できません（強制的に dropout 層を挿入するのは第6-7章の契約違反）。
 
 ```python
-# feature_attribution.py
-from dataclasses import dataclass
-from typing import Literal
+# mc_dropout_predict.py
 import torch
 import torch.nn as nn
 
-AttributionMethod = Literal["grad_cam", "integrated_gradients", "shap_deep"]
+
+def _enable_dropout_only(model: nn.Module) -> dict[str, bool]:
+    """
+    model.eval() 後に、dropout 層のみを train モードに戻す。
+    BatchNorm 等は eval のまま（train モードだと推論が壊れる）。
+    返り値：呼び出し前の各モジュールの `.training` 状態（`_restore_module_modes` で復元）。
+    """
+    prev_states: dict[str, bool] = {name: m.training for name, m in model.named_modules()}
+    model.eval()
+    for m in model.modules():
+        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d)):
+            m.train()
+    return prev_states
 
 
-@dataclass
-class AttributionRequest:
-    method: AttributionMethod
-    target_class: int | None = None          # None なら argmax(pred)
-    grad_cam_target_layer: str | None = None # method == "grad_cam" のときのみ
-    ig_baseline: str = "zero"                # "zero" | "blur" | "uniform_noise"
-    ig_steps: int = 50
-    shap_background_size: int = 100
+def _restore_module_modes(model: nn.Module, prev_states: dict[str, bool]) -> None:
+    """`_enable_dropout_only` 呼び出し前の training/eval 状態に復元。finally で必ず呼ぶ。"""
+    for name, m in model.named_modules():
+        if name in prev_states:
+            m.train(prev_states[name])
 
 
-def feature_attribution(
+def _assert_mc_dropout_prerequisites(model: nn.Module, T: int) -> None:
+    """契約 YAML の requires を code 側でも fatal assert。"""
+    assert 10 <= T <= 100, f"T must be in [10, 100], got {T}"
+    dropout_layers = [
+        m for m in model.modules()
+        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d))
+    ]
+    assert len(dropout_layers) > 0, "MC-Dropout requires at least one dropout layer"
+    assert any(getattr(m, "p", 0.0) > 0.0 for m in dropout_layers), \
+        "MC-Dropout requires at least one dropout layer with p > 0"
+
+
+@torch.no_grad()
+def mc_dropout_predict(
     model: nn.Module,
     x: torch.Tensor,
-    req: AttributionRequest,
+    T: int = 30,
+    seed: int | None = None,
 ) -> dict:
     """
-    3 系統を統一 API で呼び出す。以下は骨子。実装は captum / grad-cam ライブラリを使用。
-
-    重要：
-      - CNN 以外に grad_cam を要求されたら fatal（§10.3 warning）
-      - target_class が None なら決定論的 forward で argmax を解決し、provenance に必ず記録
-      - IG baseline の選択は結果に大きく影響するため provenance に必ず記録
+    x: (batch, ...) 入力
+    T: サンプリング回数
+    return:
+      mean_probs: (batch, K)
+      predictive_entropy: (batch,)
+      expected_entropy: (batch,)
+      mutual_information: (batch,)
+      max_softmax_uncertainty: (batch,)   # 1 - max(mean_probs)
     """
-    assert isinstance(model, nn.Module)
-    _validate_method_vs_architecture(model, req)
-
-    prev_training = model.training
-    model.eval()
+    _assert_mc_dropout_prerequisites(model, T)
+    prev_states = _enable_dropout_only(model)
     try:
-        # target_class を **決定論的に** 解決してから provenance に固定
-        with torch.no_grad():
-            logits = model(x)
-            probs = logits.softmax(-1)
-        resolved_target_class = int(logits.argmax(-1).flatten()[0].item()) \
-            if req.target_class is None else int(req.target_class)
-        logits_snapshot_hash = _hash_tensor(logits.detach())
+        # dropout mask のランダム性を制御。torch.manual_seed は global RNG を変更するため、
+        # 呼び出し外への副作用を避けたい場合は torch.random.fork_rng() を使うこと。
+        with torch.random.fork_rng(devices=[x.device] if x.is_cuda else []):
+            if seed is not None:
+                torch.manual_seed(seed)
+                if x.is_cuda:
+                    torch.cuda.manual_seed_all(seed)
 
-        req_resolved = AttributionRequest(**{**req.__dict__, "target_class": resolved_target_class})
-
-        if req_resolved.method == "grad_cam":
-            attribution = _grad_cam(model, x, req_resolved)
-        elif req_resolved.method == "integrated_gradients":
-            attribution = _integrated_gradients(model, x, req_resolved)
-        else:  # shap_deep
-            attribution = _shap_deep(model, x, req_resolved)
+            sample_probs = []
+            for _ in range(T):
+                logits = model(x)
+                sample_probs.append(logits.softmax(-1))
+        sample_probs = torch.stack(sample_probs, dim=0)  # (T, batch, K)
     finally:
-        model.train(prev_training)
+        _restore_module_modes(model, prev_states)
+
+    mean_probs = sample_probs.mean(0)                # (batch, K)
+    K = mean_probs.shape[-1]
+    assert K > 1, "MC-Dropout requires K > 1"
+    eps = 1e-12
+
+    predictive_entropy = -(mean_probs * (mean_probs + eps).log()).sum(-1)          # (batch,)
+    member_entropy = -(sample_probs * (sample_probs + eps).log()).sum(-1)          # (T, batch)
+    expected_entropy = member_entropy.mean(0)                                      # (batch,)
+    mutual_information = predictive_entropy - expected_entropy                     # (batch,)
+    max_softmax_uncertainty = 1.0 - mean_probs.max(-1).values                      # (batch,)
+
+    log_k = torch.log(torch.tensor(K, dtype=predictive_entropy.dtype, device=predictive_entropy.device))
+    predictive_entropy_normalized = predictive_entropy / log_k
 
     return {
-        "method": req_resolved.method,
-        "target_class": resolved_target_class,           # 必ず int 値で記録
-        "target_class_was_auto_resolved": req.target_class is None,
-        "logits_snapshot_hash": logits_snapshot_hash,
-        "probs_top1": float(probs.max(-1).values.flatten()[0].item()),
-        "attribution": attribution.detach(),
-        "attribution_hash": _hash_tensor(attribution),
-        "request_params": req_resolved.__dict__,
+        "mean_probs": mean_probs,
+        "predictive_entropy": predictive_entropy,
+        "predictive_entropy_normalized": predictive_entropy_normalized,
+        "expected_entropy": expected_entropy,
+        "mutual_information": mutual_information,
+        "max_softmax_uncertainty": max_softmax_uncertainty,
     }
-
-
-# アーキテクチャ ↔ 手法の許容関係を明示レジストリ化。
-# ここに列挙されないアーキテクチャで grad_cam を要求すると fatal。
-_GRAD_CAM_ALLOWED_ARCHITECTURES = {"resnet", "vgg", "densenet", "efficientnet", "convnext"}
-_GRAD_CAM_FORBIDDEN_ARCHITECTURES = {"vit", "swin", "deit", "beit", "mlp_mixer"}
-
-
-def _validate_method_vs_architecture(model: nn.Module, req: AttributionRequest) -> None:
-    """
-    Grad-CAM は「Conv があれば OK」ではない：ViT の patch embedding は Conv だが不適。
-    以下を fatal:
-      - モデル系統が forbidden リストにある
-      - grad_cam_target_layer が未指定
-      - 指定された target_layer が model に存在しない、または spatial feature 層でない
-    Transformer 系は Transformer-specific attribution（attention rollout 等）を使うこと。
-    """
-    arch_hint = getattr(model, "architecture_family", None)  # モデルが自己申告する場合
-    if req.method == "grad_cam":
-        if arch_hint is not None and arch_hint in _GRAD_CAM_FORBIDDEN_ARCHITECTURES:
-            raise AssertionError(
-                f"grad_cam is forbidden for {arch_hint}; "
-                "use Transformer-specific attribution (attention rollout / TransCAM) instead"
-            )
-        has_conv = any(isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) for m in model.modules())
-        assert has_conv, "grad_cam requires a model containing Conv layers (§10.3)"
-        assert req.grad_cam_target_layer is not None, "grad_cam_target_layer must be specified"
-
-        # target_layer が実在し、spatial 出力を持つ層であることを確認
-        target = dict(model.named_modules()).get(req.grad_cam_target_layer)
-        assert target is not None, f"grad_cam_target_layer '{req.grad_cam_target_layer}' not found in model"
-        assert isinstance(target, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.BatchNorm2d, nn.ReLU, nn.Sequential)), \
-            f"grad_cam_target_layer '{req.grad_cam_target_layer}' is not a spatial feature layer"
 ```
 
 ### 契約 YAML
 
 ```yaml
-# feature_attribution.yaml
-skill: "feature_attribution"
+# mc_dropout_predict.yaml
+skill: "mc_dropout_predict"
 version: "1.0.0"
 
 requires:
-  model_frozen_during_attribution: true
-  method_matches_architecture: true      # code で fatal assert
-  target_class_specified_or_argmax: true
+  model_must_contain_dropout_layers: true          # fatal if false
+  base_model_frozen_during_inference: true
+  reject_if_dropout_rate_zero_in_all_layers: true
 
 parameters:
-  method:
-    default: "grad_cam"
-    options: ["grad_cam", "integrated_gradients", "shap_deep"]
-  ig_baseline:
-    default: "zero"
-    options: ["zero", "blur", "uniform_noise", "domain_specific"]
-    documented_impact: "baseline choice materially affects IG magnitude"
-    provenance_required:
-      - "baseline_type"
-      - "baseline_seed_if_stochastic"          # uniform_noise / blur random seed
-      - "baseline_tensor_hash"                 # 実際に使った baseline の hash
-      - "input_normalization_domain"           # 例: "imagenet_mean_std", "spectrum_minmax_0_1"
-      - "human_approved_rationale"             # zero が normalized data manifold 外にある場合の説明
-    warn_if:
-      zero_baseline_outside_data_manifold: true   # スペクトル min-max 正規化で zero が manifold 外
-  ig_steps:
-    default: 50
-    min: 20
-    max: 200
+  T:
+    default: 30
+    min: 10
+    max: 100
+    agent_authorization:
+      L1: "read_only"
+      L2: "modify_within_range"
+      L3: "modify_with_prior_approval"
 
 outputs:
-  attribution_map: "tensor"
-  attribution_hash: "sha256"
-  request_params: "dict"
-
-post_processing:
-  must_run_sanity_check_before_showing_to_human: true    # attribution_sanity_check を必ず前段に
-
-agent_authorization:
-  L1: "run_with_default_params"
-  L2: "run_and_choose_method_within_allowed"
-  L3: "modify_baseline_or_steps_with_prior_approval"
-
-provenance:
-  layer_attribution:                       # 第4章 3 レイヤ + Ch07 Layer 4 + Ch09 bayesian_inference_config
-                                           # と同じ「拡張ブロック」パターン
-    method: "grad_cam | integrated_gradients | shap_deep"
-    method_selection_reason: "text"
-    request_params: "full dict"
-    attribution_hash: "sha256"
-    sanity_check_result_ref: "path_to_attribution_sanity_check_output"
-    target_class: "int"
-    target_layer_for_grad_cam: "layer_name or null"
-```
-
----
-
-## 10.6 Reliability Diagram（第8章 `calibration_check` の可視化）
-
-第8章で ECE / Brier score を計算しました。Human 説明資料には **reliability diagram**（横軸 predicted probability bin、縦軸 empirical accuracy）を必ず添えます。
-
-```python
-# reliability_diagram.py
-import numpy as np
-
-
-def assign_calibration_bins(
-    confidences: np.ndarray,
-    n_bins: int = 15,
-    strategy: str = "uniform",
-) -> dict:
-    """
-    ECE 計算と reliability diagram で **共有** する bin 割当関数。
-    - bin 定義は Ch8 と合わせて (lo, hi]（左開右閉）
-    - strategy="quantile" の場合、重複 edge を検出して effective bin 数を返す
-
-    Ch8 の ECE 関数もこの関数を呼び出すこと。両者が別実装だと bin 定義が食い違い、
-    Human 資料の数字が本文と合わなくなる。
-    """
-    if strategy == "uniform":
-        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-        duplicate_edges = 0
-    else:  # quantile
-        raw_edges = np.quantile(confidences, np.linspace(0.0, 1.0, n_bins + 1))
-        raw_edges[0], raw_edges[-1] = 0.0, 1.0
-        unique_edges = np.unique(raw_edges)
-        duplicate_edges = len(raw_edges) - len(unique_edges)
-        bin_edges = unique_edges
-    effective_n_bins = len(bin_edges) - 1
-
-    # (lo, hi] semantics: 各 conf c に対して最大の m で bin_edges[m] < c <= bin_edges[m+1]
-    # np.searchsorted(side="left") で bin_edges[m] < c を満たす最小 m を得て、-1 で境界に含める
-    bin_ids = np.searchsorted(bin_edges, confidences, side="left") - 1
-    bin_ids = np.clip(bin_ids, 0, effective_n_bins - 1)
-    # 完全一致で 0 になったもの（c == 0.0）は bin 0 に含める
-    return {
-        "bin_edges": bin_edges,
-        "bin_ids": bin_ids,
-        "effective_n_bins": effective_n_bins,
-        "duplicate_edges": duplicate_edges,
-        "strategy": strategy,
-        "inclusivity": "(lo, hi]",
-    }
-
-
-def reliability_diagram_data(
-    probs: np.ndarray,               # (N, K) predicted probabilities
-    labels: np.ndarray,              # (N,) true class indices
-    n_bins: int = 15,
-    strategy: str = "uniform",       # "uniform" | "quantile"（クラス不均衡時は quantile 推奨）
-) -> dict:
-    """
-    bin ごとに (confidence_mean, accuracy, count) を返す。
-    第8章 ECE と bin 定義を共有（assign_calibration_bins 経由）。
-    """
-    predictions = probs.argmax(-1)
-    confidences = probs.max(-1)
-    correct = (predictions == labels).astype(np.float32)
-
-    binning = assign_calibration_bins(confidences, n_bins=n_bins, strategy=strategy)
-    bin_edges = binning["bin_edges"]
-    bin_ids = binning["bin_ids"]
-    effective_n_bins = binning["effective_n_bins"]
-
-    out = {
-        "bin_low": [], "bin_high": [], "conf_mean": [], "accuracy": [], "count": [],
-        "strategy": strategy,
-        "effective_n_bins": effective_n_bins,
-        "duplicate_edges": binning["duplicate_edges"],
-        "inclusivity": binning["inclusivity"],
-    }
-    for m in range(effective_n_bins):
-        mask = bin_ids == m
-        n_m = int(mask.sum())
-        out["bin_low"].append(float(bin_edges[m]))
-        out["bin_high"].append(float(bin_edges[m + 1]))
-        out["count"].append(n_m)
-        if n_m == 0:
-            out["conf_mean"].append(float("nan"))
-            out["accuracy"].append(float("nan"))
-        else:
-            out["conf_mean"].append(float(confidences[mask].mean()))
-            out["accuracy"].append(float(correct[mask].mean()))
-    return out
-```
-
-### Human 説明資料への埋め込み
-
-reliability diagram は以下 3 情報を必ず併記：
-
-- **bin 定義**（uniform / quantile、n_bins）— 第8章 ECE と揃える
-- **各 bin のサンプル数**（sparse な bin は解釈注意）
-- **temperature scaling 前後**（§8.5）— 校正の効果を Human に示す
-
-> [!TIP]
-> **reliability diagram を Human に見せるだけでは不十分**です。「diagonal から離れている = miscalibrated」を口頭で説明する Skill が別途必要。`deep_report_template` §10.8 で「reliability diagram → 3 文の自動解釈」を組み込みます。
-
----
-
-## 10.7 Human-in-the-loop 拡張：誤判定流し戻し UX
-
-第8章 gate で `route_to_human` になったサンプルを、Human が判定できる形で提示する Skill。
-
-### `human_handback_review` の Skill 契約
-
-```yaml
-# human_handback_review.yaml
-skill: "human_handback_review"
-version: "1.0.0"
-
-trigger:
-  from_uncertainty_stop_gate: true                # Ch8 §8.8
-  from_domain_gap_gate: true                      # Ch7 §7.5（review 判定）
-  from_calibration_drift: true                    # Ch10 §10.9 レポート監視
-
-human_ui_required_fields:
-  # Human が「見て・判断できる」ための最小構成
-  always_shown:
-    - "sample_id"
-    - "raw_input_view"                              # 画像なら thumbnail、スペクトルなら plot
-    - "predicted_class_with_top_k_probabilities"    # k=5 程度
+  contract: "matches_uncertainty_stop_gate_input_schema"
+  fields:
+    - "mean_probs"
     - "predictive_entropy_normalized"
     - "mutual_information"
     - "max_softmax_uncertainty"
-    - "domain_gap_score"                            # Ch7 との連動
-    - "attribution_sanity_check_result"             # §10.4 の pass/fail と類似度
-    - "nearest_training_samples"                    # k=5、Human が「似たサンプルはこう分類された」を確認
-    - "recent_calibration_diagram_ref"              # §10.6
-    - "model_version_and_provenance_summary"
-    - "triggered_gate_names_and_thresholds"
-  shown_only_if_sanity_pass:
-    - "attribution_map"                             # §10.5 の grad_cam 等
-  shown_only_if_sanity_fail:
-    - "attribution_hidden_reason"                   # 例: "spearman |rho| = 0.42 > 0.3"
-    - "sanity_fail_summary"                         # どのテストで fail、similarity score
 
-human_actions_allowed:
-  - approve_prediction                              # 予測が正しい
-  - correct_label                                   # 別のラベルに修正（下記 required_fields_for 参照）
-  - reject_sample                                   # このサンプルは学習に使わない
-  - request_more_info                               # queue に戻して別 Human に回す
-  - flag_for_model_retraining                       # L3 承認ワークフローへ
-
-required_fields_for:
-  correct_label:                                    # append-only, 学習データ即時変更は禁止
-    - "corrected_label"                             # 修正後のラベル
-    - "label_ontology_version"
-    - "reviewer_confidence"                         # low | medium | high
-    - "rationale_free_text"
-    - "proposal_only_flag: true"                    # データ即時 mutation は不可
-                                                    # 学習データ反映は curator/L3 承認を経由
-
-acceptance:
-  attribution_map_shown_iff_sanity_pass: true       # pass 時のみ表示、fail 時は非表示
-  hallucinating_samples_must_be_flagged: true      # sanity fail サンプルは attribution を表示せず uncertainty のみ提示
-  human_must_view_uncertainty_and_sanity_result: true  # UI で表示済みかログで検証
-  review_duration_used_as_qc_signal_only: true     # 短時間 review は「監査 QC 信号」であり自動無効化条件ではない
-                                                    # random audit sampling で品質チェック
-  required_view_events_logged: true                # どのフィールドを表示・スクロールしたかログ
-
-agent_authorization:
-  L1: "prepare_ui_and_wait_for_human"
-  L2:
-    action: "prepare_ui_and_record_human_decision_append_only"
-    forbidden: "directly_mutating_training_data_or_labels"      # curate/L3 承認経由のみ
-  L3:
-    action: "same_as_L2 + trigger_retraining_after_separate_curator_approval"
-    forbidden: "auto_apply_correct_label_to_training_set_without_curator_sign_off"
-  never_allowed:
-    - "auto_approve_without_human"                # Ch4 §4.7 の absolute rule
-    - "modify_human_review_record_after_write"    # 監査要件
-    - "reduce_ui_snapshot_hash_scope"             # 表示内容の改ざん不可性
+known_limitations:
+  epistemic_expressiveness: "weak_compared_to_deep_ensemble"
+  dropout_mask_diversity: "may_correlate_when_T_small"
+  documented_as: "epistemic_uncertainty_proxy_not_true_bayesian"
 
 provenance:
-  layer_human_review:                             # 拡張ブロック
-    human_reviewer_id_hashed: true
-    review_timestamp: true
-    ui_snapshot_hash: true                        # 何を見せたかの改ざん不可性
-    displayed_attribution_hash_or_null: true      # sanity fail 時は null
-    attribution_display_state: "shown | hidden_due_to_sanity_fail"
-    displayed_sanity_check_result: true
-    displayed_field_view_events: true             # スクロール・focus ログで required 表示を検証
-    human_action_selected: "one of human_actions_allowed"
-    correct_label_payload_if_any:                 # correct_label 選択時のみ
-      corrected_label: true
-      label_ontology_version: true
-      reviewer_confidence: true
-      rationale_free_text: true
-      proposal_only_flag: true
-    human_free_text_comment_optional: true
-    review_duration_seconds: true                 # QC 信号（自動無効化には使わない）
-    subsequent_agent_action_ref: "id"
+  record_T: true
+  record_dropout_rate_per_layer: true
+  record_seed: true
+  record_which_layers_were_train_mode: true        # BatchNorm 等が train になっていないことを証跡化
 ```
 
 > [!IMPORTANT]
-> **`attribution_hallucinating_samples_must_be_flagged`** は特に重要です。サニティチェック（§10.4）に失敗した attribution を Human に見せると、Human は "誤った説明" を信じてしまい、逆に判定精度が下がる（Poursabzi-Sangdeh et al., 2021）。**Fail サンプルでは attribution を表示せず uncertainty と最近傍訓練サンプルのみを提示**します。
+> **`record_which_layers_were_train_mode` は必須**です。過去に「BatchNorm も train モードのままで MC-Dropout」を回した結果、running statistics が汚染された事故が多数報告されています。契約でログを義務化してください。
 
-### Human 流し戻しシーケンス
+---
 
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant G as Gates (Ch7 + Ch8)
-    participant F as feature_attribution
-    participant S as attribution_sanity_check
-    participant U as Human UI
-    participant H as Human
-    participant P as Provenance store
+## 10.5 MC-Dropout の失敗パターンと対策
 
-    A->>G: predict + uncertainty
-    G-->>A: route_to_human
-    A->>F: attribution(x, method)
-    F-->>A: attribution_map + hash
-    A->>S: sanity_check(attribution, model)
-    S-->>A: pass|fail + similarity
-    alt sanity check pass
-        A->>U: display: input + attribution + uncertainty + neighbors
-    else sanity check fail
-        A->>U: display: input + [attribution hidden] + uncertainty + neighbors + warning
-    end
-    U->>H: 上記を表示
-    H-->>U: 選択 (approve / correct_label / reject / request_more_info / flag_for_retraining)
-    U->>P: ui_snapshot_hash + human_action + duration を記録
-    P-->>A: subsequent_agent_action_ref
+| 失敗 | 症状 | 対策 |
+|---|---|---|
+| **dropout 層がないモデルに適用** | `_assert_mc_dropout_prerequisites` で即 fatal | `requires.model_must_contain_dropout_layers` fatal assert（YAML + code 両方） |
+| **BatchNorm も train モード** | running mean/var が汚染、次回 eval で予測が壊れる | `_enable_dropout_only` で dropout 層のみ選択 + `try/finally` で状態復元 |
+| **推論後にモデルが train mode に残る** | 続く normal 推論で dropout が有効化されたまま | `_restore_module_modes` を必ず finally で呼ぶ |
+| **dropout rate が全層 0** | dropout mask のばらつきなし → **`mutual_information ≈ 0`**（予測 entropy 自体は非ゼロたりうる） | fatal assert + provenance に per-layer rate 記録 |
+| **T が小さい（<10）** | 分散推定が不安定 | `T.min: 10`、agent は L2 でも下限を下げられない、code で fatal assert |
+| **T が過大（>100）** | GPU 時間浪費、性能向上飽和 | `T.max: 100`、L3 でも事前承認 |
+| **MC-Dropout の epistemic を "真の epistemic" と主張** | Human が過信 | Skill ドキュメントと provenance に "proxy" と明記 |
+| **`torch.manual_seed()` が global RNG を汚染** | 後続の学習/推論で乱数系列が想定外に | `torch.random.fork_rng()` で subprocess 的に隔離 |
+| **推論のたびに seed 記録なし** | Human と agent で異なる結果 | seed 記録を契約で必須化 |
+
+---
+
+## 10.6 BNN 3 系統の位置づけ
+
+**BNN (Bayesian Neural Network)** は重み $w$ 自体を分布として扱います。学習は事後分布 $p(w | \mathcal{D})$ の推論。実装アプローチは 3 系統：
+
+| 系統 | 代表手法 | ライブラリ | 学習コスト | posterior 表現力 | 実務適用性 |
+|---|---|---|---|---|---|
+| **Variational Inference (VI)** | Bayes by Backprop, MFVI | Pyro, TyXe, blitz-bayesian-pytorch | 中（backward パス 2 倍程度） | 中（factorized Gaussian 前提） | ○ |
+| **Laplace / SWAG** | Laplace 近似、SWAG | laplace-torch | 低（学習後の追加処理のみ） | 弱〜中 | ◎ |
+| **SG-MCMC** | SGLD, SGHMC, cSGLD | 実装は自作か Pyro | 高（多数のサンプル保管） | 強（真の posterior 近傍） | △ |
+
+> [!TIP]
+> **本章では Bayes by Backprop（VI 系）の最小実装**を示します。理由：(1) 学習コストが Deep Ensemble に近い / (2) 実装が理解しやすい / (3) posterior が明示的で Human 説明に使える。**Laplace 近似は付録**、SG-MCMC は本書の範囲外とします。
+
+### vol-02 PyMC/NumPyro との使い分け
+
+| 状況 | 推奨 |
+|---|---|
+| モデルが小さく（数百〜数千パラメータ）、完全な posterior が欲しい | **vol-02 第11-13章 PyMC / NumPyro** |
+| モデルが深層（数百万〜） | **本章 BNN**（VI 近似） |
+| 深層特徴を抽出して階層構造の推論 | **第14章**（深層 → PyMC 階層モデル） |
+
+---
+
+## 10.7 Bayes by Backprop の最小実装
+
+各重み $w_i$ を Gaussian $\mathcal{N}(\mu_i, \sigma_i^2)$ で表現し、$\mu_i, \sigma_i$ を学習します。
+
+### 数式
+
+Variational posterior $q_\theta(w) = \prod_i \mathcal{N}(w_i | \mu_i, \sigma_i^2)$、prior $p(w) = \prod_i \mathcal{N}(w_i | 0, \sigma_p^2)$ に対して ELBO を最大化：
+
+$$
+\mathcal{L}(\theta) = \mathbb{E}_{q_\theta(w)}[\log p(\mathcal{D} | w)] - \mathrm{KL}[q_\theta(w) \| p(w)]
+$$
+
+第 1 項は再パラメータ化トリック $w = \mu + \sigma \odot \epsilon, \epsilon \sim \mathcal{N}(0, I)$ で backprop 可能に。
+
+### 実装（最小構成）
+
+```python
+# bayes_by_backprop.py
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BayesianLinear(nn.Module):
+    """重み平均 mu, 対数分散 rho（softplus で sigma）を学習可能に持つ Linear。"""
+    def __init__(self, in_features: int, out_features: int, prior_sigma: float = 1.0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.prior_sigma = prior_sigma
+
+        # 平均・対数分散パラメータ（バイアス略）
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features).normal_(0, 0.1))
+        self.weight_rho = nn.Parameter(torch.full((out_features, in_features), -5.0))
+        self.bias_mu = nn.Parameter(torch.zeros(out_features))
+        self.bias_rho = nn.Parameter(torch.full((out_features,), -5.0))
+
+    def _sigma(self, rho: torch.Tensor) -> torch.Tensor:
+        return F.softplus(rho)          # 常に正
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w_sigma = self._sigma(self.weight_rho)
+        b_sigma = self._sigma(self.bias_rho)
+        # 再パラメータ化
+        w = self.weight_mu + w_sigma * torch.randn_like(w_sigma)
+        b = self.bias_mu + b_sigma * torch.randn_like(b_sigma)
+        return F.linear(x, w, b)
+
+    def kl_to_prior(self) -> torch.Tensor:
+        """factorized Gaussian の KL divergence（prior は等方 Gaussian）。"""
+        w_sigma = self._sigma(self.weight_rho)
+        b_sigma = self._sigma(self.bias_rho)
+        p_sigma = self.prior_sigma
+
+        def _kl(mu, sigma):
+            return (
+                torch.log(torch.tensor(p_sigma, device=mu.device) / sigma)
+                + (sigma.pow(2) + mu.pow(2)) / (2 * p_sigma ** 2)
+                - 0.5
+            ).sum()
+
+        return _kl(self.weight_mu, w_sigma) + _kl(self.bias_mu, b_sigma)
+
+
+def elbo_loss(
+    mean_log_likelihood_per_sample: torch.Tensor,
+    kl: torch.Tensor,
+    n_data: int,
+    kl_weight: float = 1.0,
+) -> torch.Tensor:
+    """
+    負の ELBO を最小化する形式で返す。
+
+    重要：`mean_log_likelihood_per_sample` は **サンプル 1 個あたりの log-likelihood の平均**
+    （たとえば `F.log_softmax(logits, -1).gather(...).mean()`）。
+    「mini-batch 上の合計」を渡すと likelihood 項が batch size でスケールし、
+    KL は `n_data` で割られるため、ELBO のバランスが崩壊する。
+
+    合計形式で渡したい場合はこう：
+        loss = -(n_data / batch_size) * batch_log_likelihood_sum + kl_weight * kl
+    """
+    return -mean_log_likelihood_per_sample + kl_weight * kl / n_data
+```
+
+### 推論時のサンプリング
+
+```python
+@torch.no_grad()
+def bnn_predict(model: nn.Module, x: torch.Tensor, S: int = 30) -> dict:
+    """
+    S 回 posterior サンプリングして予測分布を得る。
+    出力形式は MC-Dropout と同一（uncertainty_stop_gate 互換）。
+
+    重要：確率性は **`BayesianLinear` の再パラメータ化のみ** に限定する。
+    BatchNorm や Dropout が混在する場合、eval モードにしてそれらの寄与を止めないと、
+    MI が「重み posterior 由来」なのか「他の確率層由来」なのか解釈不能になる。
+    """
+    prev_states = {name: m.training for name, m in model.named_modules()}
+    model.eval()                                     # BN 統計凍結、Dropout 停止
+    try:
+        sample_probs = []
+        for _ in range(S):
+            logits = model(x)                        # BayesianLinear 内部で自動的に w をサンプル
+            sample_probs.append(logits.softmax(-1))
+        sample_probs = torch.stack(sample_probs, dim=0)  # (S, batch, K)
+    finally:
+        for name, m in model.named_modules():
+            if name in prev_states:
+                m.train(prev_states[name])
+
+    mean_probs = sample_probs.mean(0)
+    K = mean_probs.shape[-1]
+    eps = 1e-12
+    predictive_entropy = -(mean_probs * (mean_probs + eps).log()).sum(-1)
+    member_entropy = -(sample_probs * (sample_probs + eps).log()).sum(-1)
+    expected_entropy = member_entropy.mean(0)
+    mutual_information = predictive_entropy - expected_entropy
+    log_k = torch.log(torch.tensor(K, dtype=predictive_entropy.dtype, device=predictive_entropy.device))
+    return {
+        "mean_probs": mean_probs,
+        "predictive_entropy_normalized": predictive_entropy / log_k,
+        "mutual_information": mutual_information,
+        "expected_entropy": expected_entropy,
+        "max_softmax_uncertainty": 1.0 - mean_probs.max(-1).values,
+    }
 ```
 
 ---
 
-## 10.8 深層レポートテンプレート `deep_report_template`
-
-第4-10 章の全 provenance + Human review + attribution + uncertainty を集約する監査可能レポート。
-
-### レポート構造
+## 10.8 BNN Skill の契約と承認ゲート
 
 ```yaml
-# deep_report_template.yaml
-sections:
-  - id: "0_summary"
-    content:
-      - model_task
-      - report_period
-      - overall_metrics
-      - counts_of_human_handbacks
-      - counts_of_gate_stops
+# bnn_uncertainty.yaml
+skill: "bnn_uncertainty"
+version: "1.0.0"
+approach: "bayes_by_backprop"                       # 明示（Laplace / SG-MCMC と区別）
 
-  - id: "1_environment"
-    reference: "Ch4 Layer 1"
-    fields:
-      - "gpu_backend.*"
-      - "cudnn_deterministic"
-      - "torch_deterministic_algorithms"
-      - "random_seed_per_worker"
+requires:
+  posterior_family: "mean_field_gaussian"           # 明示
+  prior:
+    family: "isotropic_gaussian"
+    sigma: 1.0
+    documented_assumption: true                     # 事前分布の恣意性を明記
+  reparameterization_trick: true
 
-  - id: "2_pretrained_weights"
-    reference: "Ch4 Layer 2 + Ch7 §7.4"
-    fields:
-      - "weights_uri"
-      - "revision (commit hash)"
-      - "weights_sha256 (verified: true/false)"
-      - "weights_license"
-      - "pretraining_data_license"
+training:
+  kl_weight_schedule: "linear_warmup_then_constant"
+  kl_weight_final: 1.0
+  n_epochs_min: 50
+  monitor:
+    - "elbo"
+    - "log_likelihood_component"
+    - "kl_component"
+    - "mean_predictive_entropy_val"                 # 収束モニタ
 
-  - id: "3_training_and_inference"
-    reference: "Ch4 Layer 3 + Ch7 Layer 4 (transfer) + Ch9 bayesian_inference_config"
-    fields:
-      - "finetune_config"
-      - "augmentation_config"
-      - "transfer_learning.*"
-      - "bayesian_inference_config.*   # if applicable"
-
-  - id: "4_uncertainty_and_calibration"
-    reference: "Ch8 + Ch9"
-    fields:
-      - "calibration_ece"
-      - "brier_score"
-      - "reliability_diagram_image_ref"
-      - "temperature_value"
-      - "uncertainty_method_selected"        # from Ch9 selection table
-      - "uncertainty_stop_gate_thresholds"
-
-  - id: "5_gate_activity"
-    reference: "Ch7 + Ch8"
-    fields:
-      - "domain_gap_gate_pass_review_stop_counts"
-      - "uncertainty_stop_gate_activation_counts"
-      - "combined_admission_policy_state"
-
-  - id: "6_attribution"
-    reference: "§10.5"
-    fields:
-      - "method_used"
-      - "sanity_check_pass_rate"
-      - "sample_attribution_gallery_ref"
-      - "hallucinating_samples_count"
-
-  - id: "7_human_review"
-    reference: "§10.7"
-    fields:
-      - "human_handbacks_total"
-      - "action_distribution"                # approve / correct_label / reject / ...
-      - "median_review_duration_seconds"
-      - "correct_label_rate_indicating_model_error"
-      - "flagged_for_retraining_count"
-
-  - id: "8_provenance_integrity"
-    fields:
-      - "all_provenance_files_hash_chain_valid"
-      - "any_missing_layer_detected"        # 監査で fatal
-      - "any_agent_authorization_violation_detected"
-
-  - id: "9_narrative_auto_generated"
-    reference: "§10.6 TIP"
-    content:
-      - reliability_diagram_interpretation_3_sentences
-      - uncertainty_trend_interpretation_3_sentences
-      - human_handback_reason_top_3
-
-immutability:
-  once_signed_by_human: true
-  amendments_allowed_via: "appended_change_log_only"
-  hash_chain_required: true
+acceptance:
+  elbo_stable_last_10_epochs: true
+  kl_not_collapsing_to_zero: true                   # posterior が prior に張り付く「prior 型 collapse」検知
+  kl_not_exploding: true                            # σ→0 の「決定論型 collapse」で KL が爆発するのを検知
+  posterior_std_range:
+    min: 1e-4
+    max: 5.0
+  reject_if_all_sigma_approach_zero: true           # 決定論的 NN に退化していないか
+  reject_if_predictions_are_sample_invariant: true  # posterior sample S 個の予測が同一 → 実質決定論
 
 agent_authorization:
-  L1: "generate_and_display"
-  L2: "generate_and_submit_for_human_review"
-  L3: "generate_and_countersign"
-  never_allowed:
-    - "modify_prior_signed_report"          # 監査
-    - "omit_any_section"                    # fatal if any section missing
-```
+  L1: "inference_only_with_frozen_posterior"
+  L2:
+    can_finetune: false                             # BNN の fine-tune は L2 では不可
+    can_change_prior: false
+    can_change_posterior_family: false
+  L3:
+    can_finetune: "with_prior_approval"
+    can_change_prior: "with_prior_approval"
+    can_change_posterior_family: "forbidden_all_levels"  # VI → SG-MCMC 切替は Human のみ
 
-### 生成コード（骨子）
-
-```python
-# deep_report.py — 実装骨子
-def generate_deep_report(
-    provenance_bundle: dict,   # Ch4-9 の provenance を全て含む
-    attribution_bundle: dict,  # §10.5-10.7 の attribution artifacts
-    human_review_bundle: dict, # §10.7 の Human 判定ログ
-    previous_report_hash: str | None,
-    renderer_version: str,
-    output_format: str = "html",
-) -> str:
-    # 全 bundle と renderer をカバーする **report manifest** を先に構築し、hash chain の根とする
-    manifest = {
-        "provenance_bundle_hash": _hash_content(provenance_bundle),
-        "attribution_bundle_hash": _hash_content(attribution_bundle),
-        "human_review_bundle_hash": _hash_content(human_review_bundle),
-        "previous_report_hash": previous_report_hash,
-        "renderer_version": renderer_version,
-    }
-    manifest_hash = _hash_content(manifest)
-
-    _assert_all_required_sections_present(provenance_bundle, attribution_bundle, human_review_bundle)
-    _assert_hash_chain_valid(provenance_bundle)
-    _assert_attribution_artifact_hashes_match(attribution_bundle)   # UI snapshot と保存物の一致
-    _assert_ui_snapshot_hashes_present(human_review_bundle)         # 全レビューに snapshot hash
-    _assert_no_agent_auth_violation(provenance_bundle)
-
-    body = _render_sections(provenance_bundle, attribution_bundle, human_review_bundle)
-    narrative = _generate_narrative_3_sentences_per_topic(body)      # slot-fill 固定テンプレート
-    report = _compose(body, narrative, manifest, output_format)
-    report_root_hash = _hash_content((report, manifest_hash))
-    _register_in_immutable_store(report, manifest, report_root_hash)
-    return report
+provenance:
+  bayesian_inference_config:                        # 第5章スキーマの BNN 拡張ブロック
+                                                    # （Ch07 Layer 4 と同様の追加パターン）
+    posterior_family: "mean_field_gaussian"
+    prior_family: "isotropic_gaussian"
+    prior_sigma: 1.0
+    kl_weight_final: 1.0
+    n_samples_S_at_inference: 30
+    elbo_final: "value"
+    posterior_std_summary:
+      min: "value"
+      p50: "value"
+      max: "value"
+    monte_carlo_seed: "value"
 ```
 
 > [!WARNING]
-> **`_generate_narrative_3_sentences_per_topic` は決定論的テンプレートで書く**こと。LLM に自由生成させると hallucination が入り、監査レポートとして無効化されます。「reliability diagram の bin X〜Y でズレが Z」のような slot-fill 型固定テンプレートに限定します。
+> **BNN の "確率" は "prior + variational family の関数" です**。prior を変えれば数字が変わります。**Human に見せるときは prior の設定を必ず併記**し、"事前分布を変えれば予測分布も変わる" ことを説明してください。エージェントが prior を勝手に変えることは全レベルで禁止。
 
 ---
 
-## 10.9 レポートの継続監視 — calibration drift と Human review 傾向
+## 10.9 Conformal Prediction の位置づけ（比較表準備）
 
-深層モデルは運用中に **calibration drift**（時間経過で ECE が上昇）や **Human review 傾向の変化**（"correct_label" が急増 = モデル誤り増加）を起こします。
+**Conformal Prediction (CP)** は「モデルに依存しない予測区間の保証」を与える枠組みです。詳細は本書の範囲外ですが、比較表に載せるため要点だけ：
 
-### 監視 Skill `deep_operational_monitor`
+- **分布仮定不要**（任意のモデルに valid）
+- **exchangeability 前提**（i.i.d. と近い仮定）
+- **保証は marginal**（サンプルごとではなくカバレッジ率）
+- **予測集合（分類）または予測区間（回帰）**を出力
+
+### 分類での使用イメージ
+
+```
+入力 x
+  → base classifier で class probability を得る
+  → calibration set の nonconformity score から threshold を決める
+  → 予測集合 C(x) = { y : score(x, y) <= threshold } を返す
+  → P(y_true ∈ C(x)) >= 1 - α を保証（α = 0.1 → 90% 保証）
+```
+
+> [!TIP]
+> **CP は他手法と直交**します。Deep Ensemble / MC-Dropout / BNN の出力に対して conformal を後付けできます。**「不確かさ推定 = 内在的手法（Ensemble/MC-Dropout/BNN）」と「予測区間の保証 = CP」は別問題**として設計してください。
+
+### CP の落とし穴
+
+- **exchangeability 崩壊で保証消失**（分布シフト時に無効化）→ 第8章 `domain_gap_gate` を通過したサンプルにのみ CP を適用する運用が現実的
+- **`domain_gap_gate` は exchangeability 集合を変える**：CP を gate 通過後に運用するなら、**calibration set も同じ gate を通したサンプルで再校正**すること。得られる保証は "gate を通ったサンプル母集団の operational coverage" であり、gate 前の元母集団の保証ではないと Human 資料に明記する
+- **予測集合が大きすぎて実用性なし**（class 数が多い場合）→ adaptive CP / class-conditional CP を検討
+- **calibration set の汚染**（第6章 anti-leakage 違反）→ 契約で必ず分離
+
+---
+
+## 10.10 4 手法使い分け表
+
+エージェントが不確かさ推定手法を選ぶときの判断表。
+
+| 観点 | Deep Ensemble | MC-Dropout | BNN (Bayes by Backprop) | Conformal Prediction |
+|---|---|---|---|---|
+| **学習コスト** | × M（例: × 5） | × 1 | × 1.5〜2（VI overhead） | × 1（後付け） |
+| **推論コスト** | × M | × T（例: × 30） | × S（例: × 30） | × 1 + 校正 |
+| **GPU メモリ** | × M | × 1 | × 2〜（μ, σ 保持） | × 1 |
+| **モデルの前提** | 制約なし | dropout 層必須 | Bayesian 層への置換必須 | 制約なし |
+| **epistemic 表現力** | 強（複数 mode） | 弱〜中（1 mode 周辺） | 中（factorized Gaussian） | N/A（保証は別軸） |
+| **aleatoric 分解** | 可（第9章） | 可 | 可 | ✕（予測集合のみ） |
+| **予測区間の保証** | ✕（校正で近似） | ✕ | ✕（prior 依存） | **○（marginal coverage）** |
+| **Human 解釈** | 中（M モデルの多様性） | 低（proxy） | 高（重み分布 μ, σ を提示） | 高（予測集合の大きさ） |
+| **`uncertainty_stop_gate` との相性** | ◎ | ○ | ○ | 予測集合サイズを別 monitor に |
+| **分布シフト時の頑健性** | 中（epistemic 上昇で検知） | 弱 | 中 | ✕（保証消失） |
+| **実装難度** | 中 | 極低 | 高 | 中 |
+| **監査ログ量** | 大（M × provenance） | 中 | 中〜大（posterior sample） | 中 |
+| **契約破損時の危険度** | 中（M メンバー間 correlation） | 高（BN 汚染など） | 高（posterior collapse） | 中（exchangeability） |
+
+### エージェントの提案ロジック（YAML）
 
 ```yaml
-# deep_operational_monitor.yaml
-skill: "deep_operational_monitor"
+# uncertainty_method_selection.yaml
+skill: "uncertainty_method_selection_table"
 version: "1.0.0"
 
-monitors:
-  - name: "calibration_drift"
-    metric: "weekly_ece"
-    baseline: "rolling_reference_ece_last_4_weeks_pre_deployment"   # training-time 単発ではなく rolling window
-    alert_relative_increase: 0.5            # ベースライン比 +50% で alert
-    min_samples_per_window: 200             # サンプル数不足時は alert 抑止
-    confidence_interval: "bootstrap_95pct"  # 単点比較ではなく CI で判定
-    stratify_by: ["instrument", "class"]    # 全体は OK でも装置別/クラス別にズレがないか
-    delayed_label_policy: "wait_up_to_14_days_then_compute"
+inputs:
+  - gpu_budget_multiplier_available: "float, e.g. 1.0, 3.0, 5.0"
+  - human_interpretability_priority: "low|medium|high"
+  - regulatory_coverage_guarantee_required: "bool"
+  - existing_model_has_dropout: "bool"
+  - can_replace_layers_with_bayesian: "bool"
+  - distribution_shift_expected: "bool"
 
-  - name: "human_correct_label_rate_spike"
-    metric: "correct_label_count / handback_count"
-    window: "rolling_7_days"
-    alert_threshold_absolute: 0.3           # 30% 以上が correct_label なら alert
-    min_handbacks_in_window: 30             # 分母が小さいときは alert 抑止
-    denominator_zero_behavior: "no_alert"
-    stratify_by: ["reviewer_cohort", "class"]
+decision_rules:
+  - if:
+      regulatory_coverage_guarantee_required: true
+      distribution_shift_expected: true
+    then:
+      primary: "route_to_human_no_valid_automatic_method"
+      reason: "shift 下で CP の marginal coverage 保証は消失、他手法も保証を提供しない。Human が再校正/停止を決定"
 
-  - name: "attribution_sanity_check_fail_rate_spike"
-    metric: "sanity_fail_count / total_attributions"
-    alert_threshold: 0.2                    # 20% 以上失敗で alert
-    min_samples_per_window: 100
-    stratify_by: ["method"]                 # grad_cam / IG / shap 別
+  - if:
+      regulatory_coverage_guarantee_required: true
+      distribution_shift_expected: false
+    then:
+      primary: "conformal_prediction"
+      secondary: "deep_ensemble_or_mc_dropout_for_internal_uncertainty"
+      caveat: "calibration set と本番の exchangeability を運用で担保"
 
-  - name: "gate_stop_rate_spike"
-    metric: "uncertainty_stop_gate_activation / total_predictions"
-    alert_relative_increase: 1.0            # 倍以上で alert
-    min_predictions_per_window: 500
-    stratify_by: ["instrument"]
+  - if:
+      gpu_budget_multiplier_available: ">= 3.0"
+      distribution_shift_expected: true
+    then:
+      primary: "deep_ensemble"
+      reason: "epistemic を強く推定できる、shift 検知に有利"
 
-on_alert:
-  - notify_human
-  - freeze_agent_autonomous_decisions_at_L2   # L2 は L1 相当に一時降格
-  - trigger_deep_report_special_edition
-  - never_auto_retrain                        # 再学習は必ず Human 承認 (Ch7/9 継承)
+  - if:
+      gpu_budget_multiplier_available: "< 3.0"
+      existing_model_has_dropout: true
+    then:
+      primary: "mc_dropout"
+      caveat: "epistemic は proxy であること Human に明示"
+
+  - if:
+      human_interpretability_priority: "high"
+      can_replace_layers_with_bayesian: true
+    then:
+      primary: "bnn_bayes_by_backprop"
+      caveat: "prior 設定を Human 説明資料に必ず含める"
+
+  - fallback:
+      when: "existing_model_has_dropout: true"
+      primary: "mc_dropout"
+      reason: "実装コスト最小の baseline"
+  - fallback_final:
+      when: "no other rule matched"
+      primary: "single_model_max_softmax_uncertainty_with_domain_gap_gate"
+      reason: "MC-Dropout 不可・BNN 化不可の場合の最小構成。第8章 domain_gap_gate と第9章 max_softmax_uncertainty のみで運用し、Human 監視頻度を上げる"
 
 agent_authorization:
-  L1: "read_only"
-  L2: "read_only"
-  L3:
-    can_adjust: "monitor_alert_thresholds_with_prior_approval_and_appended_change_log"
-    cannot_adjust:                            # Ch8 gate 閾値は全レベル不可（Ch8 §8.9 継承）
-      - "uncertainty_stop_gate_thresholds"
-      - "domain_gap_gate_thresholds"          # Ch7 §7.5 継承
-      - "attribution_sanity_check_similarity_thresholds"   # §10.4 継承
-    cannot_use_threshold_change_to_clear_active_alert: true  # alert を隠すための閾値変更禁止
+  L1: "propose_method_only, no_execution"
+  L2: "execute_within_proposed_set"
+  L3: "execute_and_override_with_prior_approval"
+
+output_provenance:
+  record_all_inputs: true
+  record_decision_rule_matched: true
+  record_alternatives_considered: true
+  record_human_review_ref_if_L3_override: true
 ```
 
 ---
 
-## 10.10 vol-01 第6章 3 原則の深層拡張表
+## 10.11 vol-02 PyMC/NumPyro との接続点
 
-| vol-01 3 原則 | 深層拡張（本章） |
+vol-02 では階層モデルの完全な posterior を得るために PyMC / NumPyro を使いました。深層 × BNN との接続は**「深層特徴 → 階層モデル」**という段構成が実務的です（第14章 capstone で詳細）。
+
+```mermaid
+flowchart LR
+    A["ARIM 画像/スペクトル"] --> B["深層モデル<br/>+ MC-Dropout or BNN"]
+    B --> C["深層特徴 z<br/>+ epistemic uncertainty u"]
+    C --> D["PyMC 階層モデル<br/>vol-02 第11-13章"]
+    D --> E["装置間 / ロット間 / 研究室間<br/>階層効果の完全 posterior"]
+    E --> F["Agentic 判断<br/>+ Human 承認"]
+```
+
+### 接続時の注意
+
+| 論点 | 対処 |
 |---|---|
-| **疑わしいときは Human** | Ch7 domain_gap_gate + Ch8 uncertainty_stop_gate + §10.9 drift monitor が **多層で** trigger、単一 confidence 閾値に頼らない |
-| **決めるのは Human** | §10.7 `human_handback_review` で最小提示情報を規定、attribution / uncertainty / neighbors すべてを見た上での判定を強制。sanity check fail 時は attribution 非表示 |
-| **記録は改ざん不可** | §10.8 `deep_report_template` の hash chain、`once_signed_by_human` の不変性、appended change log のみ許可、agent は署名済みレポートを変更不可 |
+| 深層側の epistemic が階層側で aleatoric として扱われる | 深層 uncertainty を階層モデルの観測分散に組み込む（第14章） |
+| BNN prior と PyMC prior の二重設定 | 深層側は "特徴抽出"、階層側は "階層効果" と役割を分ける |
+| 深層 fine-tune のたびに階層モデル再校正 | `training_config.yaml` に依存関係を宣言、agent は L2 でもトリガ不可 |
 
 ---
 
-## 10.11 失敗パターンと対策
+## 10.12 失敗パターンと対策
 
 | 失敗 | 症状 / 兆候 | 対策 |
 |---|---|---|
-| Grad-CAM を Transformer に適用して意味不明な map | attribution map が入力と無関係 | §10.5 `_validate_method_vs_architecture` で fatal |
-| Sanity check を通さず attribution を Human に提示 | Human が hallucinating attribution を信じる | §10.7 `attribution_hallucinating_samples_must_be_flagged` |
-| IG の baseline を勝手に変える | attribution 値が別物になる | provenance に必ず記録、L2 は変更不可 |
-| reliability diagram の bin 定義が ECE と食い違う | Human 資料の数字が本文と合わない | §10.6 で bin_edges strategy を明示、ECE と同一関数から生成 |
-| Human review が数秒で終わる（形式的承認） | `review_duration_seconds` が異常に短い | `human_review_time_min_seconds: 5` acceptance |
-| 深層レポートの一部セクション欠落 | 監査時に "その項目は記録されなかった" | §10.8 `never_allowed: omit_any_section` fatal |
-| 署名済みレポートを agent が上書き | 監査ログが変わる | `never_allowed: modify_prior_signed_report`、hash chain |
-| narrative を LLM 自由生成 | hallucination が監査対象に混入 | §10.8 warning、slot-fill 固定テンプレートのみ |
-| drift monitor 発動でも autonomous 継続 | Ch8 gate と同じ暴走リスク | §10.9 `freeze_agent_autonomous_decisions_at_L2` |
-| 誤判定サンプルを Human に流さず agent が押し切る | `bypass_human_handback` | §10.7 `never_allowed: auto_approve_without_human` |
-| Human が correct_label を大量に返し始めたのに再学習しない | drift 検知遅延 | §10.9 `human_correct_label_rate_spike` monitor |
-| attribution artifact のハッシュ検証をスキップ | Human に見せた map と保存された map が違う可能性 | §10.7 `displayed_attribution_hash` を UI snapshot に含める |
+| MC-Dropout で BatchNorm も train モード | eval 時の予測が非決定的に壊れる | `_enable_dropout_only` で dropout 層のみ切替、per-layer state を provenance に記録 |
+| BNN の **決定論型 posterior collapse** | 全 σ が 0 に近づき決定論的 NN と同じ挙動、posterior sample S 個の予測が同一 | `reject_if_all_sigma_approach_zero` + `reject_if_predictions_are_sample_invariant`、KL weight schedule 見直し |
+| BNN の **prior 型 posterior collapse** | KL が 0 に近づき q(w) ≈ p(w)、posterior が学習に失敗 | `kl_not_collapsing_to_zero` acceptance、prior sigma と KL warmup を再設計 |
+| BNN の **prior 支配**（prior domination） | prior sigma を変えると予測分布が大きく変わる | Human 説明資料に prior 設定を必須記載、prior 変更は L3 でも要承認 |
+| Conformal set が全 class を含む | 予測集合の実用性ゼロ | α, calibration set size, model quality を再検討 |
+| Conformal の exchangeability 崩壊 | shift 下で coverage が保証値を下回る | `domain_gap_gate` 通過後のみ CP を有効化 |
+| MC-Dropout の T が過小で分散不安定 | 再実行で結果がぶれる | `T.min` 契約強制、seed 記録 |
+| BNN の重みサンプル S を Human と agent で変える | 数字が合わない | S を Skill レベルで固定、変更は L3 承認必須 |
+| 4 手法を **混ぜて "総合スコア"** を作る | 意味論が壊れ、監査で説明不能 | 各手法の出力は**別 monitor** として `uncertainty_stop_gate` に流す、混ぜない |
+| 手法選択の記録なし | なぜその手法を選んだか監査で説明できない | `uncertainty_method_selection` の decision provenance を必ず保存 |
+| Deep Ensemble を装って MC-Dropout で運用 | Human 資料に "ensemble" と書きつつ実装は MC-Dropout | Skill 名を厳密に区別、レポートに手法名を fatal assert で刻印 |
 
 ---
 
-## 10.12 まとめ
+## 10.13 まとめ
 
-- Attribution は **CAM / IG / SHAP** の 3 系統。モデル系統との整合を Skill で fatal assert
-- Attribution は hallucinate しうる（Adebayo 2018）。**model / data / cascading randomization** の 3 サニティチェックを契約に組み込み、fail サンプルは Human に attribution を表示しない
-- Reliability diagram の bin は第8章 ECE と同一関数から生成。**temperature 前後を併記**
-- **`human_handback_review`** は Human が「予測 + attribution + uncertainty + 類似訓練サンプル」を見た上で判定する UX を規定。判定は改ざん不可
-- **`deep_report_template`** は Ch4-10 の全 provenance を集約。hash chain + `once_signed_by_human` で監査可能
-- **`deep_operational_monitor`** で calibration drift / correct_label 増加 / sanity check fail 率 / gate stop 増加を継続監視、alert 時は L2 → L1 一時降格
-- vol-01 第6章の 3 原則を、深層特有の **多層 gate + attribution 検証 + hash chain レポート**として拡張
+- MC-Dropout は「dropout 層を推論時 on にする」だけの安価な epistemic uncertainty proxy。ただし理論的裏付けには仮定が多く、**真のベイズではない**
+- BNN（Bayes by Backprop）は重み分布を学習する近似ベイズ。VI / Laplace / SG-MCMC の 3 系統があり、本書は VI 系（Bayes by Backprop）を最小実装
+- Conformal Prediction は分布仮定に頼らない予測区間の保証。**他手法と直交**し、後付けで組み合わせられる
+- 4 手法を比較する使い分け表を Skill として実装し、エージェントは L1〜L3 権限に応じて提案・実行
+- vol-02 PyMC/NumPyro との接続は「深層特徴 → 階層モデル」の段構成が実務的（第14章 capstone で完成）
 
-## 10.13 章末チェックリスト
+## 10.14 章末チェックリスト
 
-- [ ] `feature_attribution` は architecture-method 整合を fatal assert しているか
-- [ ] `attribution_sanity_check` の 3 テスト（model / cascading / data randomization）がすべて通っているか
-- [ ] Sanity check fail 時に attribution を Human に**見せていない**か
-- [ ] reliability diagram の bin 定義が第8章 ECE と一致しているか
-- [ ] `human_handback_review` の UI snapshot hash が provenance に記録されているか
-- [ ] `deep_report_template` の全セクションが揃っているか（omit_any_section = fatal）
-- [ ] narrative が slot-fill 固定テンプレートで生成されているか（LLM 自由生成禁止）
-- [ ] `deep_operational_monitor` の alert 発動で agent 権限が一時降格するか
-- [ ] Human review duration が min_seconds を満たしているか
-- [ ] レポート署名後の変更が append-only change log に限定されているか
+- [ ] MC-Dropout Skill の `_enable_dropout_only` は BatchNorm を train にしないことを確認したか
+- [ ] MC-Dropout の T は契約範囲内か（min ≤ T ≤ max）
+- [ ] `record_which_layers_were_train_mode` が provenance に記録されているか
+- [ ] BNN の posterior collapse チェック（σ が 0 に近づいていないか）
+- [ ] BNN の prior 設定を Human 説明資料に明記したか
+- [ ] Conformal Prediction を使う場合、`domain_gap_gate` 通過後に限定されているか
+- [ ] 4 手法選択の decision rule が provenance に記録されているか
+- [ ] エージェント権限（L1-L3）と `agent_authorization` YAML が一致しているか
+- [ ] 手法出力はすべて第9章 `uncertainty_stop_gate` 互換の schema か（`mean_probs`, `predictive_entropy_normalized`, `mutual_information`）。**ただし Conformal Prediction のみ例外**で、`prediction_set_size` / `interval_width` / `coverage_alpha` を別 monitor として gate に追加すること
+- [ ] 手法を混ぜず、各 monitor 独立で gate に流しているか
 
-## 10.14 ワーク
+## 10.15 ワーク
 
-**W10-1**: 第6章の CNN に対し `feature_attribution(method="grad_cam")` を実装し、`attribution_sanity_check` を回せ。cascading randomization で attribution similarity が単調減少することを確認し、失敗した場合は原因を書け。
+**W9-1**: 既存の CNN（第7章）に MC-Dropout を適用し、T=10, 30, 100 で `predictive_entropy_normalized` の分散を比較せよ。T の下限を決める根拠を書き、`mc_dropout_predict.yaml` の `T.min` に反映せよ。
 
-**W10-2**: `reliability_diagram_data` を第8章の `calibration_check` と統合し、temperature scaling 前後の 2 枚を並べた HTML を出力せよ。3 文の自動解釈を slot-fill で書け。
+**W9-2**: BayesianLinear で MLP を書き、MNIST または ARIM 風合成データで学習せよ。学習曲線に ELBO / log-likelihood / KL の 3 曲線を重ねてプロットし、KL が collapse していないことを確認せよ。
 
-**W10-3**: `human_handback_review` の UI モック（Streamlit / Gradio 等）を作り、`attribution_hallucinating_samples_must_be_flagged` の動作（sanity fail 時に attribution を非表示にすること）を確認せよ。
+**W9-3**: 同一の val セットに対し、MC-Dropout / BNN / Deep Ensemble（第9章）の `mutual_information` 分布をヒストグラムで重ね描きし、"どの手法が epistemic を強く見せるか" を Human に説明せよ。
 
-**W10-4**: `deep_report_template` を第6-9 章のダミー provenance で埋め、hash chain を検証するテストを書け。1 か所のフィールドを改ざんしたら chain が破綻することを示せ。
+**W9-4**: `uncertainty_method_selection_table` の YAML を、ARIM の 6 データ型テンプレート（vol-01 第13章）ごとに埋めよ。各データ型で primary 手法と caveat を書け。
 
-**W10-5**: `deep_operational_monitor` の 4 monitor を、ARIM 風合成データで 4 週間分シミュレートせよ。calibration drift alert が発火する条件を作為的に作り、agent 権限が L2 → L1 に降格するログを確認せよ。
+## 10.16 参考資料
 
-## 10.15 参考資料
-
-- Adebayo, J., et al. (2018). Sanity Checks for Saliency Maps. NeurIPS.
-- Selvaraju, R. R., et al. (2017). Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization. ICCV.
-- Sundararajan, M., Taly, A., & Yan, Q. (2017). Axiomatic Attribution for Deep Networks (Integrated Gradients). ICML.
-- Lundberg, S. M., & Lee, S.-I. (2017). A Unified Approach to Interpreting Model Predictions (SHAP). NeurIPS.
-- Kokhlikyan, N., et al. (2020). Captum: A unified and generic model interpretability library for PyTorch. arXiv.
-- Poursabzi-Sangdeh, F., et al. (2021). Manipulating and Measuring Model Interpretability. CHI.
-- Guo, C., et al. (2017). On Calibration of Modern Neural Networks (reliability diagram). ICML.
-- 本書 第4章（3 レイヤ provenance）、第7章（domain_gap_gate + Layer 4）、第8章（uncertainty_stop_gate + calibration）、第9章（bayesian_inference_config）
-- vol-01 第6章（予防的 Human-in-the-loop 3 原則）
-- vol-01 第7章（provenance 5 要素）
+- Gal, Y., & Ghahramani, Z. (2016). Dropout as a Bayesian Approximation: Representing Model Uncertainty in Deep Learning. ICML.
+- Blundell, C., et al. (2015). Weight Uncertainty in Neural Networks (Bayes by Backprop). ICML.
+- Maddox, W. J., et al. (2019). A Simple Baseline for Bayesian Uncertainty in Deep Learning (SWAG). NeurIPS.
+- Daxberger, E., et al. (2021). Laplace Redux — Effortless Bayesian Deep Learning. NeurIPS.
+- Angelopoulos, A. N., & Bates, S. (2023). A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification.
+- Fort, S., Hu, H., & Lakshminarayanan, B. (2019). Deep Ensembles: A Loss Landscape Perspective. arXiv.
+- vol-02 第11-13章（PyMC / NumPyro による本格ベイズ推論）
+- 本書 第9章（Deep Ensemble と `uncertainty_stop_gate`）
+- 本書 第14章（深層特徴 × 階層モデル capstone）
+- 本書 付録B（Pyro / NumPyro / laplace-torch チートシート）

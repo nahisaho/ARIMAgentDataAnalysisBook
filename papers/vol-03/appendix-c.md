@@ -11,17 +11,17 @@
 
 | こんなときは | 参照節 | 関連章 |
 |---|---|---|
-| `CUDA out of memory` が出る | §C.2.1〜C.2.4 | 第4章・第6章 |
-| 「同じ seed なのに結果が違う」 | §C.3 | 第4章・第14章 DG-01 |
-| CI で GPU 前提コードが落ちる | §C.4 | 第4章（CPU fallback） |
-| Mixed precision で NaN が出る | §C.5.1 | 第6章・第8章 |
+| `CUDA out of memory` が出る | §C.2.1〜C.2.4 | 第5章・第7章 |
+| 「同じ seed なのに結果が違う」 | §C.3 | 第5章・第15章 DG-01 |
+| CI で GPU 前提コードが落ちる | §C.4 | 第5章（CPU fallback） |
+| Mixed precision で NaN が出る | §C.5.1 | 第7章・第9章 |
 | DataLoader が遅い / hang する | §C.5.2 | 付録B B.2.4 |
-| Hugging Face Hub 認証で 401/403 | §C.5.4 | 第11章・付録B B.4 |
-| ARIM 実データにアクセスできない | §C.6 | 第2章・第4章 |
-| 公開ベンチマークを使いたい | §C.7〜C.8 | 第7章・第13章 |
+| Hugging Face Hub 認証で 401/403 | §C.5.4 | 第12章・付録B B.4 |
+| ARIM 実データにアクセスできない | §C.6 | 第3章・第5章 |
+| 公開ベンチマークを使いたい | §C.7〜C.8 | 第8章・第14章 |
 
 > [!TIP]
-> **§C.2〜§C.5 のすべてのトラブルシューティングは、「まず provenance / audit ledger に "何が起きたか" を残す」がゴール**です。エラーを消すことがゴールではありません。第14章 §14.5 の failure_pattern_registry と対応させて読んでください。
+> **§C.2〜§C.5 のすべてのトラブルシューティングは、「まず provenance / audit ledger に "何が起きたか" を残す」がゴール**です。エラーを消すことがゴールではありません。第15章 §15.5 の failure_pattern_registry と対応させて読んでください。
 
 ---
 
@@ -57,7 +57,7 @@ def dump_memory_summary(tag: str) -> None:
     frag = stats["reserved_MB"] - stats["allocated_MB"]
     stats["fragmentation_MB"] = frag
     print(f"[{tag}] " + " ".join(f"{k}={v:.1f}" for k, v in stats.items()))
-    # 監査に残す（第14章 audit ledger）
+    # 監査に残す（第15章 audit ledger）
     return stats
 ```
 
@@ -89,7 +89,7 @@ for step, batch in enumerate(loader):
 3. ループ外で参照が残っていないか確認（`losses.append(loss)` は `.item()` してから）
 
 > [!NOTE]
-> **`losses.append(loss)` は分類 A の典型的な原因**です。`loss` は autograd グラフ全体を参照するため、リストに保持すると **1 ステップ分の activation がずっと解放されません**。必ず `losses.append(loss.item())` にしてください。（第14章 canonical registry には該当 ID なし——実装レベルの一般的バグとして扱う。）
+> **`losses.append(loss)` は分類 A の典型的な原因**です。`loss` は autograd グラフ全体を参照するため、リストに保持すると **1 ステップ分の activation がずっと解放されません**。必ず `losses.append(loss.item())` にしてください。（第15章 canonical registry には該当 ID なし——実装レベルの一般的バグとして扱う。）
 
 ### C.2.3 分類 G：gradient 蓄積
 
@@ -206,7 +206,7 @@ def assert_deterministic_ready(expected_seed: int,
     assert tf32_cudnn == expect_tf32
 ```
 
-このアサートを **Skill の入口（`run_train` の先頭）**に置き、失敗したら第14章 **DG-01（GPU 非決定性による結果ずれ）** として `audit.log` に記録するのが本書の運用モデルです。
+このアサートを **Skill の入口（`run_train` の先頭）**に置き、失敗したら第15章 **DG-01（GPU 非決定性による結果ずれ）** として `audit.log` に記録するのが本書の運用モデルです。
 
 ### C.3.3 「決定論 OFF が正当化される」場合
 
@@ -266,7 +266,7 @@ def scale_for_ci(config: dict) -> dict:
 | 4 | Bit-exact regression test fail | CPU/GPU で数値差 | 許容誤差ベース比較（`torch.allclose(rtol=1e-4)`）|
 
 > [!IMPORTANT]
-> CI での smoke test は **「Skill が起動する」「provenance が正しい schema で出力される」ことを検証**するもので、**性能検証ではありません**。第4章の Skill 定義では `ci_smoke_test` と `production_run` を明示的に分ける運用を推奨します。
+> CI での smoke test は **「Skill が起動する」「provenance が正しい schema で出力される」ことを検証**するもので、**性能検証ではありません**。第5章の Skill 定義では `ci_smoke_test` と `production_run` を明示的に分ける運用を推奨します。
 
 ---
 
@@ -548,14 +548,14 @@ def generate(cfg: SynthConfig) -> tuple[dict, dict]:
 | フィールド | 出力先 | 用途 | 対応章 |
 |---|---|---|---|
 | `schema_version` | public / truth 両方 | 生成器スキーマ ID | Ch4 canonical |
-| `generator_config_public` | public のみ | 学習に公開してよいハイパラ | Ch4 §4.5 |
-| `generator_source_sha256` | 両方 | 生成スクリプトの hash | Ch11 §11.4 |
-| `files_with_sha256[].{file,kind,sha256}` | public のみ | Ch11 / 付録B canonical schema | Ch11 §11.4 integrity（改ざん検知は AG-08 と同族の signature 系脅威）|
+| `generator_config_public` | public のみ | 学習に公開してよいハイパラ | Ch4 §5.5 |
+| `generator_source_sha256` | 両方 | 生成スクリプトの hash | Ch11 §12.4 |
+| `files_with_sha256[].{file,kind,sha256}` | public のみ | Ch11 / 付録B canonical schema | Ch11 §12.4 integrity（改ざん検知は AG-08 と同族の signature 系脅威）|
 | `hierarchy` (lab/instrument/lot/sample ID) | public のみ | Ch13 階層構造 | Ch13 capstone |
 | `truths_by_instrument[].{psf_sigma_truth, bias_truth}` | **truth のみ** | 学習後の bias 復元検証 | Ch13 Gate2 |
 | `truths_by_lot[].peaks_truth` | **truth のみ** | ピーク位置の復元検証 | Ch13 Gate2 |
 | `psf_sigma_truth` / `bias_truth` | 装置固有真値 | Ch13 capstone 教師 |
-| `files_with_sha256[].sha256` | 個別ファイルの integrity | Ch11 §11.4 |
+| `files_with_sha256[].sha256` | 個別ファイルの integrity | Ch11 §12.4 |
 
 > [!TIP]
 > `manifest_public.yaml` は学習・Skill 実行時に参照し、`manifest_truth.yaml` は評価器 / Ch13 Gate2 のみが読みます。エージェントが `lab_00` で学習した重みを `lab_02` に転移するとき、Gate 側で truth と学習結果を照合し、Ch13 Gate2 の判断材料にします。
@@ -676,7 +676,7 @@ print(ds)
 >        endpoint: "https://api.materialsproject.org"
 >    ```
 > 2. ダウンロード後に **file-level sha256 検証**（付録B B.4.4 の `files_with_sha256` パターンを流用）
-> 3. ライセンス文字列と取得時刻を provenance の `dataset_license` / `dataset_fetched_at` に刻印（Ch11 §11.4）
+> 3. ライセンス文字列と取得時刻を provenance の `dataset_license` / `dataset_fetched_at` に刻印（Ch11 §12.4）
 > 4. **rate limit / 大容量 DL の再試行ポリシーを Skill 定義に明記**（Ch4）
 >
 > **`dataset_fetch_allowlist` にない取得元へエージェントが自律的にアクセスすることは禁止**（Ch14 **AG-06 Human-in-the-loop バイパス**に該当）。取得時に signature / hash 検証を省略した場合は **AG-08（署名検証スキップ）**として扱います。
@@ -724,7 +724,7 @@ def check_dataset_license(name: str,
 - **CPU fallback / CI smoke test** は「動く」ではなく「provenance が正しい schema で出る」ことを確認するもの
 - **演習データは ARIM 風合成データを主軸**にし、公開ベンチマークは対比用途に留める。生成データは **`manifest_public` / `manifest_truth` を分離**し、truth を学習に見せない
 - **公開ベンチマークの自動 fetch は `dataset_fetch_allowlist` + file-level sha256 + ライセンス drift 検出**の 3 点セット
-- **すべてのトラブルシューティングは第14章 failure_pattern_registry（DG-01〜08 / AG-01〜09）と対応**させ、audit ledger の入力にする
+- **すべてのトラブルシューティングは第15章 failure_pattern_registry（DG-01〜08 / AG-01〜09）と対応**させ、audit ledger の入力にする
 
 ---
 
@@ -739,4 +739,4 @@ def check_dataset_license(name: str,
 - **Open Catalyst Project**: https://opencatalystproject.org/
 - **NOMAD Laboratory**: https://nomad-lab.eu/
 - 本書付録A（テンプレート集）／付録B（PyTorch/JAX/HF/MCP チートシート）
-- 本書第4章（Skill 定義）／第11章（Foundation Model provenance）／第13章（Gate state machine）／第14章（failure_pattern_registry）
+- 本書第5章（Skill 定義）／第12章（Foundation Model provenance）／第14章（Gate state machine）／第15章（failure_pattern_registry）

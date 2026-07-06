@@ -1,670 +1,695 @@
-# 第8章 深層モデルの不確かさ入門 — Agentic 停止条件つき
+# 第8章 転移学習 / fine-tuning を Skill 化する — Agentic 判断つき
 
 > [!NOTE]
 > **本章の到達目標**
-> - **calibrated softmax の限界**（confidence ≠ probability）を数値例で説明できる
-> - **calibration 指標**（Brier / ECE / reliability diagram）を実装し、Skill の受け入れ基準に組み込める
-> - **temperature scaling** による post-hoc calibration を Skill 化できる
-> - **Deep Ensemble Skill** を M モデルで実装し、`predictive_entropy_normalized` / `mutual_information`（epistemic）/ `expected_entropy`（aleatoric）を計算できる
-> - **`uncertainty_stop_gate` 契約**を書き、エージェントが不確かさ閾値超過時に自律停止して Human に投げるゲートを設計できる
-> - 第6章 §6.3 の `val_ood_score` の forward reference を、この章で **具体実装として回収**する
-> - 第7章の `domain_gap_gate`（feature-level OOD）と、この章の `uncertainty_stop_gate`（output-level uncertainty）の**役割分担**を書き分けられる
+> - **転移学習 4 戦略**（frozen feature extractor / partial fine-tune / full fine-tune / LoRA・PEFT）を、データ規模・装置固有性・計算資源から**機械的に**選び分けられる
+> - **事前学習重みの分布外検知**（feature-level domain gap early warning）を Skill に組み込める
+> - **装置ごとに fine-tune 戦略を切り替える判断表**を書ける（同じデータ型でも装置が違えば戦略が変わる）
+> - **「今日のバッチだけで再 fine-tune するか」の承認ゲート**を設計できる
+> - **少データ材料での fine-tune 評価戦略**（vol-02 第8章 CV 設計を深層に、grouped × few-shot × 事前学習の 3 軸）を実装できる
+> - **エージェントに fine-tune を実行させる Skill** において、勝手にモデルを更新できない契約を書ける
 >
 > **本章で扱わないこと**
-> - **MC-Dropout / BNN**（Bayes by Backprop / VI / SG-MCMC）→ **第9章**（Deep Ensemble との使い分け表を含む）
-> - **PyMC / NumPyro による本格ベイズ推論** → **第10-12章**（vol-02 継承 + 深層特徴の接続）
-> - **conformal prediction の詳細** → **第9章末で使い分け表のみ触れる**
-> - **Grad-CAM / SHAP / attribution** → **第10章**（解釈と誤判定流し戻し UX）
+> - Foundation Model の内部構造・アーキテクチャ詳細 → **第12章**（FM）
+> - 事前学習そのもの（大規模データからの自己教師あり学習） → **第13章**（SSL）
+> - 不確かさの本格的な扱い（BNN / Deep Ensemble / Predictive Entropy） → **第8-9章**
+> - ハイパーパラメータの Bayesian Optimization → **vol-04**（第8章末の道しるべ）
 
 ---
 
 ## 8.1 この章で作る Skill
 
-3 つの **不確かさ Agentic Skill** と 1 つの **停止ゲート契約**を作ります。
+3 つの **転移学習 Agentic Skill** と 1 つの **判断表** を作ります。
 
-| Skill / 成果物 | 役割 | 入出力 |
-|---|---|---|
-| **`calibration_check`** | 学習済みモデルの calibration 品質を測る | 入力: model + val set → 出力: ECE / Brier / reliability diagram |
-| **`temperature_scaling`** | post-hoc temperature scaling で calibration を改善 | 入力: model + calibration set → 出力: 温度パラメータ T + wrapped model |
-| **`deep_ensemble`** | M モデルの Deep Ensemble を訓練・推論・不確かさ分解 | 入力: model factory + M + data → 出力: 平均予測 / 分散 / 分解 |
-| **`uncertainty_stop_gate`**（契約） | 推論時に不確かさ閾値超過で自律停止 → Human 送り | 入力: predictive distributions → 出力: action (continue / route_to_human / block) |
+| Skill | データ型 | ベース戦略 | 想定装置 |
+|---|---|---|---|
+| **`spectrum_transfer_1d`** | 1D スペクトル（IR / Raman） | 事前学習 1D CNN → head 交換 + partial fine-tune | 装置 A（校正済み） / 装置 B（新規） |
+| **`sem_transfer_2d`** | 2D 画像（SEM） | ImageNet 事前学習 ResNet18 → LoRA fine-tune | SEM 装置 α / β / γ |
+| **`tabular_transfer`** | Tabular（組成・実験条件） | 事前学習 FT-Transformer → frozen feature + linear head | 装置横断（tabular） |
 
-前提として、第4章 provenance 3 レイヤ、第5-6 章の契約群、第7章の `domain_gap_gate` を継承します。
+さらに、**判断表と承認ゲート**を成果物として設計します。
+
+- **成果物 4**：装置別 fine-tune 戦略判断表（`instrument_finetune_decision_table.yaml`）
+- **成果物 5**：日次 re-fine-tune 承認ゲート仕様（`daily_refinetune_gate.yaml`）
+
+各 Skill は第5章の 7 セクション仕様書、第6章の 2 契約（`deep_split_contract` + `augmentation_contract`）、第7章の `training_config.yaml` を継承した上で、**転移学習に特有の追加契約 3 種**を導入します：
+
+1. **`pretrained_weights` provenance**（第5章 Layer 2 の厳格版）
+2. **`domain_gap_gate`**（feature-level 分布外検知）
+3. **`refinetune_authorization`**（日次 / バッチ単位の再学習権限）
 
 ---
 
-## 8.2 なぜこの章が必要か — vol-02 第9-10 章との対比
+## 8.2 なぜこの章が必要か — vol-02 第8章の限界と ARIM の現実
 
-vol-02 では PyMC による本格ベイズ推論（第10-12章）で不確かさを扱いました。しかし深層モデルでは：
+### vol-02 第8章 vs vol-03 第8章
 
-- **PyMC でネットワーク重みを直接推論するのは計算コストが非現実的**（数百万〜数十億パラメータ）
-- **深層モデルの softmax 出力は "確率" ではなく "confidence"** — calibration を測らないと数字が意味を持たない
-- **単一 checkpoint の点推定では、認識できていないことを認識できない**（epistemic uncertainty が消える）
+vol-02 第8章では **CV 設計とデータリーク検知** を扱いました。それは「モデルは自分で学習する」前提でした。しかし現実の ARIM データでは：
 
-一方で Agentic 環境では：
-
-- エージェントが `predict()` の 1 スカラー確信度を鵜呑みにして自律判断すると **危険**
-- Human に投げる基準を「confidence < 0.7 なら」で決めると overconfidence 問題で **不発**（本当は 0.9 でも間違っている）
-- **不確かさ閾値超過で停止するゲート**を Skill に組み込まないと、暴走する
+- **単一装置の実験室スケール**では、深層モデルを **from-scratch で学習するデータが足りない**（第7章 §7.7 の議論）
+- 一方で **公開の事前学習モデル**（ImageNet, ChemBERTa, Uni-Mol, Raman-FM 等）は装置分布の外にある
+- **装置ごとに fine-tune 戦略を変える**必要がある：装置 A では frozen feature で十分、装置 B では partial fine-tune が必要、装置 C では LoRA、といった判断が発生する
 
 ```mermaid
 flowchart TB
-    A["新規サンプル"] --> B["深層モデル推論"]
-    B --> C{"出力 softmax 信頼度"}
-    C -->|"生 softmax"| D["⚠️ Overconfident<br/>信用できない"]
-    B --> E["Deep Ensemble<br/>M モデル平均 + 分散"]
-    E --> F["predictive_entropy_normalized<br/>+ mutual_information"]
-    F --> G{"uncertainty_stop_gate"}
-    G -->|"entropy 小"| H["エージェント自律決定 OK"]
-    G -->|"entropy 中"| I["Human に flag + continue"]
-    G -->|"entropy 大"| J["自律停止<br/>Human 送り"]
+    A["新しい ARIM データバッチ"] --> B{"事前学習モデルの分布内?"}
+    B -->|"Yes (domain gap 小)"| C["frozen feature extractor<br/>+ linear head 再学習のみ"]
+    B -->|"No (domain gap 中)"| D{"データ量 n"}
+    B -->|"分布外 (domain gap 大)"| E["Human review<br/>→ 事前学習モデルの見直し"]
+    D -->|"n < 100"| F["frozen feature + head fine-tune"]
+    D -->|"100 <= n < 1000"| G["LoRA / PEFT<br/>partial fine-tune"]
+    D -->|"n >= 1000"| H["full fine-tune<br/>（承認ゲート必要）"]
 ```
+
+**Agentic 特有の課題**：
+
+- **エージェントが勝手に fine-tune を起動**：GPU 時間・エネルギー・checkpoint の管理を無視して自律実行し、結果として整合性が崩れる
+- **エージェントが domain gap を無視**：事前学習分布から遠いデータに対しても「fine-tune すれば大丈夫」と誤った自信を持つ
+- **エージェントが日次 re-fine-tune を暴走**：新バッチ到着のたびに再学習し、モデルが日毎に変わる（provenance が追えない）
+
+この章は、これら 3 つの Agentic 特有問題を **契約と承認ゲート** で解決します。
 
 ---
 
-## 8.3 Calibrated softmax の限界 — 「confidence 0.95」は 95% ではない
+## 8.3 転移学習 4 戦略の比較と選択基準
 
-深層モデルの softmax 出力は「学習時の cross-entropy を最小化した結果の確率らしき数値」であり、**真の予測確率とは一致しません**。
+### 4 戦略の定義
 
-### §8.3 confidence bin の「予測との差」
+| 戦略 | 説明 | 更新される重み | 計算コスト | 破壊リスク |
+|---|---|---|---|---|
+| **A. Frozen feature extractor + linear head** | 事前学習モデルを固定、最終層のみ線形分類器で学習 | linear head の重みのみ | 極低 | ほぼゼロ |
+| **B. Partial fine-tune (last N layers)** | 最終 N 層のみ更新、他は frozen | 最終 N 層 + head | 低〜中 | 中 |
+| **C. LoRA / PEFT** | 各層に低ランク adapter を挿入し、adapter のみ更新 | adapter 重み（元重み変更なし） | 中 | 低（元重み保持） |
+| **D. Full fine-tune** | 全層を更新 | 全重み | 高 | 高（catastrophic forgetting） |
 
-**注**：下表の「予測との差」は各 bin の accuracy と bin **中央値** confidence（例：bin `0.9-1.0` は中央 0.95）の差です。
-
-学習済み ResNet を CIFAR-10 で評価すると（Guo et al., 2017 系の典型結果パターン）：
-
-| 予測 confidence | サンプル数 | 実際の正解率 | 予測との差 |
-|---|---|---|---|
-| 0.5-0.6 | 500 | 0.55 | +0.00 |
-| 0.6-0.7 | 800 | 0.58 | -0.07 |
-| 0.7-0.8 | 1200 | 0.68 | -0.07 |
-| 0.8-0.9 | 2500 | 0.79 | -0.06 |
-| 0.9-1.0 | 5000 | 0.88 | **-0.07** |
-
-**「confidence 0.9-1.0 のうち、実際に正解なのは 88%」**——つまり深層モデルは自信過剰（overconfident）です。
-
-> [!IMPORTANT]
-> **上表は教材上の典型パターン**であり、実測ではモデル・データセット・学習設定で大きく変わります。**必ず自データで reliability diagram を描いてから閾値を決めてください**。
-
-### なぜ overconfident になるのか
-
-1. **Cross-entropy loss は confidence を 1 に押し上げる圧力を持つ**（間違っていても押し上げる）
-2. **BatchNorm / dropout / weight decay が寄与するが、根本原因は capacity 過剰**
-3. **augmentation を除いた「素の train」で最終 epoch を回すと悪化**
-
-### 結果：エージェントが softmax を鵜呑みにするとどうなるか
-
-```python
-# ❌ 危険なパターン
-prediction = model(x)                     # (batch, n_classes)
-confidence = prediction.softmax(-1).max()
-if confidence > 0.7:
-    agent_autonomous_action()             # ⚠️ 実際は正解率 65% でも走る
-else:
-    route_to_human()
-```
-
-正しくは、**calibration を測定してから閾値を決める**（§8.4）、**temperature scaling で補正**（§8.5）、**Deep Ensemble で分散を測る**（§8.6）、そして **`uncertainty_stop_gate` 契約で停止条件を明文化**（§8.8）します。
-
----
-
-## 8.4 Calibration 指標 — Brier / ECE / reliability diagram
-
-### Brier score
-
-$$
-\mathrm{Brier} = \frac{1}{N} \sum_{i=1}^{N} \sum_{k=1}^{K} (p_{ik} - y_{ik})^2
-$$
-
-- $p_{ik}$: サンプル $i$ のクラス $k$ の予測確率
-- $y_{ik}$: one-hot 正解（0 or 1）
-- **範囲**: 0（完璧）〜 2。**K-class one-hot 定義では K=2 でも 0〜2**（各サンプル最大寄与 $2$：予測 $[1,0]$ vs 正解 $[0,1]$）。二値分類で scalar $p \in [0,1]$ に対して $(p-y)^2$ を使う慣例では 0〜1。契約では**どちらの定義を使うか必ず明記**すること
-- 予測が正確でも overconfident なら悪化する
-
-### Expected Calibration Error (ECE)
-
-confidence を M bin に区切り、各 bin での |accuracy − confidence| の加重平均：
-
-$$
-\mathrm{ECE} = \sum_{m=1}^{M} \frac{|B_m|}{N} \, \bigl| \, \mathrm{acc}(B_m) - \mathrm{conf}(B_m) \, \bigr|
-$$
-
-ここでは $B_m = \{ i \mid c_i \in ((m-1)/M, m/M] \}$（左端除外の半開区間）とします。softmax の max confidence は通常 $1/K$ 以上なので左端除外の影響は無視できます。$M$（bin 数）は **各 bin に十分なサンプルがある場合のみ 10-15 を採用**し、クラス不均衡・少データではサンプル数を bin ごとに報告するか、等頻度 bin に切り替えてください。
-
-- **範囲**: 0（完璧）〜 1
-- **典型的な採用基準**：ECE < 0.05 なら calibration OK（**例示；タスク・重要度で変わる**）
-- Bin 数 M は 10〜15 が慣例（少なすぎると鈍感、多すぎると個別 bin が空）
-
-### Reliability diagram
-
-x 軸 = confidence bin、y 軸 = accuracy を描画。**対角線に近い**ほど calibration が良好。
-
-```python
-# calibration_metrics.py
-import numpy as np
-
-def expected_calibration_error(probs: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> float:
-    """
-    probs: (N, K) 予測確率、labels: (N,) 正解クラス
-    """
-    confidences = probs.max(axis=1)
-    predictions = probs.argmax(axis=1)
-    accuracies = (predictions == labels).astype(float)
-
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-    ece = 0.0
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        in_bin = (confidences > lo) & (confidences <= hi)
-        if in_bin.sum() == 0:
-            continue
-        acc_bin = accuracies[in_bin].mean()
-        conf_bin = confidences[in_bin].mean()
-        ece += (in_bin.sum() / len(probs)) * abs(acc_bin - conf_bin)
-    return float(ece)
-
-
-def brier_score(probs: np.ndarray, labels: np.ndarray) -> float:
-    """
-    probs: (N, K), labels: (N,)
-    """
-    n_classes = probs.shape[1]
-    one_hot = np.eye(n_classes)[labels]
-    return float(((probs - one_hot) ** 2).sum(axis=1).mean())
-```
-
-### Skill 契約への組み込み
-
-```yaml
-# calibration_acceptance.yaml
-calibration_acceptance:
-  ece_threshold: 0.05                     # example; タスクで再校正
-  brier_threshold: 0.15                   # example; K=5 分類の目安
-  reliability_diagram_output: "reports/reliability_YYYY-MM-DD.png"
-  n_bins: 15
-  compute_on: "val_set"                   # test への計算は禁止（第5章 anti-leakage）
-  action_on_fail:
-    - "run_temperature_scaling"           # §8.5 で自動実行
-    - "if_still_fail_route_to_human"
-```
-
----
-
-## 8.5 Temperature Scaling — Post-hoc calibration の最小実装
-
-学習済みモデルをそのままに、**softmax 前のロジットをスカラー T で割る**だけの後処理で ECE を大きく改善できます（Guo et al., 2017）。
-
-$$
-p_i = \mathrm{softmax}(z_i / T)
-$$
-
-- $T > 1$: 出力を「なだらか」に（overconfident を緩和）
-- $T < 1$: 出力を「尖らせる」（underconfident を補正）
-- **重みは変更しない**ため、accuracy に影響を与えない（argmax は不変）
-
-```python
-# temperature_scaling.py
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
-class TemperatureScaledModel(nn.Module):
-    """
-    Post-hoc temperature scaling。
-    重要：
-      - base_model の重みは frozen（`requires_grad_(False)`）。
-      - fit_temperature には eval モード・no_grad で抽出した logits を渡す。
-      - temperature を log 空間で持ち、常に正を保証（argmax 不変を保つ）。
-    """
-    def __init__(self, base_model: nn.Module):
-        super().__init__()
-        self.base_model = base_model
-        for p in self.base_model.parameters():
-            p.requires_grad_(False)                   # base 重み frozen
-        # log_temperature を parameter にすることで T = exp(log_T) > 0 を保証
-        self.log_temperature = nn.Parameter(torch.zeros(1))
-
-    @property
-    def temperature(self) -> torch.Tensor:
-        return self.log_temperature.exp()
-
-    def forward(self, x):
-        self.base_model.eval()                        # 推論時常に eval
-        with torch.no_grad():
-            logits = self.base_model(x)
-        return logits / self.temperature
-
-    def fit_temperature(self, logits: torch.Tensor, labels: torch.Tensor, max_iter: int = 50):
-        """
-        calibration set の logits + labels から log_temperature のみを最適化。
-        logits は事前に `base_model.eval()` + `torch.no_grad()` で抽出しておく：
-
-            base_model.eval()
-            with torch.no_grad():
-                logits = torch.cat([base_model(x).detach() for x, _ in calib_loader])
-                labels = torch.cat([y for _, y in calib_loader])
-        """
-        nll_criterion = nn.CrossEntropyLoss()
-        optimizer = optim.LBFGS([self.log_temperature], lr=0.01, max_iter=max_iter)
-
-        def closure():
-            optimizer.zero_grad()
-            loss = nll_criterion(logits / self.temperature, labels)
-            loss.backward()
-            return loss
-
-        optimizer.step(closure)
-        return float(self.temperature.item())
-```
-
-### Skill 契約
-
-```yaml
-# temperature_scaling_contract.yaml
-temperature_scaling:
-  enabled: true
-  calibration_set:
-    source: "val_split_of_current_training"   # test 使用は fatal
-    n_samples_min: 500                         # 少なすぎると T 推定が不安定
-  optimizer:
-    name: "LBFGS"
-    max_iter: 50
-  acceptance:
-    ece_after_scaling_threshold: 0.03          # example
-    # accuracy 変化ではなく個別予測の変化を数える（argmax 保存の厳密チェック）
-    prediction_change_count_max: 0             # tie 以外の変化は 0 でなければ fatal
-    allow_tie_only_changes: true               # 完全同点の場合のみ変化許容
-    accuracy_change_max_delta: 0.0             # 補助チェック（0 が理想）
-  temperature_constraint:
-    positive_only: true                        # log 空間で持つことで自動保証
-  provenance:
-    log_temperature_value: true
-    log_calibration_set_hash: true
-  agent_authorization:
-    l1: "inference_with_scaled_model_only"
-    l2: "can_refit_temperature_on_new_val_set"
-    l3: "same_as_l2"
-  # temperature の学習後変更は L3 でも都度承認必須
-  refit_approval_required: true
-```
-
----
-
-## 8.6 Deep Ensemble Skill — M モデルで不確かさを分解
-
-Deep Ensemble は「異なる seed / 初期化で M 個のモデルを独立に学習し、推論時に平均と分散を取る」手法です（Lakshminarayanan et al., 2017）。
-
-- **簡単**：学習コードそのまま × M
-- **強力**：多くのベンチマークで MC-Dropout / BNN を上回る calibration と OOD 検出性能
-- **並列化容易**：M 個の学習ジョブは独立
-
-### 実装骨格
-
-```python
-# deep_ensemble.py
-import torch
-from typing import Callable, List
-
-class DeepEnsemble:
-    def __init__(self, model_factory: Callable[[int], torch.nn.Module], m: int):
-        """
-        model_factory(seed) は seed から独立学習済みモデルを返す関数。
-        m は ensemble 数（推奨 5-10）。
-        """
-        self.models: List[torch.nn.Module] = []
-        for seed in range(m):
-            _set_seeds(seed)                            # 第4章 Layer 1: worker seed 実 seed を記録
-            self.models.append(model_factory(seed))
-
-    def predict_distribution(self, x: torch.Tensor) -> dict:
-        """
-        M モデルの softmax を集計。
-        戻り値:
-          mean_probs      : (batch, K)  M モデル平均
-          member_probs    : (M, batch, K) 各モデル出力
-          predictive_entropy: (batch,)   総不確かさ H[E[p]]
-          expected_entropy  : (batch,)   aleatoric 近似 E[H[p]]
-          mutual_information: (batch,)   epistemic 近似 H[E[p]] - E[H[p]]
-        """
-        member_probs = torch.stack([
-            m(x).softmax(-1) for m in self.models
-        ], dim=0)                                        # (M, batch, K)
-        mean_probs = member_probs.mean(dim=0)            # (batch, K)
-
-        # 総 predictive entropy
-        eps = 1e-12
-        predictive_entropy = -(mean_probs * (mean_probs + eps).log()).sum(-1)  # (batch,)
-        # aleatoric 近似（各モデルの entropy 平均）
-        member_entropy = -(member_probs * (member_probs + eps).log()).sum(-1)  # (M, batch)
-        expected_entropy = member_entropy.mean(0)                              # (batch,)
-        # epistemic 近似
-        mutual_information = predictive_entropy - expected_entropy             # (batch,)
-
-        return {
-            "mean_probs": mean_probs,
-            "member_probs": member_probs,
-            "predictive_entropy": predictive_entropy,
-            "expected_entropy": expected_entropy,
-            "mutual_information": mutual_information,
-        }
-```
-
-### Uncertainty 分解の解釈
-
-| 量 | 意味 | 高いとき |
-|---|---|---|
-| **`predictive_entropy`** ($H[\mathbb{E}[p]]$) | 総不確かさ | このサンプルは全体的に判別困難 |
-| **`expected_entropy`** ($\mathbb{E}[H[p]]$) | aleatoric（データノイズ）近似 | 個々のモデルがそれぞれ高 entropy で迷っている（データが本質的にあいまい）。**モデル間の意見の分かれは `mutual_information` で見る** |
-| **`mutual_information`** ($H[\mathbb{E}[p]] - \mathbb{E}[H[p]]$) | epistemic（モデル不確かさ）近似 | モデル間で意見が分かれている（学習データ不足の可能性） |
-
-> [!NOTE]
-> **この分解は近似**です。「aleatoric = ノイズ、epistemic = 知識不足」という厳密な因果分解にはなりません（Deep Ensemble の epistemic は "分散" 由来で、真の posterior 上の不確かさとは限らない）。実務上は「両者を並置して監視する」が現実的です。
-
-> [!IMPORTANT]
-> **`_set_seeds(seed)` の実装要件**：Python `random`・NumPy・PyTorch CPU/CUDA・DataLoader worker seed（第4章 Layer 1）を **すべて** 設定します。それでも Deep Ensemble メンバー間の**真の独立性は保証されず**、data order・augmentation RNG・pretrained 初期化・checkpoint 共有などで多様性が崩れる可能性があります。契約に以下を追加してください：
->
-> ```yaml
-> ensemble_diversity:
->   record_member_seed: true
->   record_data_order_seed_per_member: true
->   record_augmentation_seed_per_member: true
->   require_distinct_initialization_hash: true      # 初期重み hash が全 M で異なる
->   min_pairwise_disagreement_on_val: "task_specific"  # 相関崩壊の早期検出
-> ```
-
-### 正規化 entropy（Ch06 §6.3 の forward reference を回収）
-
-第6章 §6.3 で「`predictive_entropy_normalized > 0.3` で自律停止」と参照した数値の正体：
-
-$$
-\mathrm{predictive\_entropy\_normalized} = \frac{H[\mathbb{E}[p]]}{\log K}
-$$
-
-$K$ はクラス数。$\log K$ で割ることで **値域を [0, 1] に正規化**、クラス数が違うタスク間で閾値を比較できます。
-
-```python
-def predictive_entropy_normalized(mean_probs: torch.Tensor) -> torch.Tensor:
-    """mean_probs: (batch, K) -> (batch,) in [0, 1]"""
-    eps = 1e-12
-    K = mean_probs.shape[-1]
-    assert K > 1, "entropy normalization requires K > 1"
-    H = -(mean_probs * (mean_probs + eps).log()).sum(-1)
-    log_k = torch.log(torch.tensor(K, dtype=H.dtype, device=H.device))  # device 揃える
-    return H / log_k
-```
-
----
-
-## 8.7 `val_ood_score` の実装候補 — 第6章の forward reference 回収
-
-第6章 §6.3 では `ood_stop_gate.monitor = "val_ood_score_placeholder"` として **forward reference** にしていました。この章で 4 つの実装候補を提示します。
-
-| 実装 | 計算コスト | 追加モデル | 特徴 |
-|---|---|---|---|
-| **A. Max-softmax uncertainty** | 極低 | なし | `1 - max(softmax)`。値域 [0, 1-1/K]、方向は「大きいほど危険」。overconfidence の影響を受けるが baseline として便利 |
-| **B. Predictive entropy (normalized)** | 極低 | なし | Deep Ensemble または単一モデルで計算可 |
-| **C. Deep Ensemble mutual information** | 中 | Deep Ensemble | epistemic の近似指標。OOD で高くなる |
-| **D. Mahalanobis on penultimate** | 中 | calibration set | 第7章 §7.5 の domain_gap と同じ手法（**役割は違う**、§8.10 で整理） |
-
-### 推奨：Deep Ensemble 前提なら B + C の併用
-
-```yaml
-# val_ood_score_implementation.yaml
-val_ood_score:
-  primary_metric: "predictive_entropy_normalized"    # §8.6 の実装
-  secondary_metric: "mutual_information"             # epistemic 監視
-  thresholds:                                        # example; calibration set から derive
-    warn: 0.3                                        # 上位 20% あたりを想定
-    stop: 0.5                                        # 上位 5% あたりを想定
-  aggregation_over_batch: "max"                      # バッチ内の worst-case を採用
-  calibration_set:
-    source: "val_split_of_current_training"
-    reference_sha256: "..."
-```
-
-**単一モデル運用（Deep Ensemble 未使用）の場合**は A + B のみで代替できます。ただし epistemic の情報は失われるため、`domain_gap_gate`（第7章 §7.5）との併用が必須です。
-
----
-
-## 8.8 `uncertainty_stop_gate` 契約 — Agentic 自律停止の設計
-
-推論時に不確かさが閾値を超えたらエージェントは **自律決定を停止し Human に投げる**。この振る舞いを契約化します。
-
-```yaml
-# uncertainty_stop_gate.yaml
-uncertainty_stop_gate:
-  enabled: true
-  # 監視する指標（複数可、いずれかが閾値超過で発動）
-  monitors:
-    - metric: "predictive_entropy_normalized"
-      threshold_warn: 0.3
-      threshold_stop: 0.5
-    - metric: "mutual_information"                   # epistemic
-      threshold_warn: 0.15
-      threshold_stop: 0.30
-    - metric: "max_softmax_uncertainty"              # = 1 - max_softmax_probability
-      direction: "higher_is_riskier"                  # 明示的な方向（実装バグ防止）
-      threshold_warn: 0.35                            # つまり max_softmax_probability < 0.65 で warn
-      threshold_stop: 0.55                            # つまり max_softmax_probability < 0.45 で stop
-  # calibration の前提
-  requires_calibration_check_first: true             # ECE < ece_threshold でないと gate 無効
-  requires_temperature_scaling_if_ece_high: true
-
-  # 動作
-  action_on_warn: "flag_and_continue_with_annotation"
-  action_on_stop: "route_to_human_with_full_provenance"
-  # stop 発動時に Human に渡す情報
-  human_handoff_payload:
-    - "sample_id"
-    - "triggered_metric_names"                       # どの monitor が発動したか
-    - "thresholds_used"                              # 発動時の閾値
-    - "predicted_class_with_confidence"
-    - "top_k_classes_with_probabilities"             # k=3 程度
-    - "predictive_entropy_normalized"
-    - "mutual_information"
-    - "max_softmax_uncertainty"
-    - "ensemble_member_predictions"
-    - "domain_gap_score"                             # §7.5 と併記
-    - "recent_calibration_ece"
-    - "temperature_value"                            # §8.5 の T
-    - "model_version"
-    - "calibration_set_hash"
-    - "raw_input_or_sanitized_view_uri"              # Human が実サンプルを確認できるように
-    - "recommended_next_action"                      # 推奨アクション（Human は上書き可）
-    - "allowed_human_actions"                        # Human が選べる action リスト
-    - "provenance_uri"
-
-  # エージェント権限
-  agent_authorization:
-    l1: "can_only_observe_gate_output"
-    l2: "can_execute_action_on_warn_but_not_disable"
-    l3: "same_as_l2"
-    disable_gate_all_levels: forbidden               # 全レベル無効化禁止
-    threshold_change_by_agent: forbidden             # 全レベル閾値変更禁止
-
-  # 監査
-  audit:
-    log_every_gate_evaluation: true
-    weekly_summary_to_human: true
-    consecutive_stop_warning: 5                       # 5 回連続 stop で weekly より早く警告
-```
-
-### エージェント判断シーケンス
+### 選択マップ
 
 ```mermaid
-sequenceDiagram
-    participant S as Sample
-    participant M as Model / Ensemble
-    participant G as uncertainty_stop_gate
-    participant A as Agent (L2)
-    participant H as Human
-
-    S->>M: predict(x)
-    M-->>G: (mean_probs, member_probs, entropy, MI, max_softmax_unc)
-    G->>G: 各 monitor を評価<br/>(entropy / MI / max_softmax_uncertainty)
-    alt すべての monitor が warn 未満
-        G-->>A: continue (自律決定 OK)
-    else いずれかが warn <= x < stop
-        G-->>A: flag_and_continue
-        A->>H: 週次サマリーに flag 記録
-    else いずれかが stop 以上
-        G-->>A: route_to_human
-        A->>H: full_provenance を添えて送信
-        H-->>A: 判定 / 再学習指示
-    end
+flowchart TD
+    A["新規データ n サンプル"] --> B{"normalized_gap_0_1<br/>(§8.5 の実 Mahalanobis を calibration の<br/>99% タイル値で正規化)"}
+    B -->|"小 (< 0.2)"| C{"n"}
+    B -->|"中 (0.2-0.5)"| D{"n"}
+    B -->|"大 (> 0.5)"| E["Human review<br/>事前学習モデル自体を再選定"]
+    C -->|"< 100"| C1["A: Frozen + linear head"]
+    C -->|">= 100"| C2["A または B: partial fine-tune 検討"]
+    D -->|"< 100"| D1["A: Frozen + head<br/>(データ不足で fine-tune 危険)"]
+    D -->|"100-1000"| D2["C: LoRA 推奨"]
+    D -->|">= 1000"| D3["B または D: partial or full fine-tune"]
 ```
 
+> [!NOTE]
+> **上記の閾値（n < 100, gap < 0.2 等）は教材上の経験則**です。実際は事前学習分布・タスク種別・augmentation の効き方・GBM ベースラインとの比較で境界が動きます。**この判断表は Skill 設計のための出発点**であり、**必ず自データで frozen ベースライン → LoRA → full の順に検証**してから採用してください。
+
 > [!IMPORTANT]
-> **`uncertainty_stop_gate` は Skill を跨いで共通化**します。1D CNN Skill（第6章）でも、転移学習 Skill（第7章）でも、Foundation Model Skill（第11章）でも、この契約フォーマットを再利用します。閾値は Skill ごとに calibrate しますが、フィールドスキーマは統一します。
+> **domain gap のスケールと指標について**：本章では 2 種類の domain gap を使い分けます。
+> - **`normalized_gap_0_1`**（0-1 範囲、§8.3 の選択マップおよび §8.6 の判断表で使用）：**教材上の相対指標**。実装は Mahalanobis を calibration set の 99% タイル値で正規化するなど、値域を 0-1 に押し込めた形。
+> - **`mahalanobis_squared`**（実距離、§8.5 の gate 計算で使用）：`sklearn.covariance.*.mahalanobis()` が返す squared Mahalanobis 距離。値域は 0 〜 ∞。
+>
+> 契約 YAML では `method` フィールドで明示し、**同じ変数名で異なるスケールを扱わない**ようにしてください。
 
----
-
-## 8.9 単一モデル vs Deep Ensemble vs 事後 calibration — 判断表
-
-| 状況 | 推奨 | 理由 |
-|---|---|---|
-| **正解率が最優先、不確かさは補助** | 単一モデル + temperature scaling | 計算コスト最小、calibration は改善可 |
-| **Human-in-the-loop で自律停止が必要** | **Deep Ensemble (M=5)** | epistemic 分解が可能、OOD 検出も強い |
-| **少データで epistemic を強く出したい** | Deep Ensemble (M=5-10) or MC-Dropout（第9章） | M を増やすほど安定 |
-| **GPU / 時間が極めて制約** | 単一モデル + temperature scaling + max-softmax gate | Deep Ensemble は諦める、代わりに `domain_gap_gate`（第7章）を厳しめに |
-| **PyMC 階層に接続したい** | Deep Ensemble の平均予測を層別 feature に（第13章）| 深層特徴の不確かさは第13章 capstone で |
-
-### エージェントに任せてよい判断
+### エージェントに任せられる/任せられない
 
 | 判断場面 | L1 | L2 | L3 | 説明 |
 |---|:---:|:---:|:---:|---|
-| Deep Ensemble メンバー数 M の変更 | ❌ | ❌ | ⚠️ | L3 でも事前承認が必要（provenance 全体が変わる） |
-| `predictive_entropy_normalized` の閾値変更 | ❌ | ❌ | ❌ | 全レベル禁止 |
-| temperature 値の再学習（新 val set で） | ❌ | ✅ | ✅ | L2 は `refit_approval_required: true` の下で可 |
-| Gate 発動時の Human 送り | ❌ | ✅ | ✅ | 決定的動作、L2 で可 |
-| Gate 無効化 | ❌ | ❌ | ❌ | 全レベル禁止 |
+| Skill 実行（推論） | ✅ | ✅ | ✅ | どの level でも推論は可 |
+| **frozen feature の linear head 再学習** | ❌ | ✅ | ✅ | L2 は事前承認範囲内で可 |
+| **LoRA fine-tune の起動** | ❌ | ✅ | ✅ | `refinetune_authorization` 内で可 |
+| **partial fine-tune の起動** | ❌ | ⚠️ | ✅ | L2 は `daily_refinetune_gate` などの Human 承認 gate を通せば可 |
+| **full fine-tune の起動** | ❌ | ❌ | ⚠️ | L3 の事前承認ワークフローに **full fine-tune が明示的に scope 内**でかつ都度 Human sign-off がある場合のみ可（本章は Ch04 §5.7 L3 定義より厳格化） |
+| **事前学習モデルの差し替え** | ❌ | ❌ | ❌ | 全レベル禁止（Human 契約変更） |
+| **domain gap 閾値の変更** | ❌ | ❌ | ❌ | 全レベル禁止 |
+
+> [!WARNING]
+> **full fine-tune は L3 でも Human sign-off 必須**とする理由：full fine-tune は事前学習重みを不可逆に上書きし、後続 Skill（推論・attribution）の provenance が変わります。Ch04 §5.7 では L3 は「事前承認ワークフロー ID 内で既存 checkpoint 上書き可」でしたが、**本章では full fine-tune に限り Ch04 より厳格化**し、pre-approved workflow ID に加えて実行直前の Human sign-off も要求します。「元に戻せない変更」は必ず Human ゲートを通す設計です（第5章 §5.7 の 4 承認ゲート思想の徹底）。
 
 ---
 
-## 8.10 `domain_gap_gate`（第7章）と `uncertainty_stop_gate`（本章）の役割分担
+## 8.4 事前学習重みの provenance 契約（第5章 Layer 2 の厳格版）
 
-両者は **どちらも「怪しいサンプルで止まる」** ですが、**測っている対象と発動タイミングが違います**。
-
-| 観点 | `domain_gap_gate` (§7.5) | `uncertainty_stop_gate` (§8.8) |
-|---|---|---|
-| **測るもの** | feature-level：penultimate 出力が事前学習分布からどれくらい離れているか | output-level：softmax 出力の不確かさ（entropy / MI / max-softmax） |
-| **発動タイミング** | 学習前・推論時（両方） | 推論時のみ |
-| **計算方法** | Mahalanobis / cosine / FID-like | predictive entropy / mutual information / max-softmax |
-| **必要なもの** | Human curated calibration set + shrinkage covariance | 学習済みモデル + calibration set |
-| **fine-tune を止められるか** | ✅ block_finetune 可能 | ❌ 学習停止には使わない |
-| **Deep Ensemble が必要か** | 不要（単一モデルの penultimate で計算） | epistemic 分解には Ensemble 必須 |
-| **典型的な発動理由** | 「そもそも事前学習モデルに認識できない領域」 | 「認識できるが確信が持てない」 |
-
-### 両者を並置する契約
+第5章では `pretrained_weights` の provenance を **Layer 2** として定義しました。転移学習では **この Layer 2 を最も厳しく検証**します。
 
 ```yaml
-# combined_ood_and_uncertainty.yaml
-# 第7章 domain_gap_gate は pass / review / stop の tri-state を返す
-sample_admission_policy:
-  step_1_domain_gap:                  # 第7章 §7.5
-    reference: "domain_gap_gate.yaml"
-    on_pass: "run_step_2"
-    on_review: "route_to_human_with_optional_uncertainty_context"
-                                      # step 2 を実行するが結果は Human 参考用
-                                      # step 1 の review 判定を step 2 で覆すことは禁止
-    on_stop: "block_inference"        # ここで止まったら uncertainty 測る意味がない
-  step_2_uncertainty:                 # 本章 §8.8
-    reference: "uncertainty_stop_gate.yaml"
-    run_when_step_1: ["pass", "review_for_context_only"]
-    cannot_override_step_1_review_or_stop: true
-    on_stop: "route_to_human"
+# pretrained_weights_contract.yaml
+pretrained_weights:
+  source_type: "hf_hub"                    # hf_hub / local_registry / signed_url
+  weights_uri: "hf://microsoft/resnet-18"  # example URI（実在性は各自確認、社内 registry の場合は local_registry）
+  revision: "a1b2c3d4e5f6..."              # commit hash 必須（tag 名不可）
+  weights_sha256: "9f8e7d6c5b4a..."        # 事前計算した SHA256（config 内に直接記録）
+  weights_license: "MIT"
+  pretraining_data_license: "ImageNet-1k (research only)"
+  safetensors_available: true              # true でなければ **fatal (load block)**（Ch06 §7.3 と整合）
+  # 追加契約：pretraining の分布記述
+  pretraining_distribution:
+    modality: "natural_image_rgb_224x224"
+    class_semantics: "generic_object_recognition"
+    n_pretrain_samples: 1281167
+    intended_downstream:
+      - "natural_image_classification"
+      - "transfer_to_texture_analysis"
+    NOT_intended_for:
+      - "scientific_grayscale_imaging"     # SEM は NOT_intended の例
+      - "electron_microscopy"
+  # 追加契約：改変の禁止事項
+  modification_policy:
+    push_to_hub: false                     # 全レベル禁止（第5章 §5.8 継承）
+    revision_change_by_agent: false        # revision 変更は L3 でも不可
+    weight_replacement: false              # weight_source 変更は全レベル禁止
+    trust_remote_code: false               # 常に false
+
+# 起動時契約 assert（第7章 §7.3 の startup_asserts に追加）
+weight_load_policy:
+  torch_load_weights_only: true
+  require_safetensors: true
+  require_weights_sha256_verified: true    # 転移学習では常に true
+  revision_must_be_commit_hash: true       # 転移学習では常に true
+  trust_remote_code: false
+  domain_gap_check_before_training: true   # §8.5 の gate を「重み load 後・学習開始前」に実行
+  # 起動順（実装者向け）:
+  #   1. revision が commit hash 形式か検証
+  #   2. safetensors 存在確認 (fatal if missing)
+  #   3. weights_sha256 事前計算値との照合 (fatal on mismatch)
+  #   4. torch.load(weights_only=True) で安全 load、trust_remote_code=false
+  #   5. penultimate feature 抽出
+  #   6. domain_gap_gate 評価（§8.5）
+  #   7. gate が pass すれば学習/推論を許可
+```
+
+> [!IMPORTANT]
+> **`pretraining_distribution.NOT_intended_for` フィールドは転移学習の Skill で最重要の防御**です。SEM 画像に対して ImageNet 事前学習を使うのは技術的には可能ですが、**NOT_intended リストに `"electron_microscopy"` が入っていれば、Skill は起動時に warning を出し、Human 確認を必須化**します（後述の §8.5 domain gap gate と連動）。
+
+---
+
+## 8.5 Domain gap early warning — feature-level OOD 検知
+
+事前学習モデルは「学習分布内」のデータに対してのみ性能を保証します。新規 ARIM データが分布外なら、**少データ fine-tune による改善保証はなく、性能低下・不安定化のリスクが高い**（大規模 labeled data があれば分布外でも改善する場合はある）。
+
+### なぜ入力ピクセル空間ではなく feature 空間で検知するのか
+
+- **入力空間**：SEM 画像 vs 自然画像は明らかに違うが、統計だけでは domain gap の大きさを定量できない
+- **Feature 空間（penultimate layer 出力）**：事前学習モデルが「認識できているか」を直接測れる。calibration set との距離で domain gap を数値化できる
+
+### Domain gap の計算方法
+
+```python
+# domain_gap_score.py
+import torch
+import numpy as np
+from sklearn.covariance import LedoitWolf   # 高次元少サンプルで安定（EmpiricalCovariance は避ける）
+
+def compute_domain_gap_mahalanobis_squared(
+    pretrained_model: torch.nn.Module,
+    calibration_features: np.ndarray,   # 事前学習分布の代表サンプル feature（Human が事前に用意）
+    new_batch: torch.Tensor,            # 新規データ（min_batch_size 以上）
+    covariance_estimator: str = "ledoit_wolf",
+) -> float:
+    """
+    事前学習分布と新規データの feature-level squared Mahalanobis 距離を計算。
+
+    注意：
+    - 返り値は **squared** Mahalanobis 距離（sklearn の mahalanobis() の仕様）。
+      値域 [0, ∞)。§8.5 の閾値 (warn/review/stop) はこの squared 値に対する目安。
+    - `LedoitWolf` shrinkage 共分散を使うことで、高次元 feature (>= 256 次元) に
+      対する少サンプル (n < 500) calibration でも安定する。
+    - `EmpiricalCovariance` はサンプル数 << 次元では特異に近づき信頼できない。
+    """
+    pretrained_model.eval()
+    with torch.no_grad():
+        new_features = _extract_penultimate(pretrained_model, new_batch).cpu().numpy()
+
+    if covariance_estimator == "ledoit_wolf":
+        cov = LedoitWolf().fit(calibration_features)
+    else:
+        raise ValueError("high-dim feature には LedoitWolf / OAS shrinkage を推奨")
+
+    # 新規バッチ平均と calibration 平均の squared Mahalanobis 距離
+    return float(cov.mahalanobis(new_features.mean(0, keepdims=True))[0])
+
+
+def compute_normalized_gap_0_1(
+    mahalanobis_squared_value: float,
+    calibration_99th_percentile: float,
+) -> float:
+    """
+    §8.3 選択マップ / §8.6 判断表用の正規化 gap。
+    calibration set 内で計算した Mahalanobis squared の 99% タイル値で正規化し、
+    値を [0, 1] にクリップする（1.0 超は 1.0 に）。
+    """
+    return float(min(mahalanobis_squared_value / calibration_99th_percentile, 1.0))
+```
+
+### Domain gap gate 契約
+
+```yaml
+# domain_gap_gate.yaml
+domain_gap_gate:
+  enabled: true
+  method: "mahalanobis_squared"            # squared Mahalanobis（sklearn 仕様）
+  covariance_estimator: "ledoit_wolf"      # 高次元向け shrinkage（EmpiricalCovariance 禁止）
+  feature_dim: 512                         # penultimate 次元（例：ResNet18 は 512）
+  min_calibration_samples_per_dim: 0.5     # 少なくとも次元数 × 0.5 のサンプルを推奨
+  calibration_set:
+    source: "curated_by_human"
+    n_samples: 200                         # example; feature_dim との比を上記制約で確認
+    reference_uri: "arim://calibration/2026-Q1"
+    reference_sha256: "..."
+    calibration_99th_percentile: 12.5      # normalized_gap_0_1 の正規化定数
+                                           #  （calibration set 内 squared Mahalanobis の 99% タイル）
+  thresholds:                              # squared Mahalanobis の目安（**example; calibration 必須**）
+    warn: 3.0                              # gap 小、fine-tune 可
+    review: 5.0                            # gap 中、Human 確認 → LoRA 推奨
+    stop: 8.0                              # gap 大、事前学習モデル自体を再選定
+  # 上記閾値は模擬 512 次元 feature の例。必ず自 calibration set の分布から
+  # (median, 95% タイル, 99% タイル) を求めて再校正すること
+  action_on_warn: "log_and_continue"
+  action_on_review: "route_to_human"
+  action_on_stop: "block_finetune"
+  # 起動時に必ず実行
+  run_before_training: true                # 重み load 後・学習開始前
+  run_before_inference: true               # 推論時にもチェック（第15章で参照）
+  # 推論時ガード（run_before_inference: true のときの補助設定）
+  inference_guard:
+    min_batch_size_for_gap_check: 8        # 単一サンプルでは batch mean が不安定
+    fallback_for_single_sample: "log_only" # log_only / block / route_to_human
+    cache_gap_by_batch_id: true            # 同一 batch_id への再計算を抑制
+    action_on_inference_review: "flag_prediction_and_continue"
 ```
 
 > [!TIP]
-> **段階チェックの順序を逆にしない**。「先に uncertainty 見て、それが低ければ通す」だと、domain gap が大きく本来は認識できていないサンプルを、たまたま overconfident に「認識できた」と判定して通してしまう可能性があります。**必ず「feature-level 分布内か」→「output-level 確信度は十分か」の順**。
+> **calibration_set は Human が curate する**必要があります。「事前学習データからランダムに 200 サンプル」ではなく、「その事前学習モデルが実際に**認識できていたサンプル**（高 confidence + 正解）」を選びます。ImageNet の場合、公開されている representative samples リストを使うか、事前学習モデルの val set から high-confidence correct を抽出します。
+
+### エージェントに任せられる判断
+
+| 判断場面 | L2 | 説明 |
+|---|:---:|---|
+| gap 計算の実行 | ✅ | 決定的処理、契約に従うのみ |
+| `action_on_warn` の実行（ログ記録） | ✅ | 決定的 |
+| `action_on_review` で Human に送る | ✅ | 決定的 |
+| **閾値の変更** | ❌ | 全レベル禁止 |
+| **calibration_set の差し替え** | ❌ | 全レベル禁止 |
 
 ---
 
-## 8.11 失敗パターンと改善版
+## 8.6 装置別 fine-tune 戦略判断表
+
+同じデータ型（例：SEM 画像）でも、装置ごとに fine-tune 戦略が変わります。これを **成果物 4**：`instrument_finetune_decision_table.yaml` として定式化します。
+
+```yaml
+# instrument_finetune_decision_table.yaml — SEM 3 装置の例
+schema_version: "1.0"
+domain: "SEM_image_classification"
+gap_metric: "normalized_gap_0_1"           # §8.3 選択マップと同じ相対スケール（§8.5 の Mahalanobis を calibration の 99% タイル値で正規化）
+pretrained_base:
+  uri: "hf://microsoft/resnet-18"          # example URI
+  revision: "a1b2c3d4..."
+
+# 装置ごとの判断ロジック
+instruments:
+  - id: "SEM_alpha"                         # 装置 α（校正済み・大量データあり）
+    calibration_status: "well_calibrated"
+    n_samples_available: 5000
+    domain_gap_last_measured: 0.3           # normalized_gap_0_1
+    recommended_strategy: "partial_fine_tune_last_2_layers"
+    reason: |
+      装置 α は校正済みで n = 5000 と豊富。domain gap も小さい (0.3)。
+      partial fine-tune で最終 2 層のみ更新すれば十分。full は overkill。
+    agent_min_level: "L2"                   # L1/L2/L3 taxonomy 内
+    required_gate: "training_job_approval"  # partial は §8.3 と一致：Human 承認 gate 必須
+    approval_required: true                 # 事前承認 (approval_record_id) が必要
+    agent_can_execute_daily: false          # 日次 re-fine-tune は禁止（partial は日次に不向き）
+
+  - id: "SEM_beta"                          # 装置 β（新規・少データ）
+    calibration_status: "recently_calibrated"
+    n_samples_available: 150
+    domain_gap_last_measured: 0.5
+    recommended_strategy: "lora_r8"
+    reason: |
+      装置 β は新規導入で n = 150 と少なく、domain gap 中程度 (0.5)。
+      LoRA (rank=8) で adapter のみ学習し、元重みを保持することでリスクを最小化。
+    agent_min_level: "L2"
+    required_gate: "daily_refinetune_gate"  # 日次 gate 経由なら L2 で可
+    approval_required: true
+    agent_can_execute_daily: true
+
+  - id: "SEM_gamma"                         # 装置 γ（未校正・分布外リスク大）
+    calibration_status: "not_calibrated"
+    n_samples_available: 30
+    domain_gap_last_measured: 0.9
+    recommended_strategy: "human_review_required"
+    reason: |
+      装置 γ は未校正、n = 30 と極少、domain gap 大 (0.9)。
+      fine-tune するとむしろ性能悪化のリスク大。
+      Human が (a) 装置を校正 (b) 事前学習モデル自体を差し替え を判断すべき。
+    agent_min_level: "none"                 # エージェント実行不可（Human のみ）
+    required_gate: "manual_only"
+    approval_required: true
+    agent_can_execute_daily: false
+
+# 判断ロジック（Skill 起動時に自動評価）
+decision_logic:
+  inputs:
+    - instrument_id
+    - n_samples_available
+    - domain_gap_score                      # normalized_gap_0_1
+  algorithm: "lookup_table_with_gap_override"
+  # domain_gap が recommended より大きくなったら strategy を降格
+  gap_override:
+    "0.0-0.2": "no_downgrade"
+    "0.2-0.5": "downgrade_to_lora_or_frozen"
+    "0.5-0.8": "route_to_human"
+    "0.8+": "block"
+```
+
+> [!IMPORTANT]
+> **この判断表は Human が装置ごとに書きます**。エージェントは表を読んで自動判断できますが、**表そのものを書き換えることは全レベルで禁止**です。装置校正状態の変化・データ蓄積の進捗に応じて、Human が定期的に見直します（推奨：四半期ごと）。
+
+---
+
+## 8.7 「今日のバッチだけで再 fine-tune」承認ゲート
+
+Agentic 環境でよくある落とし穴：**新しいデータバッチが届くたびに、エージェントが自動で再学習を起動**する。これは以下の問題を起こします：
+
+- **モデルが日毎に変わる**：昨日の予測と今日の予測が違う理由が provenance で追えない
+- **GPU 資源の食い潰し**：他ユーザーの学習ジョブを阻害
+- **統計的に不健全**：日々のバッチは小さくノイズが大きく、単日データで fine-tune するとモデルが振動
+- **catastrophic forgetting**：日次 fine-tune を積み重ねると、当初の性能が失われる
+
+**成果物 5**：`daily_refinetune_gate.yaml` で防御します。
+
+```yaml
+# daily_refinetune_gate.yaml
+# 数値はすべて **example; must be calibrated per instrument/task**
+daily_refinetune_gate:
+  # 起動条件（すべて満たさないと fine-tune できない）
+  triggers_required_all:
+    - name: "min_new_samples"
+      threshold: 50                        # example: 50 サンプル以上溜まっていること
+    - name: "domain_gap_change"
+      threshold_relative: 0.15             # example: 前回学習時から gap が 15% 以上変化
+      baseline_gap_reference:              # ⚠️ agent が silently reset することを防ぐ
+        source: "last_approved_training_provenance"
+        field: "transfer_learning.domain_gap_at_start"
+        immutable_by_agent: true
+        require_provenance_hash: true      # 参照 provenance の SHA を照合
+    - name: "current_val_score_drop"
+      threshold: 0.05                      # example: 現在モデルの val F1 が 0.05 以上悪化
+    - name: "days_since_last_finetune"
+      min_days: 7                          # example: 前回から少なくとも 7 日空ける
+    - name: "human_approval"
+      approver_role: "lab_admin"
+      approval_record_id_required: true
+      max_approval_age_hours: 24           # 24 時間以内の approval のみ有効
+
+  # 実行制約
+  execution_constraints:
+    allowed_strategies_for_daily:          # 日次 gate では以下の戦略のみ許可
+      - "lora_r8"
+      - "lora_r16"
+                                           # partial / full は日次では禁止（別の
+                                           # training_job_approval gate 経由）
+    max_epochs_hard_cap: 5                 # example: 日次では 5 epoch まで
+    max_learning_rate: 5.0e-5              # example: 日次では小さめの LR
+    checkpoint_policy: "append_only_dated" # 日付付き append_only
+    previous_checkpoint_must_be_preserved: true
+
+  # 監視
+  monitoring:
+    log_all_attempts: true
+    weekly_summary_to_human: true          # 毎週 Human に「今週の fine-tune サマリー」
+    consecutive_finetune_warning: 3        # 3 日連続で fine-tune 起動があれば warn
+    rollback_on_val_degradation: true      # 前 checkpoint より悪ければ自動 rollback
+
+  # エージェント権限
+  agent_authorization:
+    l1_can_trigger: false
+    l2_can_trigger_with_human_approval: true
+    l3_can_trigger_within_preapproved_window: true
+    # 全レベル：triggers_required_all を 1 つでも満たさなければ block
+```
+
+### エージェント判断シーケンス（Mermaid）
+
+```mermaid
+sequenceDiagram
+    participant B as 新バッチ到着
+    participant A as Agent (L2)
+    participant G as Gate
+    participant H as Human
+    participant T as Trainer
+
+    B->>A: n=80 samples 到着
+    A->>G: refinetune 起動を要求
+    G->>G: triggers_required_all を評価
+    G->>G: min_new_samples 50 ✅
+    G->>G: domain_gap_change 0.18 ✅
+    G->>G: val_score_drop 0.06 ✅
+    G->>G: days_since_last 8 ✅
+    G->>H: human_approval 要求 (approval_record_id)
+    H-->>G: APP-2026-0703-01 (24h 有効)
+    G->>A: 全 trigger 満たす → 実行許可
+    A->>T: LoRA fine-tune 起動 (r=8, epochs<=5, lr<=5e-5)
+    T-->>A: 完了 (val F1 0.87 -> 0.91)
+    A->>G: append_only checkpoint 書き込み
+    G->>H: 週次サマリーに記録
+```
+
+> [!WARNING]
+> **triggers_required_all を 1 つでも欠かせば fine-tune はブロック**されます。エージェントが「なんとなく」再学習を起動できないように設計しています。特に **human_approval の `max_approval_age_hours: 24`** は重要で、「昨日の承認で今日走らせる」を防ぎます。
+
+---
+
+## 8.8 少データ材料での fine-tune 評価戦略（grouped × few-shot × 事前学習）
+
+vol-02 第8章の CV 設計を深層に持ち込みますが、**転移学習では 3 つの新しい課題**が加わります：
+
+### 課題 1：事前学習データと評価データの leakage
+
+事前学習モデル（例：Raman-FM）が公開データセット D で訓練されているとき、あなたの評価データが D の一部でないか要確認です。
+
+```yaml
+# split_contract.yaml に追加
+pretraining_data_overlap_check:
+  method: "hash_and_near_duplicate"        # 完全一致だけでは crop/resize/smoothing の重複を見逃す
+  exact_hash:
+    algorithm: "sha256"
+    pretrain_dataset_hashes_source: "arim://finetune_leakage/2026-Q1"
+  near_duplicate:
+    perceptual_hash_for_images: true       # pHash / dHash 等
+    spectral_similarity_threshold: 0.98    # 例：cosine similarity（IR/Raman 等）
+    embedding_similarity_threshold: 0.95   # 事前学習 encoder の embedding cosine
+  action_on_exact_overlap: "exclude_from_test"
+  action_on_near_duplicate: "route_to_human_or_exclude"
+  minimum_test_size_after_exclusion: 30    # 除外後 test が 30 未満なら fatal
+```
+
+### 課題 2：装置別 grouped CV × few-shot の並列評価
+
+少データ n < 500 で fine-tune するときは、**装置ごとの grouped CV** に加えて、**few-shot 学習**（1-shot / 5-shot / 10-shot）でも評価します。
+
+```python
+# few_shot_eval.py 骨格
+from sklearn.model_selection import GroupKFold
+
+def evaluate_finetune_strategy(
+    model, X, y, groups,   # groups = instrument_id
+    n_shot_list=(1, 5, 10, 50),
+) -> dict:
+    """
+    装置別 grouped CV × n-shot の 2 軸で fine-tune 戦略を評価。
+    - 各 fold で、train 側から n サンプル/クラスのみ使用
+    - 残りの train データは使わない（少データ現場をシミュレート）
+    """
+    results = {}
+    gkf = GroupKFold(n_splits=len(set(groups)))
+    for n_shot in n_shot_list:
+        scores = []
+        for train_idx, test_idx in gkf.split(X, y, groups=groups):
+            train_subset = _sample_n_per_class(X[train_idx], y[train_idx], n_shot)
+            fine_tuned = _finetune(model, train_subset)
+            score = _eval(fine_tuned, X[test_idx], y[test_idx])
+            scores.append(score)
+        results[f"n_shot_{n_shot}"] = {
+            "mean": float(np.mean(scores)),
+            "std": float(np.std(scores)),
+            "per_instrument": scores,
+        }
+    return results
+```
+
+### 課題 3：事前学習分布シフトの評価
+
+fine-tune 前後で、domain gap がどう変化したかを記録します（fine-tune で分布シフトが起きるのは正常だが、**過度なシフト = catastrophic forgetting** の兆候）。
+
+```yaml
+# finetune_evaluation_report.yaml
+finetune_evaluation:
+  before_finetune:
+    domain_gap_score: 0.35
+    val_f1_macro: 0.78
+  after_finetune:
+    domain_gap_score: 0.42        # 少しシフト（想定内）
+    val_f1_macro: 0.87            # 向上
+    catastrophic_forgetting_check:
+      pretrain_task_score_before: 0.92
+      pretrain_task_score_after: 0.88   # 4pt 低下（許容範囲）
+      threshold_for_warning: 0.10
+      status: "ok"
+  grouped_cv_by_instrument:
+    SEM_alpha: {mean: 0.89, std: 0.03}
+    SEM_beta:  {mean: 0.84, std: 0.06}
+    SEM_gamma: {mean: 0.61, std: 0.12}   # γ は不安定 → §8.6 判断表通り
+  few_shot_scores:
+    n_shot_5:  0.72
+    n_shot_10: 0.81
+    n_shot_50: 0.86
+```
+
+---
+
+## 8.9 転移学習の provenance 拡張
+
+第5章の 3 レイヤ provenance に、**転移学習 3 追加項目**を加えます。
+
+```yaml
+# provenance.yaml — 転移学習拡張版
+schema_version: "1.1"
+
+# Layer 1: GPU（第5章継承）
+gpu_backend: {...}
+
+# Layer 2: 事前学習重み（§8.4 で厳格化）
+pretrained_weights: {...}
+
+# Layer 3: 学習設定（第7章継承）
+finetune_config: {...}
+augmentation_config: {...}
+
+# Layer 4: 転移学習追加項目（vol-03 §8.9 新設）
+transfer_learning:
+  strategy: "lora_r8"                     # A/B/C/D のどれか、または詳細名
+  domain_gap_at_start: 0.42
+  domain_gap_at_end: 0.44
+  frozen_layer_names:                     # frozen または LoRA 対象外の層
+    - "layer1.*"
+    - "layer2.*"
+  trainable_params_count: 45000
+  trainable_params_percent: 0.4           # 全パラメータ中 0.4%
+  base_weights_hash_before: "9f8e7d..."
+  base_weights_hash_after: "9f8e7d..."    # LoRA なら base 変わらず一致
+  adapter_weights_hash: "1a2b3c..."       # LoRA / PEFT の場合
+  finetune_data:
+    n_samples_used: 150
+    sampling_scheme: "grouped_by_instrument"
+    catastrophic_forgetting_delta: 0.04
+  refinetune_history:                     # 過去の日次 fine-tune 履歴
+    - date: "2026-06-25"
+      approval_record_id: "APP-2026-0625-02"
+      val_f1_delta: 0.03
+    - date: "2026-07-02"
+      approval_record_id: "APP-2026-0702-01"
+      val_f1_delta: 0.04
+    - date: "2026-07-03"
+      approval_record_id: "APP-2026-0703-01"
+      val_f1_delta: 0.04
+  consecutive_finetune_warning_triggered: false
+```
+
+---
+
+## 8.10 失敗パターンと改善版
 
 | 失敗 | 原因 | 改善版 |
 |---|---|---|
-| confidence 0.9 のサンプルが 30% 誤答 | 生 softmax を鵜呑み | §8.4 ECE 測定 → §8.5 temperature scaling |
-| ECE 0.02 なのに OOD で誤動作 | in-distribution calibration だけ見た | `domain_gap_gate` と併用（§8.10） |
-| Deep Ensemble を M=2 で運用 | コスト削減 | M ≥ 5 推奨、`consecutive_stop_warning` で監視 |
-| ensemble の全モデルが同じ seed でスタート | model_factory 実装バグ | `_set_seeds(seed)` を必須化、provenance に M 個の seed を記録 |
-| `predictive_entropy_normalized` を対数 K で割り忘れ | 実装ミス | クラス数が違う Skill 間で閾値が比較不能に。単体テストを書く |
-| temperature scaling で accuracy が変わった | argmax が保持されない実装 | temperature は logits を割るだけ。他の変更を混ぜない |
-| Gate 発動が多すぎて Human 疲弊 | 閾値が厳しすぎ or 学習不足 | まず ECE を下げる → 閾値再校正 → データ追加 |
-| Gate を「一時的に無効化」した後戻し忘れ | manual override | 契約で `disable_gate_all_levels: forbidden`、監査ログ必須 |
-| calibration set と test set が重複 | anti-leakage 違反 | 第5章 `deep_split_contract` で分離を fatal assert |
-| epistemic uncertainty が単一 checkpoint で推定できないのに主張 | Deep Ensemble/MC-Dropout なしで epistemic を語る | 単一モデルなら `max_softmax` + `domain_gap_gate` のみに絞る |
-| **Ensemble メンバーが seed 違いでも相関している** | data order・augmentation seed・初期化 hash が共有 | `ensemble_diversity` 契約に `require_distinct_initialization_hash: true` と `min_pairwise_disagreement_on_val`、`record_data_order_seed_per_member` を追加 |
-| **ECE / 閾値が seed 間で不安定** | calibration set が小さい / 特定 seed の偶然 | 複数 seed で calibration set を切り、ECE の平均・分散を報告。閾値は 95% CI で保守的に決める |
-| **閾値が時間と共に drift する（装置変化・分布シフト）** | 一度校正した閾値を放置 | 月次で ECE / 閾値を再校正するタスクを設ける、`weekly_summary_to_human` に監視項目を追加 |
-| **クラス不均衡下で ECE bin が空になる** | bin 数固定 15 で少数クラス消失 | 適応 bin（等頻度）に切替、または `n_bins` を減らす。bin ごとのサンプル数もレポート |
-| **temperature scaling を汚染された calibration set で学習** | val に test の一部が混入した | Ch05 anti-leakage assert に加えて calibration_set_hash を provenance に記録し、再現時に照合 |
-| **Deep Ensemble 推論時に model.eval() 忘れ** | dropout が active のまま推論 | 推論エントリで全メンバーを `eval()` に強制。`assert not m.training for m in ensemble.models` |
+| fine-tune 後に性能悪化 | domain gap 大に対して full fine-tune を強行 | §8.5 gate で `action_on_review: route_to_human`、または LoRA に降格 |
+| モデルが日毎に変わり provenance が追えない | 日次 auto-refinetune | §8.7 `daily_refinetune_gate` で `min_days: 7` + human_approval 必須 |
+| 装置 γ で性能が出ない | 全装置一律の戦略 | §8.6 判断表で装置ごとに戦略を切り替え |
+| Catastrophic forgetting（pretrain タスクスコア大幅低下） | 少データで full fine-tune | LoRA に降格、`catastrophic_forgetting_check` を契約に追加 |
+| 事前学習データとの leakage | 評価データが pretrain データに含まれる | §8.8 `pretraining_data_overlap_check` を split_contract に追加 |
+| エージェントが `revision` を勝手に変えた | `modification_policy.revision_change_by_agent` が未設定 | §8.4 の modification_policy 契約を追加 |
+| LoRA adapter だけ差し替えて base 重みハッシュ検証を怠る | adapter が別の base に対して作られていた | provenance に `base_weights_hash_before` を必須化、起動時に照合 |
+| calibration_set が古い | 装置校正後も同じ calibration set を使い続けた | §8.5 `reference_uri` と `reference_sha256` を四半期ごとに更新 |
+| **normalized_gap_0_1 と mahalanobis_squared を混同** | 契約 YAML の `gap_metric` フィールド未指定 | §8.5 の `method` を必ず指定、§8.3 選択マップ・§8.6 判断表は明示的に `normalized_gap_0_1` を使う |
+| **LoRA fine-tune 後に base 重み hash が変わっていた** | frozen 指定漏れ・実装バグ | 起動時に `base_weights_hash_before == base_weights_hash_after` を **fatal assert**（LoRA/PEFT 戦略時のみ） |
+| **共分散推定が高次元少サンプルで不安定** | EmpiricalCovariance を使った | `LedoitWolf` / `OAS` に切替、`min_calibration_samples_per_dim` を契約に追加 |
+| **エージェントが baseline_gap_reference を silently reset** | reference を再計算する権限を持っていた | §8.7 `baseline_gap_reference.immutable_by_agent: true` + `require_provenance_hash: true` |
+| **near-duplicate leakage を見逃した** | 完全 hash 一致のみでチェック | §8.8 `method: "hash_and_near_duplicate"`（perceptual hash + embedding similarity） |
+| **単一サンプル推論で domain gap gate が誤動作** | batch mean の Mahalanobis が不安定 | §8.5 `inference_guard.min_batch_size_for_gap_check` を設定、単サンプルは `log_only` |
 
 ---
 
-## 8.12 この章のチェックリスト
+## 8.11 この章のチェックリスト
 
-- [ ] 学習済みモデルに対して val set で ECE / Brier を計算している
-- [ ] ECE > 0.05（または task-specific 閾値）なら temperature scaling を適用している
-- [ ] Temperature 適用後、accuracy が変わっていないことを確認している
-- [ ] Deep Ensemble を採用する場合、M ≥ 5 で seed を別々にしている
-- [ ] 各 ensemble メンバーの seed を provenance に記録している
-- [ ] `predictive_entropy` / `expected_entropy` / `mutual_information` を分けて計算している
-- [ ] `predictive_entropy_normalized = H / log K` で正規化している
-- [ ] 第6章 §6.3 の `val_ood_score` を §8.7 の実装候補で具体化している
-- [ ] `uncertainty_stop_gate` を Skill 契約に組み込んでいる
-- [ ] `uncertainty_stop_gate` の閾値変更を全レベル禁止している
-- [ ] `disable_gate_all_levels: forbidden` を設定している
-- [ ] Gate 発動時の `human_handoff_payload` を明示している
-- [ ] `domain_gap_gate` と `uncertainty_stop_gate` の**両者を並置**し、順序を「feature-level → output-level」にしている
-- [ ] calibration set と test set が重複していない（第5章 anti-leakage 契約で fatal assert）
-- [ ] Deep Ensemble を持たない単一モデル運用では、epistemic を主張していない
+Skill 実装前・レビュー時のチェック（第5章の 7 セクション + 第6章の 2 契約 + 第7章の `training_config.yaml` に加えて）：
+
+- [ ] 転移学習 4 戦略（frozen / partial / LoRA / full）から機械的に選択できる
+- [ ] `pretrained_weights` に `revision` を commit hash で記録している
+- [ ] `weights_sha256` を事前計算し contract に記録している
+- [ ] `pretraining_distribution.NOT_intended_for` を書いている
+- [ ] `domain_gap_gate` で feature-level OOD 検知を組み込んでいる
+- [ ] `domain_gap_gate.method` で `mahalanobis_squared` / `normalized_gap_0_1` を明示的に指定している
+- [ ] 共分散推定に `LedoitWolf` / `OAS` を使っている（EmpiricalCovariance は不採用）
+- [ ] `calibration_set` が Human curate 済みで、`reference_sha256` が記録されている
+- [ ] `calibration_99th_percentile` から `normalized_gap_0_1` を計算している
+- [ ] 装置別 fine-tune 判断表（`instrument_finetune_decision_table.yaml`）を書いている
+- [ ] 判断表の各装置に `agent_min_level` + `required_gate` + `approval_required` の 3 フィールドを揃えている（`L2_with_daily_gate` のような taxonomy 外の記述は禁止）
+- [ ] 日次 re-fine-tune 承認ゲート（`daily_refinetune_gate.yaml`）を書いている
+- [ ] `triggers_required_all` に human_approval が含まれ、`max_approval_age_hours` を設定している
+- [ ] `baseline_gap_reference.immutable_by_agent: true` を設定し、agent が baseline を silent reset できないようにしている
+- [ ] `allowed_strategies_for_daily` を LoRA 系のみに制限している（partial / full は日次禁止）
+- [ ] `pretraining_data_overlap_check` を split_contract に追加している（`hash_and_near_duplicate`）
+- [ ] 装置別 grouped CV × few-shot 評価を実行している
+- [ ] `catastrophic_forgetting_check` を評価レポートに含めている
+- [ ] provenance に `transfer_learning` セクション（Layer 4）を追加している
+- [ ] **LoRA / PEFT 戦略時は `base_weights_hash_before == base_weights_hash_after` を fatal assert している**
+- [ ] `adapter_weights_hash` に加えて `adapter_base_weights_hash` を記録し、adapter がどの base 用か照合している
+- [ ] full fine-tune を L3 でも Human sign-off 必須にしている（pre-approved workflow scope 内かつ都度承認）
+- [ ] 事前学習モデルの差し替え / domain gap 閾値変更を全レベルで禁止している
+- [ ] 推論時 domain gap の `min_batch_size_for_gap_check` を設定している
 
 ---
 
-## 8.13 ワーク・まとめ・参考資料
+## 8.12 ワーク・まとめ・参考資料
 
 ### 演習
 
-1. **ECE 計算の実装**：CIFAR-10 で公開されている pre-trained ResNet の softmax 出力（val 5000 サンプル）に対して、`expected_calibration_error(n_bins=15)` を実装・計算せよ。教材上のパターンでは ECE ≈ 0.08 になる想定。
-2. **Temperature scaling の効果測定**：上記モデルに対して val の 500 サンプルで T を最適化し、残り 4500 サンプルで ECE 改善を測定せよ。T ≈ 1.5-2.5 になれば期待通り。
-3. **Deep Ensemble の実装**：第6章の 1D CNN を M=5 で ensemble し、`predictive_entropy_normalized` と `mutual_information` を計算せよ。OOD として意図的に augmentation を強化したサンプルを混ぜ、両指標が上がるか確認せよ。
-4. **Gate 契約の設計**：あなたが実装したい Skill（例：SEM 画像分類）について、`uncertainty_stop_gate.yaml` を書け。`monitors` の 3 指標について、warn / stop 閾値の初期値を calibration set の 80% / 95% タイル値から derive せよ。
-5. **並置 gate のシナリオシミュレーション**：以下 3 サンプルについて、`sample_admission_policy` の 2 段階チェックが pass / stop するか判定せよ。
-   - サンプル A: normalized_gap 0.1, predictive_entropy_normalized 0.2 → ?
-   - サンプル B: normalized_gap 0.4, predictive_entropy_normalized 0.15 → ?
-   - サンプル C: normalized_gap 0.15, predictive_entropy_normalized 0.55 → ?
+1. **戦略選択の判断練習**：ARIM 風合成 IR スペクトルで、n = 80 / n = 500 / n = 3000 の 3 ケースについて、`spectrum_transfer_1d` で選ぶべき戦略（A/B/C/D）を §8.3 の選択マップから決めよ。domain gap は 0.3 とする。
+2. **判断表の作成**：あなたが実際に使っている装置（または想像上の 3 装置）について、`instrument_finetune_decision_table.yaml` の 3 エントリを書け。校正状態・想定サンプル数・想定 domain gap を仮置きし、`recommended_strategy` を決めよ。
+3. **承認ゲートのシミュレーション**：`daily_refinetune_gate` の `triggers_required_all` について、以下のシナリオで gate が pass / block のどちらか判定せよ。
+   - シナリオ A：n_new=60, gap_change=0.20, val_drop=0.03, days_since=10, approval_age=12h
+   - シナリオ B：n_new=80, gap_change=0.18, val_drop=0.06, days_since=8, approval なし
+   - シナリオ C：n_new=100, gap_change=0.25, val_drop=0.08, days_since=8, approval_age=30h
+4. **provenance レビュー**：仮の `provenance.yaml` を作り、`base_weights_hash_before == base_weights_hash_after` になるべき戦略（LoRA）と、変わって良い戦略（full fine-tune）を書き分けよ。
+5. **catastrophic forgetting の検出**：`pretrain_task_score_before = 0.92`, `pretrain_task_score_after = 0.75` のとき、`threshold_for_warning: 0.10` の設定でどの status になるか、また改善策を 3 つ挙げよ。
 
 ### まとめ
 
-- **Softmax confidence ≠ 予測確率**。ECE / Brier / reliability diagram で必ず measure する
-- **Temperature scaling** は accuracy を保ちつつ ECE を下げる最小コストの post-hoc 法
-- **Deep Ensemble (M=5-10)** で `predictive_entropy` / `mutual_information` を分解できる。epistemic 監視の第一選択
-- **`predictive_entropy_normalized = H / log K`** で値域 [0, 1]、クラス数を跨いで閾値比較可
-- **第6章 `val_ood_score` の実装候補 4 種**（max-softmax / normalized entropy / mutual info / Mahalanobis）から選ぶ
-- **`uncertainty_stop_gate`** は監視指標・閾値・action・authorization を明文化した契約。Skill 間で共通化する
-- **第7章 `domain_gap_gate`（feature-level）と本章 `uncertainty_stop_gate`（output-level）は役割が違う**。並置して「feature → output」の順序で評価する
-- **Gate 無効化は全レベル禁止**。閾値変更は事前 Human 承認が必要
+- 転移学習 4 戦略（**frozen / partial / LoRA / full**）は、`n × domain_gap` の 2 軸で機械的に選べる。full fine-tune は L3 でも Human sign-off 必須
+- **事前学習重みの provenance は最も厳しく**：`revision` は commit hash、`weights_sha256` は事前計算、`NOT_intended_for` を明記
+- **`domain_gap_gate`** は feature-level（penultimate layer）で計算し、`warn / review / stop` の 3 段階アクション
+- **装置別判断表**（`instrument_finetune_decision_table.yaml`）は Human が四半期ごとに更新
+- **日次 re-fine-tune 承認ゲート**は `triggers_required_all` の 5 条件（新サンプル数 / gap 変化 / val 低下 / 日数 / 24h 以内 human approval）
+- **少データ評価**は grouped × few-shot × 事前学習 leakage check の 3 軸
+- **provenance に `transfer_learning` セクション（Layer 4）** を追加。`refinetune_history` で日次履歴を蓄積
 
 ### 参考資料
 
 **本書内**：
-- 第4章 §4.4-4.10（provenance 3 レイヤ、Agentic 学習権限 L1-L3）
-- 第5章（`deep_split_contract` の calibration/test 分離）
-- 第6章 §6.3（`val_ood_score` forward reference の起点）
-- 第7章 §7.5（`domain_gap_gate`：feature-level OOD）
-- 第9章（MC-Dropout / BNN、conformal prediction 比較表）
-- 第10章（誤判定流し戻し UX、attribution）
-- 第13章（capstone：深層特徴 × PyMC 階層に不確かさを渡す）
-- 第14章（Deep Ensemble の過信・BNN の未収束）
+- 第5章 §5.4-4.10（provenance 3 レイヤ、Agentic 学習権限 L1-L3、4 承認ゲート）
+- 第6章 §6.5-5.7（augmentation プリミティブと L1-L3 権限）
+- 第7章 §7.3, §7.9（`training_config.yaml`、10 判断場面）
+- 第9章（不確かさと OOD の本格実装、`val_ood_score` の実装候補）
+- 第12章（Foundation Model 章、事前学習の内部構造）
+- 第15章（深層 × Agentic 特有の失敗、fine-tune のデータリーク）
 
 **vol-01/02**：
-- vol-02 第9章（予測区間、conformal prediction 基礎）
-- vol-02 第10-12章（PyMC の $\hat{R}$ / ESS / PPC など診断）
+- vol-01 第6章（Human-in-the-loop の設計原則）
+- vol-02 第8章（CV 設計とデータリーク検知）
+- vol-02 第11章（Skill 仕様書 7 セクション）
 
 **外部**：
-- Guo et al. — "On Calibration of Modern Neural Networks", ICML 2017 [https://arxiv.org/abs/1706.04599](https://arxiv.org/abs/1706.04599)
-- Lakshminarayanan et al. — "Simple and Scalable Predictive Uncertainty Estimation using Deep Ensembles", NeurIPS 2017 [https://arxiv.org/abs/1612.01474](https://arxiv.org/abs/1612.01474)
-- Ovadia et al. — "Can You Trust Your Model's Uncertainty?", NeurIPS 2019 [https://arxiv.org/abs/1906.02530](https://arxiv.org/abs/1906.02530)
-- Kendall & Gal — "What Uncertainties Do We Need in Bayesian Deep Learning?", NeurIPS 2017 [https://arxiv.org/abs/1703.04977](https://arxiv.org/abs/1703.04977)
-- Naeini et al. — "Obtaining Well Calibrated Probabilities Using Bayesian Binning", AAAI 2015 [https://cdn.aaai.org/ojs/9602/9602-13-13130-1-2-20201228.pdf](https://cdn.aaai.org/ojs/9602/9602-13-13130-1-2-20201228.pdf)
-- Hendrycks & Gimpel — "A Baseline for Detecting Misclassified and OOD Examples", ICLR 2017 [https://arxiv.org/abs/1610.02136](https://arxiv.org/abs/1610.02136)
+- LoRA — Hu et al., 2021 [https://arxiv.org/abs/2106.09685](https://arxiv.org/abs/2106.09685)
+- PEFT ライブラリ — Hugging Face [https://github.com/huggingface/peft](https://github.com/huggingface/peft)
+- Mahalanobis distance for OOD detection — Lee et al., 2018 [https://arxiv.org/abs/1807.03888](https://arxiv.org/abs/1807.03888)
+- Catastrophic forgetting — Kirkpatrick et al., 2017 (EWC) [https://arxiv.org/abs/1612.00796](https://arxiv.org/abs/1612.00796)
+- Foundation Model 転移学習の展望 — Bommasani et al., 2021 [https://arxiv.org/abs/2108.07258](https://arxiv.org/abs/2108.07258)
+- torch.load `weights_only=True` の重要性 — PyTorch security advisory [https://pytorch.org/docs/stable/notes/serialization.html](https://pytorch.org/docs/stable/notes/serialization.html)
+- safetensors 仕様 — Hugging Face [https://github.com/huggingface/safetensors](https://github.com/huggingface/safetensors)

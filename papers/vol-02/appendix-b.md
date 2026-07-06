@@ -103,7 +103,7 @@ res = cross_validate(pipe, X, y, cv=cv, groups=g,
 | Deterministic | `pm.Deterministic(name, expr, dims)` | 事後保存対象 |
 | データ差替え | `pm.Data(name, value, dims)` + `pm.set_data({name: new})` | out-of-sample 予測 |
 | サンプリング | `pm.sample(draws, tune, chains, cores, nuts_sampler, target_accept, random_seed)` | — |
-| Prior predictive | `pm.sample_prior_predictive(random_seed=)` | Ch10 §10.3 |
+| Prior predictive | `pm.sample_prior_predictive(random_seed=)` | Ch10 §11.3 |
 | Posterior predictive | `pm.sample_posterior_predictive(idata, predictions=True/False, random_seed=)` | `predictions=True` で out-of-sample |
 
 ### B.2.2 事前分布の選び方
@@ -115,11 +115,11 @@ res = cross_validate(pipe, X, y, cv=cv, groups=g,
 | 相関行列（コレスキー分解） | `LKJCholeskyCov(name, eta, n, sd_dist=...)` | `chol, corr, sigmas = pm.LKJCholeskyCov("chol", eta=2, n=K, sd_dist=pm.HalfNormal.dist(1.0, size=K))` — `sd_dist` は `.dist()` 経由、`n` は次元数 |
 | Group effect（sum-to-zero） | `ZeroSumNormal(sigma, dims=...)` | identifiable |
 | Weakly informative（標準化済み特徴量の回帰係数、特にロジスティック） | `Normal(0, 2.5)` | Gelman recommendation（対象は必ず標準化後） |
-| Wide "flat" | `Normal(0, 100)` | **避けるべき**（Ch14 §14.5） |
+| Wide "flat" | `Normal(0, 100)` | **避けるべき**（Ch14 §15.5） |
 | 制約付き（[0, 1]） | `Beta(alpha, beta)` | `Beta(2, 2)` は中央寄り |
 | 分散比 | `HalfStudentT(nu=3, sigma)` | 重い裾で robust |
 
-**推奨**（第10章 §10.3）：**必ず prior predictive check** を実行し、範囲がドメイン外でないことを確認。
+**推奨**（第11章 §11.3）：**必ず prior predictive check** を実行し、範囲がドメイン外でないことを確認。
 
 ### B.2.3 診断指標のしきい値
 
@@ -132,9 +132,9 @@ res = cross_validate(pipe, X, y, cv=cv, groups=g,
 | BFMI | ≥ 0.3 | エネルギー適応度 | reparameterize |
 | max treedepth | `reached_max_treedepth == False` | tree 深さ天井到達 | まず幾何を確認、その後 `max_treedepth=15` 検討 |
 
-> **divergences のしきい値**：Ch12 §12.9 では認定要件として **非ゼロは不許可**。「〜% までなら OK」ではなく、原因（曲率・スケール・パラメータ化）を必ず特定してから再サンプルする。
+> **divergences のしきい値**：Ch12 §13.9 では認定要件として **非ゼロは不許可**。「〜% までなら OK」ではなく、原因（曲率・スケール・パラメータ化）を必ず特定してから再サンプルする。
 
-### B.2.4 事後予測チェック（Ch12 §12.5）
+### B.2.4 事後予測チェック（Ch12 §13.5）
 
 ```python
 import arviz as az
@@ -171,7 +171,7 @@ with open("artifacts/posterior_v1.0.0.nc", "rb") as f:
 | GPU 利用可 | NumPyro NUTS on GPU | `+ jax.config.update("jax_platform_name", "gpu")` |
 | Rust NUTS | NutPie | `nuts_sampler="nutpie"` |
 
-> **`nuts_sampler` を必ず明示する**：PyMC の内部デフォルトはバージョンや導入済みパッケージによって変わり得る（例: `nutpie` が入っていれば自動選択されるケースがある）。再現性・provenance のために **`nuts_sampler=` を省略しない**。認定実行では固定必須（Ch14 §14.7）。
+> **`nuts_sampler` を必ず明示する**：PyMC の内部デフォルトはバージョンや導入済みパッケージによって変わり得る（例: `nutpie` が入っていれば自動選択されるケースがある）。再現性・provenance のために **`nuts_sampler=` を省略しない**。認定実行では固定必須（Ch14 §15.7）。
 
 ### B.3.2 環境設定（NumPyro/JAX）
 
@@ -181,7 +181,7 @@ jax.config.update("jax_enable_x64", True)         # ★ float64 必須
 print(jax.devices())                              # 実行デバイス確認
 ```
 
-**注意**（第10章 §10.9, 第14章 §14.7）：
+**注意**（第11章 §11.9, 第15章 §15.7）：
 - FP32 だと収束不良・divergences 増加
 - CPU/GPU で乱数結果は完全一致しない
 - **認定は 1 バックエンド固定**、比較は tolerance 内
@@ -190,7 +190,7 @@ print(jax.devices())                              # 実行デバイス確認
 
 ## B.4 MCMC トラブル対処早見表
 
-**対処の優先順位（Ch12 §12.6 の梯子）**：
+**対処の優先順位（Ch12 §13.6 の梯子）**：
 `(1) 発散点の localize` → `(2) スケール・標準化見直し` → `(3) 非中心化・reparameterize` → `(4) 最終手段で target_accept を上げる`。
 いきなり `target_accept=0.99` にすると根本原因が隠れる。
 
@@ -202,8 +202,8 @@ print(jax.devices())                              # 実行デバイス確認
 | `reached_max_treedepth == True` | tree が浅すぎ／幾何が悪い | まず幾何・スケールを確認、それでもダメなら `max_treedepth=15` |
 | `NaN` in log_prob | 数値不安定、prior 極端 | prior 見直し、`jitter` 増 |
 | `BFMI < 0.3` | エネルギー分布が悪い | reparameterize、scale 調整 |
-| 予測が prior に張り付く | prior が狭すぎ | Prior sensitivity（Ch14 §14.5） |
-| PyMC で通ったが NumPyro で違う結果 | float32 / 乱数実装差 | `jax_enable_x64`、tolerance 検証（Ch14 §14.7） |
+| 予測が prior に張り付く | prior が狭すぎ | Prior sensitivity（Ch14 §15.5） |
+| PyMC で通ったが NumPyro で違う結果 | float32 / 乱数実装差 | `jax_enable_x64`、tolerance 検証（Ch14 §15.7） |
 
 **非中心化の書換パターン**：
 
@@ -411,9 +411,9 @@ with pm.Model() as m:
 ### 本書内の該当章
 
 - 第5-8章：sklearn 実装
-- 第7章：CV 詳細
+- 第8章：CV 詳細
 - 第10-12章：PyMC 実装・診断
-- 第11章：階層モデル・非中心化
+- 第12章：階層モデル・非中心化
 - 付録A：Skill テンプレート
 
 ### 外部参考

@@ -1,617 +1,506 @@
-# 第5章　前処理と Augmentation の Skill 化 — Agentic 契約と深層 anti-leakage
+# 第5章 深層 × Agentic Skill の設計原則
 
-第4章で設計した **深層 × Agentic Skill 仕様書テンプレート**（§4.9）と **provenance スキーマ**（§4.10）を、この章では **データ流路の契約**という側面から埋めていきます。データを深層モデルに流し込む前段には、統計/古典 ML には存在しなかった**深層特有の落とし穴**があります。
-
-vol-02 第4-5 章では、`data_split` と CV 設計を **anti-leakage split contract** として言語化しました。この章はその契約を、深層 × Agentic 時代の**追加要件**——augmentation・事前学習データ重複・装置間差の判断ゲート——で拡張します。
-
-> [!NOTE]
-> **この章の到達目標**：
-> - 深層版 anti-leakage split contract に必要な 3 つの追加要件を列挙できる
-> - Augmentation contract の 3 要素（train-only / 物理妥当性 / エージェント権限）を Skill 契約に書ける
-> - 装置間差を augmentation で「消してよい / 消してはいけない / Human 送り」の 3 分岐で判断できる
-> - エージェントが augmentation の強度を勝手に変更しないための契約を書ける
+> **本章の到達目標**
+> - vol-01 第7章「Skill 設計 6 要素」と vol-02 第5章「統計/ML 版拡張」を、**深層学習 × Agentic** に拡張した設計原則を理解する
+> - Skill 仕様書に **3 つの新しい問い**——「何を成功とみなすか」「どの環境で再現するか」「**エージェントに何を許すか**」——を書き下せる
+> - **循環設計問題の深層版**（エポック数・augmentation 強度・early stopping の勝手な変更）を防ぐ仕組みを設計できる
+> - **Agentic 学習権限設計（3 段階権限）**——推論のみ / 承認済み範囲内 fine-tune 可 / 事前承認ワークフロー内自律実行可——を、自研究室の運用に合わせて選べる
+> - **深層 × Agentic Skill 仕様書テンプレート** と **GPU/Agentic provenance スキーマ** を、本章の成果物として持ち帰る
 >
-> **この章で扱わないこと**：
-> - 具体的な深層モデル実装（第6章）
-> - 転移学習の fine-tune 戦略（第7章）
-> - 不確かさ推定（第8-9章）
-> - Foundation Model への augmentation 適用（第11-12 章で言及）
+> **本章で扱わないこと**
+> - 具体的な PyTorch/JAX/HF の API 呼び出し（第7章以降のハンズオン）
+> - augmentation の実装（第6章）
+> - CV 設計の詳細（第8章、vol-02 第8章の深層版）
+> - 不確かさ推定手法の実装（第8-9章）
 
 ---
 
-## 5.1 この章で作る Skill（2 種）
+## 5.1 なぜ「設計」から始めるのか（深層 × Agentic 版の動機）
 
-この章では 2 つの Skill を作ります。どちらも **契約定義中心**の Skill であり、以降の第6-13 章のハンズオンから常に呼び出されます。
+vol-02 第5章の設計原則は、**「何を成功とみなすか」＋「どの環境で再現するか」** の 2 問を Skill 仕様書に書き下すことでした。深層 × Agentic では、**もう 1 問**が加わります。
 
-| Skill 名 | 目的 | 出力 |
+**vol-03 の 3 つの問い**：
+
+| # | 問い | 中心となる論点 | 対応節 |
+|---|---|---|---|
+| 1 | **何を成功とみなすか** | 評価指標 + 目的関数 + 許容範囲。**深層では calibration・不確かさ閾値**も含む | §5.3 |
+| 2 | **どの環境で再現するか** | seed / cuDNN / GPU backend / weights sha256 / tolerance の provenance | §5.4-§5.5 |
+| 3 | **エージェントに何を許すか**（新） | 学習ジョブ起動範囲 / checkpoint 上書き / FM 更新 / augmentation 変更の 3 段階権限 | §5.7 |
+
+vol-02 では **「モデル選択の暴走」** が中心的なリスクでしたが、vol-03 では **「学習ジョブ・checkpoint・重みの上書きが自律的に走る」**——影響範囲がはるかに広い運用リスクが加わります。設計を先に書かなければ、**エージェントが週末に checkpoint を大量上書きして、翌週の校正が壊れる**といった事故が現実になります。
+
+> [!TIP]
+> 3 番目の問いは vol-01 第6章「Human-in-the-loop」の深層版です。vol-01 では「ユーザーが確認する」ことが中心でしたが、vol-03 では **エージェントが何を許され、何をブロックされるか**を Skill 契約に**明示的に符号化**することを求めます。
+
+---
+
+## 5.2 6 要素の深層 × Agentic 拡張
+
+vol-01 の 6 要素は深層 × Agentic Skill でもそのまま使えます。各要素の**中身**が深層 × Agentic 特有になる点を、vol-01・vol-02 との対比で示します。
+
+| # | 要素 | vol-01（データ整備） | vol-02（統計/ML） | vol-03（深層 × Agentic） |
+|---|---|---|---|---|
+| ① | 目的 | 「XRD ファイルを標準 DataFrame に変換」 | 「組成 20 変数から硬度を回帰予測」 | 「ARIM 風合成 SEM を装置別に 5 クラス分類する fine-tune 済み ViT」 |
+| ② | 入力条件 | 装置形式・単位・欠損率 | 特徴量スキーマ・目的変数 | **上記 + 事前学習重み仕様**（`weights_uri` / `revision` / `sha256` / `license`） **+ GPU 要件** |
+| ③ | 出力形式 | 標準 DataFrame | 学習済みモデル + 評価指標 + 予測 | **上記 + calibration 指標（Brier/ECE）+ 不確かさ + attribution + augmentation ログ** |
+| ④ | 成功条件 | 契約チェック通過 | 指標 X ≥ Y、CV 設計 Z | **上記 + calibration 閾値 + 不確かさ閾値 + GPU determinism 許容 tolerance** |
+| ⑤ | 禁止事項 | 生データ上書き | + データリーク・指標後付け | **+ checkpoint 上書き・augmentation 契約違反・FM revision 変更・push_to_hub** |
+| ⑥ | 再現性条件 | input_sha / skill_version / seed | + cv_scheme / model_config / sampler_config | **+ gpu_backend / cudnn_deterministic / weights_sha256 / augmentation_config / agent_authorization** |
+
+本章では、**④成功条件・⑤禁止事項・⑥再現性条件**に加え、**新設の Agentic 学習権限設計**（§5.7）を深掘りします。
+
+---
+
+## 5.3 成功条件の 3 点セット + 深層特有の追加
+
+vol-02 §5.3 で確立した **3 点セット**（評価指標・目的関数・許容範囲）は深層でもそのまま使います。深層 × Agentic では、以下の**追加成分**を成功条件に組み込みます。
+
+### 深層 × Agentic の追加成分
+
+| 追加成分 | 意味 | 例 |
 |---|---|---|
-| **`deep_split_contract`** | 学習/検証/テスト分割 + 事前学習データ重複チェック + augmentation 適用範囲を **契約 YAML** として固定 | `split_contract.yaml`、分割インデックス、`leakage_audit.log` |
-| **`augmentation_contract`** | データ型・装置種類ごとに augmentation の**契約**（何を・どの強度で・train のみに）を固定 | `augmentation_contract.yaml`、augmentation 適用ログ |
+| **Calibration 閾値** | 予測確率が実際の頻度と合っているか | ECE ≤ 0.05、Brier score ≤ 0.15 |
+| **不確かさ閾値** | エージェントが自律決定してよい不確かさ上限 | predictive entropy ≤ 0.3、ensemble variance ≤ σ_max |
+| **Attribution の sanity check 通過** | Grad-CAM/IG などの説明がパラメータ/ラベルのランダム化に対して**適切に変化する**（=モデル依存性を持つ） | model-parameter-randomization test / label randomization test を通過（第11章） |
+| **GPU determinism tolerance** | 完全再現ではなく差分を許容 | 学習曲線が 3 seed で loss ± 0.02 以内で収束 |
+| **CPU モードでの smoke test 通過** | CI で最低限動くこと | 縮小データ・少エポックで学習ループが完走 |
+
+### 深層で埋めた 3 点セットの例（分類）
+
+> ✅ **成功条件（1D CNN でスペクトル分類、ARIM 風合成）**：
+> - **評価指標**：F1（macro 平均） + 混同行列 + **ECE**（calibration）
+> - **目的関数**：cross entropy（label smoothing 0.05）
+> - **許容範囲**：
+>   - grouped CV（装置単位）の平均 F1 ≥ 0.85、各装置での F1 ≥ 0.78
+>   - **ECE ≤ 0.05**、reliability diagram で 5 bin 中 4 bin が対角線 ±0.1 以内
+>   - **予測時**：エージェント自律決定は **正規化 predictive entropy ≤ 0.3**（クラス数 K に対して `H / log(K)` で正規化）の場合のみ、それ以外は Human 送り
+>   - **GPU determinism**：seed × 3 で 5-fold F1 の標準偏差 ≤ 0.01（それ以上ばらつくなら fold 数か seed 数を増やす）
+
+### 悪い成功条件（深層特有）
+
+> ❌ 「accuracy 90% 以上」——**キャリブレーションと不確かさ閾値が未定義。誤検出のコストが暗黙。**
+>
+> ❌ 「学習曲線が下がりきれば OK」——**loss と評価指標のどちらを見ているか不明。overfitting を隠す。**
+>
+> ❌ 「augmentation を強くすれば精度が上がる」——**augmentation の物理妥当性（第6章）が未定義。**
 
 > [!IMPORTANT]
-> **これらは「実装 Skill」ではなく「契約 Skill」**です。実際の augmentation 演算（回転・ノイズ付与など）を担うのは第6-7 章のモデル学習 Skill ですが、**契約が先**にあることで、エージェントが augmentation を勝手に強めることを防ぎます。契約なしのハンズオンは vol-03 では書きません。
+> 深層モデルの精度は augmentation 強度・エポック数・学習率で **簡単に上下します**。事前に **「不確かさ閾値まで書いた 3 点セット」** を固定しておかないと、エージェントが「精度が上がった」を根拠に **augmentation を勝手に強めたり epoch を伸ばしたりする** ——これが循環設計問題の深層版です（§5.6）。
 
 ---
 
-## 5.2 なぜ深層 × Agentic で特別に問題になるか
+## 5.4 どの環境で再現するか — GPU/Agentic provenance の 3 レイヤ
 
-vol-02 第4-5 章の anti-leakage split contract は、以下を扱いました：
+第3章 §3.5 と第4章 §4.6–§4.7 で挙げた provenance フィールドを、**3 レイヤ**に整理します。以下の表はスキーマの**論理構造**を示し、実装 YAML（§5.10、付録 A）ではこれらを `gpu_backend.cuda_version` のように**ネストしたキー**として保存します。
 
-- 分布分割（random split / stratified split / grouped split）
-- CV 設計（fold 数、outer/inner CV、時系列 split）
-- 特徴量に目的変数が混入していないか
+### Layer 1: GPU バックエンド
 
-深層 × Agentic では、これに **3 つの新問題**が加わります。
-
-### 新問題 1：Augmentation の物理妥当性
-
-深層モデルの標準ワークフローには **data augmentation**（回転・反転・ノイズ付与・intensity jitter など）が組み込まれています。しかし ARIM のような材料計測データでは、augmentation の多くが**物理的に無意味・または誤った学習を誘発**します。
-
-| データ型 | よく使われる augmentation | 物理的に妥当か？ |
+| フィールド | 例 | 意味 |
 |---|---|---|
-| SEM 画像 | 水平フリップ | **場合による**（結晶方位を持つ場合は破壊、非晶質なら OK） |
-| SEM 画像 | 90° 回転 | **多くの場合 NG**（結晶方位・成長方向を破壊） |
-| XRD パターン | 水平フリップ（2θ 反転） | **NG**（物理的に無意味、負角度は存在しない） |
-| XRD パターン | intensity jitter（強度スケール） | **OK**（検出器ゲイン差の模倣） |
-| スペクトル | 波数シフト | **場合による**（キャリブレーション差の範囲内なら OK、それ以上は装置種類の変化と混同） |
-| 時系列（計測ログ） | 時間反転 | **NG**（因果性を壊す） |
+| `gpu_backend` | `cuda` / `rocm` / `mps` / `cpu` | 計算基盤 |
+| `cuda_version` | `12.1` | ドライバ非依存部の再現性 |
+| `cudnn_version` | `8.9` | cuDNN の一部演算は非決定的（第3章） |
+| `cudnn_deterministic` | `true` | `torch.backends.cudnn.deterministic` |
+| `cudnn_benchmark` | `false` | ベンチマークモードは非決定的経路を選ぶ |
+| `torch_deterministic_algorithms` | `true` | `torch.use_deterministic_algorithms(True)` |
+| `cublas_workspace_config` | `":4096:8"` | matmul の決定性を担保 |
+| `gpu_memory_gb` | `24.0` | OOM 回避、モデル選択の記録 |
 
-**エージェントは物理妥当性を判断できません**。契約に「このデータ型ではどの augmentation を許すか」を **Human が事前定義**する必要があります。
+### Layer 2: 事前学習重み
 
-### 新問題 2：事前学習データとの重複
-
-Foundation Model や pretrained CNN（ImageNet 事前学習など）を使う場合、**事前学習データと自研究のテストデータが重複**すると、汎化性能を過大評価します。**FM 種別によって重複チェックの方法が異なる**点に注意します。
-
-| FM 種別 | 代表例 | 事前学習データの性質 | 重複チェックの方法 |
-|---|---|---|---|
-| **NLP 系 FM**（テキスト事前学習） | MatBERT, ChemBERTa, SciBERT, MoLFormer | 論文コーパス・SMILES 文字列など | テキスト content_hash 照合、または「非公開・照合不能」として `unknown` 扱い |
-| **結晶・原子構造系 FM** | CrystaLLM, M3GNet, MACE, UMA | Materials Project / ICSD / OQMD の構造データ | `material_id` などの識別子照合（`identifier_hash_join`）が可能な場合が多い |
-| **画像事前学習**（ImageNet 等） | ResNet, ViT の事前学習 | 自然画像 | 材料画像とドメインが異なるため厳密照合は不要だが**ドメインギャップ**を第7章で評価 |
-| **原子ポテンシャル**（trajectory 事前学習） | UMA など | MD trajectory | trajectory 単位で照合、または `unknown` |
-
-- どの FM 種別でも、事前学習データが**公開されていない**場合（`pretraining_data_license: unknown`、第3章 §3.7）、重複チェック自体が不可能 → **契約上「重複可能性あり」と明記**して結果解釈時に反映
-- **NLP 系 FM に対して `material_id` で照合する誤り**に注意（NLP 系 FM の事前学習に MP の識別子は使われていない場合が多い）
-
-### 新問題 3：エージェントによる augmentation の勝手な強化
-
-エージェントは「精度が上がった」を根拠に、**augmentation 強度を勝手に上げる**ことができます（回転角度を広げる、ノイズを増やす、mixup を混ぜる）。これは第4章 §4.6 で扱った**循環設計問題の深層版**の典型例です。契約で `augmentation_config` を固定し、変更を audit violation にする必要があります（第4章 §4.8 C 分類）。
-
----
-
-## 5.3 深層版 anti-leakage split contract
-
-vol-02 の split contract に、深層特有の 3 フィールドを追加します。
-
-### 契約 YAML（拡張版）
-
-```yaml
-# split_contract.yaml
-version: "1.0"
-
-# vol-02 継承部
-split_scheme:
-  type: "grouped_5fold"       # random / stratified / grouped / temporal
-  group_key: "instrument_id"  # 装置別 CV（第7章）
-  test_ratio: 0.2
-  val_ratio: 0.1
-  random_seed: 42
-  stratify_by: "class_label"
-
-leakage_prevention:
-  target_leakage_check: true      # 特徴量に目的変数が混入していないか
-  temporal_order_preserved: true  # 時系列データの場合
-
-# vol-03 追加：事前学習データ重複チェック（FM 種別ごとに `check_method` を選ぶ）
-pretraining_data_overlap:
-  applicable: true            # Foundation Model / pretrained weight を使うか
-  fm_type: "atomistic_structure"  # nlp_text / atomistic_structure / image_pretrained / atomic_potential
-  pretraining_dataset:
-    name: "Materials Project"
-    version: "v2024.01"
-    identifier_column: "material_id"   # 重複判定に使うカラム（識別子照合が可能な場合）
-  check_method: "identifier_hash_join"  # identifier_hash_join / content_hash / unknown
-  overlap_action: "exclude_from_test"   # exclude_from_test / warn / block
-  overlap_audit_log: "leakage_audit.log"
-  # 事前学習データが公開されていない場合
-  unknown_dataset_policy: "flag_and_document"
-
-# vol-03 追加：Augmentation 適用範囲
-augmentation_scope:
-  applied_to: ["train"]       # ["train"] のみ許可、["val", "test"] は禁止
-  seed_isolation: true        # augmentation 用 RNG を学習用と分離
-  log_applied_transforms: true
-  # オフライン事前生成 augmentation を使う場合の split 継承ルール
-  offline_augmentation:
-    enabled: false
-    source_sample_id_column: "source_sample_id"   # 親サンプル ID を必須化
-    split_inheritance: true                        # 親サンプルの split を継承
-    augmentation_parent_sha256_recorded: true
-
-# vol-03 追加：CLIP-like モデルの text-image leakage
-# NOTE: pretraining_data_overlap と同じ 3 ケース構造を持つ
-multimodal_leakage_check:
-  applicable: false           # CLIP / MoLFormer など text-image / text-graph の場合 true
-  modalities: []              # ["image", "text"] / ["graph", "text"] / ["structure", "text"] 等
-  check_method: "unknown"     # identifier_hash_join / content_hash / unknown
-  overlap_status: "unknown"   # confirmed_absent / confirmed_present / unknown
-  unknown_policy: "restrict_claims"  # flag_and_document / block_fm_evaluation / restrict_claims
-  overlap_audit_log: "multimodal_leakage_audit.log"
-```
-
-### `pretraining_data_overlap` の 3 ケース
-
-| ケース | `check_method` | `overlap_action` | 備考 |
-|---|---|---|---|
-| 事前学習データが公開・識別子で照合可 | `identifier_hash_join` | `exclude_from_test` | Materials Project の `material_id` など |
-| 事前学習データは公開だが識別子が異なる | `content_hash` | `exclude_from_test` or `warn` | 内容ハッシュで近似判定 |
-| 事前学習データが非公開 | `unknown` | `flag_and_document` | ライセンスが `unknown`（第3章 §3.7） |
-
-> [!WARNING]
-> **`unknown` ケースこそが最も危険**です。「チェックできない ＝ 重複はない」と結論してはいけません（第2章の**absence of evidence ≠ evidence of absence**、第14章で失敗事例）。契約に `unknown_dataset_policy: flag_and_document` を書き、レポートに「事前学習データ非公開のため独立性未検証」と明記します。
-
----
-
-## 5.4 データローダ設計と split の実装
-
-vol-02 の CV 実装（sklearn の `GroupKFold` 等）は深層でもそのまま使いますが、**PyTorch/JAX の DataLoader を通す**ことで new なリスクが加わります。
-
-### DataLoader worker seed の provenance 連携
-
-PyTorch `DataLoader` は複数 worker を並列起動して I/O を並列化します。各 worker の RNG seed は**明示的に設定**しないと、実行ごとに異なる augmentation シーケンスが適用され、**再現性が壊れます**（第2章 §2.3 で扱った GPU 非決定性とは別の非決定性）。
-
-```python
-# 概念コード（実装は第6章）
-def worker_init_fn(worker_id):
-    # PyTorch は base_seed を内部で派生する。実際に使われた seed を記録することが重要
-    worker_seed = torch.initial_seed() % 2**32
-    numpy.random.seed(worker_seed)
-    random.seed(worker_seed)
-    # 実際に使われた seed を provenance に append する（下記 YAML 参照）
-    log_worker_seed(worker_id=worker_id, torch_seed=worker_seed)
-
-loader = DataLoader(
-    dataset,
-    batch_size=32,
-    num_workers=4,
-    worker_init_fn=worker_init_fn,   # 必須
-    generator=torch.Generator().manual_seed(42),
-)
-```
-
-**provenance への記録**（第4章 Layer 1 の `gpu_backend.random_seed_per_worker` に対応）。**「意図した seed」ではなく「実行時に実際に使われた seed」を記録**する点に注意：
-
-```yaml
-gpu_backend:
-  # worker_init_fn が run-time に emit した実 seed をログ
-  random_seed_per_worker:
-    - {worker_id: 0, torch_initial_seed: 3948217, numpy_seed: 3948217, python_seed: 3948217}
-    - {worker_id: 1, torch_initial_seed: 3948218, numpy_seed: 3948218, python_seed: 3948218}
-    - {worker_id: 2, torch_initial_seed: 3948219, numpy_seed: 3948219, python_seed: 3948219}
-    - {worker_id: 3, torch_initial_seed: 3948220, numpy_seed: 3948220, python_seed: 3948220}
-```
-
-> [!NOTE]
-> **`torch.Generator().manual_seed(42)` から worker seed が `[42,43,44,45]` になるわけではありません**。PyTorch は base_seed から内部派生ルールで各 worker seed を作ります。**契約に書くのは「意図値」ではなく「実行時に emit された seed」**です。
-
-### stratified × grouped × augmentation の順序
-
-3 種類の制約が絡む場合、順序を **契約で固定**しないとエージェントが実装で入れ替える可能性があります。
-
-```
-[1] grouped split（装置別分割、vol-02 第7章）
-    ↓
-[2] stratified check（class 分布が train/val/test でずれていないか）
-    ↓
-[3] augmentation は train のみに適用（split 完了後）
-```
-
-### sklearn API との対応（実装ヒント）
-
-- **grouped + stratified**：`StratifiedGroupKFold`（sklearn ≥ 1.0）を使う
-- **grouped + holdout（test/val ratio 指定）**：`GroupShuffleSplit` で test を切り出し、残りに再度 `GroupShuffleSplit` で val を切り出す
-- **`GroupKFold` は ratio / stratification を持たない**ため、`split_scheme.type = grouped_5fold` の実装は `StratifiedGroupKFold` を推奨（stratify 不要の場合は `GroupKFold`）
-
-```yaml
-# split_contract.yaml（実装ヒントを追記）
-split_scheme:
-  implementation_hint: "StratifiedGroupKFold when stratify_by is set, else GroupKFold"
-  val_derivation: "inner_group_shuffle_split"   # train groups からさらに切り出す
-```
-
-### 順序違反の扱い（augmentation → split）
-
-**原則 fatal**：augmentation してから split すると、同じ元サンプルの拡張版が train と test の両方に入り、**深層特有のリーク**が発生します。
-
-**ただし例外**：オフライン事前生成 augmentation を使う場合、以下 3 条件を**すべて満たせば**許容されます。
-
-1. 各拡張サンプルが `source_sample_id` を必ず保持する
-2. split は `source_sample_id` で group 化して行う（子は必ず親と同じ split に入る）
-3. `augmentation_parent_sha256` を provenance に記録
-
-**条件を満たさない augmentation → split は fatal**（第4章 §4.8 A 分類）。
-
----
-
-## 5.5 Augmentation contract Skill
-
-Augmentation の契約は **3 要素**で書きます。
-
-| 要素 | 意味 | エージェント可否 |
+| フィールド | 例 | 意味 |
 |---|---|---|
-| **① Applied scope（適用範囲）** | train のみ / val / test のいずれに適用するか | **Human 固定**（変更不可） |
-| **② Physical validity（物理妥当性）** | データ型ごとに許可される augmentation 種類 | **Human 事前定義** |
-| **③ Agent permission（エージェント権限）** | エージェントが強度・種類を選ぶ範囲 | Skill 契約の `approved_augmentation_set` で数値化 |
+| `weights_uri` | `huggingface.co/lbnlp/MatBERT-base` | どこから取得したか |
+| `revision` | commit hash（`3fa2b1c...`）を必須 | branch 名は可変、契約に不適（第4章 §4.5） |
+| `weights_sha256` | `d4c3b2...` | ハッシュ検証（署名ではない） |
+| `weights_license` | `Apache-2.0` | 商用可否・再配布可否 |
+| `pretraining_data_license` | `不明` を含む | 事前学習データの法的リスク |
+| `safetensors_available` | `true` / `false` | pickle exec リスク管理（第4章 §4.7） |
 
-### 用語定義：augmentation プリミティブ
+### Layer 3: 学習・推論の設定
 
-「horizontal_flip」など曖昧な語を避け、**プリミティブ単位**で契約を書きます。
-
-| プリミティブ | 意味 | 「軸の表示反転」との違い |
+| フィールド | 例 | 意味 |
 |---|---|---|
-| `reverse_axis_order` | データ配列のインデックス順序を反転（例：波数配列 `[400..4000]` を `[4000..400]`） | **単なる表示反転（データ変更なし）は augmentation ではない**。プリミティブは配列そのものを書き換える |
-| `coordinate_reflection` | 座標軸の物理的反転（例：波数 `x` → `-x`、時間 `t` → `-t`） | 物理的に非合法な場合が多い |
-| `invert_intensity_sign` | 強度値の符号反転（`y` → `-y`） | 吸光度・強度に対して物理的に不可能な場合が多い |
-| `rescale_intensity` | 強度の乗法スケーリング（検出器ゲイン差の模倣） | OK な代表例 |
-| `baseline_shift` | 一定値の加算（バックグラウンド模倣） | 条件付き OK |
-| `axis_shift` | 軸方向の平行移動（キャリブレーション差の模倣） | 範囲内で条件付き OK |
-| `additive_noise` | ノイズ加算（Gaussian / Poisson） | OK |
+| `random_seed_per_worker` | `[42, 43, 44, 45]` | DataLoader worker ごとの seed |
+| `finetune_config` | `{"lr": 3e-5, "epochs": 5, "freeze_layers": [0-8]}` | fine-tune の全ハイパー |
+| `augmentation_config` | `{"rotation": null, "flip": "horizontal_only", "intensity_jitter": 0.1}` | augmentation の**契約**（第6章） |
+| `tolerance` | `{"metric_std": 0.01, "loss_variance": 0.02}` | 3 seed 実行での許容ばらつき |
+| `checkpoint_overwrite_policy` | `append_only` / `overwrite_with_human_approval` | §5.7 権限設計と連動 |
 
-> [!IMPORTANT]
-> ライブラリ関数名の「horizontal_flip」「vertical_flip」は**表示座標系依存**で意味が変わります。契約は**プリミティブ名**で書き、実装関数は Skill 内部で writeup にマップします。
+### 3 レイヤを分ける理由
 
-### 契約 YAML
+Layer 1 は **環境**、Layer 2 は **他人の学習成果**、Layer 3 は **自分の学習/推論**——**責任と変更頻度が異なる**ため、Skill 契約でも別のブロックに書きます。エージェントに触れることを許すかどうかも、レイヤごとに異なります（§5.7）。
 
-```yaml
-# augmentation_contract.yaml
-version: "1.0"
-data_type: "spectrum_ir"     # spectrum_ir / spectrum_raman / spectrum_uv_vis / image / pattern_xrd / timeseries / tabular / structure / multimodal
-axis_unit: "cm^-1"           # cm^-1 / nm / eV / degree_2theta / seconds / index
-applied_scope:
-  train: true
-  val: false                 # 変更禁止（第4章 §4.8 A 分類 fatal）
-  test: false                # 変更禁止
+---
 
-# データ型ごとの許可 augmentation リスト（Human 事前定義）
-# 各 range は「例示値ではなく、装置校正データから導出」することを推奨
-allowed_augmentations:
-  - name: "rescale_intensity"
-    physical_validity: "OK"
-    reason: "検出器ゲイン差の模倣として妥当"
-    strength_range: [0.90, 1.10]      # 例；装置 QC ログから導出すること
-    calibration_evidence_uri: "calib_2026_01.yaml"
-  - name: "additive_noise"
-    physical_validity: "OK"
-    reason: "計測ノイズの模倣"
-    sigma_range: [0.01, 0.05]         # 例；SNR 実測から導出
-    calibration_evidence_uri: "calib_2026_01.yaml"
-  - name: "axis_shift"
-    physical_validity: "conditional"
-    reason: "キャリブレーション差の範囲内のみ"
-    shift_range_cm1: [-2.0, 2.0]      # IR の場合は cm^-1 単位
+## 5.5 CI 上の CPU 学習（smoke test の設計）
 
-# 禁止 augmentation（プリミティブで指定）
-prohibited_augmentations:
-  - name: "coordinate_reflection"
-    reason: "波数の符号反転は物理的に非合法"
-    severity: "fatal"
-  - name: "invert_intensity_sign"
-    reason: "強度の符号反転は物理的に不可能"
-    severity: "fatal"
-  - name: "reverse_axis_order"
-    reason: "計測順序の反転はキャリブレーション情報を破壊"
-    severity: "fatal"
+vol-02 第5章では「CI 上の実行」を扱いましたが、深層モデルでは **GPU が CI 上で動かないことが普通**です。そこで、次の設計パターンを採ります。
 
-# エージェントの選択権限（第4章 §4.7 と連動）
-agent_permission:
-  level: L2                  # L1 / L2 / L3
-  approved_augmentation_set: ["rescale_intensity", "additive_noise"]
-  strength_selection: "within_range_only"   # within_range_only / fixed / free
-  can_add_new_augmentation: false           # L1/L2/L3 すべて禁止
-  can_modify_strength_range: false          # 全レベル禁止（audit violation）
+### Smoke test の要件
+
+- **縮小データ**：合成データ 100 サンプル程度（vol-03 の ARIM 風合成データを主軸に）
+- **少エポック**：3-5 エポックで loss の**下降傾向**が見えれば合格（絶対値は問わない）
+- **seed 固定**：seed=0 と seed=1 で loss 曲線の**符号（下降）**が一致
+- **CPU 動作**：`gpu_backend=cpu`、`torch.set_num_threads(2)` で安定化
+- **tolerance**：`loss ≤ initial_loss - Δ`（Δ は事前設定）
+
+### CI とフル学習の役割分担
+
+```mermaid
+flowchart LR
+    A["Push / PR"] --> B["CI: CPU smoke test<br/>100 sample, 3 epoch"]
+    B -- pass --> C["Human 承認"]
+    C --> D["Full training on GPU<br/>full data, N epoch"]
+    D --> E["Skill artifact 保存<br/>+ provenance 記録"]
+    B -- fail --> F["Skill 契約違反<br/>PR reject"]
 ```
 
 > [!TIP]
-> **数値範囲は「例示」であり本書のデフォルト値ではありません**。実運用では自装置の QC ログ・校正データから導出し、`calibration_evidence_uri` に根拠を紐づけます。
+> **フル学習を CI で回さないことが本書の設計原則**です。GPU コストが線形以上に膨らむ・共有 GPU がボトルネックになる・非決定性でテストが flaky になる、の 3 理由。Full training は **Human 承認後にワークフローとして起動**する設計にします（§5.7）。
 
-### データ型別の物理妥当性テーブル（Human が事前作成）
+---
 
-以下はプリミティブ単位で記述。**個々のプリミティブの可否は装置種別・試料の対称性・因果性の有無で変わる**ため、下記は**デフォルト prior**として提示し、自研究の contract で override します（`orientation_semantics` / `causality_semantics` フィールドで明示）。
+## 5.6 循環設計問題の深層版
 
-| データ型 | OK（デフォルト） | 条件付き OK | fatal（デフォルト、override 可） |
+vol-02 §5.4 で扱った循環設計問題は、深層でさらに深刻化します。
+
+### 定義
+
+**エージェントが「評価指標」「モデル選択」「augmentation 強度」「エポック数」「learning rate」の複数を同時に触れると、指標が「都合の良い方向」に選ばれる**——これが深層版の循環設計問題です。
+
+### 具体例
+
+```
+ユーザー：「精度を上げてください」
+エージェント：「augmentation を強くしました。F1=0.92 です」
+（実は augmentation で結晶方位を壊す回転が入り、
+ 現場の実データでは F1=0.60 まで落ちる）
+```
+
+```
+ユーザー：「学習曲線を安定させてください」
+エージェント：「early stopping の閾値を緩めました。loss=0.05 です」
+（実は overfitting が進み、独立テストで性能が下落）
+```
+
+### 予防策（Skill 契約に書き下す）
+
+| 予防策 | 契約フィールド | 具体 |
+|---|---|---|
+| **評価指標を Skill 契約で固定** | `metric_definition` | エージェントが評価指標を選び直すのは違反 |
+| **augmentation を契約で固定** | `augmentation_config` | エージェントが augmentation の種類・強度を変えるのは違反（第6章） |
+| **エポック数・learning rate の範囲を契約で固定** | `finetune_config.hp_range` | 契約範囲外の値をエージェントが選ぶのは違反 |
+| **early stopping の条件を契約で固定** | `finetune_config.early_stopping` | 閾値・patience の変更はエージェント側で禁止 |
+| **独立テストは 1 回しか触らせない** | `test_access_log` | 独立テストへのアクセス回数を記録 |
+
+> [!WARNING]
+> **「精度が上がったのでこの設定を採用しました」** とエージェントが言ってきた場合、**評価指標・augmentation・エポック数・LR のうち複数が変わっていないか**を必ず確認します。1 つ以上変わっていれば、それは自律決定ではなく設計変更であり、Human 承認が必要です（§5.7）。
+
+---
+
+## 5.7 Agentic 学習権限設計（新設節）
+
+vol-01 第6章「Human-in-the-loop」は、**「ユーザーが最終判断する」** ことを中心テーマにしていました。vol-03 では、これを **「エージェントが何を許され、何をブロックされるか」** の設計として、**3 段階権限**に整理します。
+
+### 3 段階権限
+
+権限レベルは**契約に事前記載**された範囲でのみ有効です。範囲外の操作は **§5.7 末尾の 4 承認ゲート**を通す必要があります。「事前記載」＝ Skill 仕様書 §⑦・provenance の `agent_authorization` にて、Human が明示的に定義済みという意味です。
+
+| レベル | 名称 | エージェントに許すこと（**事前承認範囲内**） | 典型的な運用 |
 |---|---|---|---|
-| **XRD パターン**（`degree_2theta`） | rescale_intensity、additive_poisson_noise | peak_broadening（測定条件シミュレーション、範囲要指定） | coordinate_reflection（2θ 反転）、reverse_axis_order、90° rotation |
-| **SEM 画像**（結晶方位あり） | rescale_intensity、additive_noise、gaussian_blur | 小角度回転（±5° 以内、成長方向を保つ） | 90°/180° rotation、coordinate_reflection（結晶方位破壊）、mirror_reflection |
-| **SEM 画像**（非晶質） | 上 + mirror_reflection（`orientation_semantics: isotropic` 時）、90° rotation | mixup | invert_intensity_sign（下地判定を壊す場合） |
-| **IR / Raman スペクトル**（`cm^-1`） | rescale_intensity、additive_noise | axis_shift（キャリブレーション範囲内） | coordinate_reflection（波数の符号反転）、reverse_axis_order、cutout（中心峰破壊時） |
-| **UV-Vis スペクトル**（`nm`） | rescale_intensity、additive_noise | axis_shift（±0.5 nm 例、装置校正から導出） | coordinate_reflection、reverse_axis_order |
-| **時系列**（計測ログ、`causality_semantics: causal`） | additive_noise、warping（時間軸微調整） | random_crop（時間窓） | coordinate_reflection（時間反転）、shuffle |
-| **Tabular** | mixup（連続値のみ）、additive_noise（連続値のみ） | SMOTE（少数クラス補完、grouped CV と整合するか要確認） | カテゴリカル列の flip / permutation |
-| **結晶・原子構造** | 対称群を保つ回転・平行移動 | supercell 拡張 | 対称性違反の変形（本書 scope 外、第12章 SSL で本格対応） |
-| **Multimodal**（image + text / graph + text） | image / graph 側は上記 | — | text-image / text-graph の対応関係を崩す augmentation |
+| **L1** | **推論のみ** | 学習済みモデルの読み込み・推論・attribution 計算・レポート生成 | 本番運用、Human は結果を確認して意思決定 |
+| **L2** | **承認済み範囲内 fine-tune 可** | L1 + `approved_hp_range` 内でのハイパー選択・学習ジョブ起動・新 checkpoint 保存（**別名のみ、既存 checkpoint 上書き不可**）。範囲外は都度承認ゲートへ | 週次の再学習パイプライン、契約範囲は Human が事前定義 |
+| **L3** | **事前承認ワークフロー内自律実行可** | L2 + 事前承認された**ワークフロー承認 ID** に紐づく範囲でのみ、既存 checkpoint 上書き（バージョンタグ必須）・複数実験の自律スケジュール | 実験計画自動化パイプライン（本書は L3 の設計まで、運用は読者環境） |
+
+> [!NOTE]
+> **承認の粒度**：本書では「契約時の 1 回承認で範囲内は都度承認不要」を推奨します。範囲外だけ都度承認ゲート（下記 4 種）を通します。「範囲」の妥当性を Human が定期レビュー（例：月次）することが前提です。
+
+**すべてのレベルで禁止**：
+- Hugging Face Hub への `push_to_hub`（アップロード）
+- 契約の `revision`（重み commit hash）を変更
+- `augmentation_config` を勝手に変更
+- 評価指標・目的関数・許容範囲を変更
+
+### 4 つの承認ゲート
+
+権限レベルによらず、以下の 4 操作は **Human 承認ゲート**を通過しないと実行できません。
+
+| ゲート | 対象 | Human が判断すること |
+|---|---|---|
+| **計算資源承認ゲート** | 学習ジョブ起動（GPU 時間・エネルギー） | ジョブが必要か、他ユーザーとの GPU 共有への影響 |
+| **重み変更承認ゲート** | 新 checkpoint 保存（別名） / 既存 checkpoint 上書き | 過去モデルの再現性を壊さないか |
+| **FM 更新承認ゲート** | `revision`（事前学習重みの commit hash）を新版に切り替え | 事前学習データ・ライセンスが変わっていないか（第4章 §4.7） |
+| **判断停止ゲート** | 予測不確かさが閾値超過時のエージェント動作 | 自律停止 → Human に判断を投げる（第8-9章） |
+
+### 権限マップの例（Skill 契約フィールド）
+
+```yaml
+agent_authorization:
+  level: L2  # L1 / L2 / L3
+  training_job_approval:
+    required: true
+    approver: "lab_admin@example.com"
+    approval_record_id: "APP-2026-0128-01"   # 事前承認済みレコード ID
+    approved_hp_range:
+      lr: [1e-5, 1e-4]
+      epochs: [3, 10]
+      batch_size: [16, 32]
+  checkpoint_overwrite_policy: "append_only"  # append_only / overwrite_with_approval
+  fm_update_gate:
+    required: true
+    approved_revisions:
+      - "3fa2b1c9..."
+  uncertainty_stop_gate:
+    metric: "predictive_entropy_normalized"
+    threshold: 0.3
+    on_exceed: "route_to_human"
+  # 安全ロードポリシー（ch03 §4.7-3.9 の予防条件を契約に組み込む）
+  weight_load_policy:
+    torch_load_weights_only: true            # torch.load(..., weights_only=True) 必須
+    require_safetensors: true                # safetensors_available=false のときブロック
+    require_weights_sha256_verified: true    # 取得後にハッシュ照合
+    revision_must_be_commit_hash: true       # branch/tag 名は拒否
+    trust_remote_code: false                 # HF pipeline() / from_pretrained() 共通
+```
+
+### vol-01 Ch6 との対応
+
+| vol-01 Ch6（データ整備の HITL） | vol-03 §5.7（深層 × Agentic） |
+|---|---|
+| 予防的原則 1：確認可能な変更 | L1-L3 すべてで provenance に変更履歴を記録 |
+| 予防的原則 2：可逆な変更 | checkpoint は `append_only` を原則、上書きは Human 承認 |
+| 予防的原則 3：スコープを絞る | Skill 契約の `approved_hp_range` で自律範囲を数値化 |
 
 > [!IMPORTANT]
-> **6→8 テンプレートへの拡張**：vol-01 第13章の 6 データ型（画像 / スペクトル / 回折 / 時系列 / 構造 / Tabular）を vol-03 では**UV-Vis と IR/Raman を分離**、**Multimodal を追加**して 8 テンプレートに拡張しています。§5.10 の対応表を参照。
->
-> **override 必須フィールド**：`orientation_semantics`（`isotropic` / `anisotropic_with_growth_direction` / `crystallographic`）、`causality_semantics`（`causal` / `time_symmetric`）、`symmetry_group`（結晶データの場合）。これらを埋めないと**デフォルト prior が誤動作**します。
+> **どのレベルを採用するかは研究室ごとに違います**。本書は L1-L3 の設計テンプレートを提供しますが、**まず L1 から始めて、Skill 実装と Human 検証の実績が積まれた後に L2 への昇格を検討する**ことを推奨します。実験計画自動化（L3）は、本書の scope の到達点であり、本番運用は次巻（vol-04 候補）で扱う可能性があります。
 
 ---
 
-## 5.6 装置間差を augmentation で消してよいか
+## 5.8 深層 × Agentic Skill の禁止事項（severity 付き）
 
-ARIM のような**複数装置**からのデータでは、augmentation を **「装置間差を消す道具」** として使いたくなる場面があります。これは**3 分岐で判断**します。
+vol-02 §5.5 の禁止事項に、深層 × Agentic 特有項目を追加します。
 
-### 3 分岐の判断ゲート
-
-| ケース | 判断 | 根拠 | 例 |
-|---|---|---|---|
-| **A. 消してよい** | augmentation で装置間差を吸収 | 差が**計測ノイズ・キャリブレーション差**の範囲内 | 装置 A/B で XRD 強度スケーリングが 0.9-1.1 倍のばらつき → `rescale_intensity=[0.9, 1.1]` で吸収 |
-| **B. 消してはいけない** | grouped CV で装置差を明示的に扱う | 差が**装置の応答関数・測定原理**に由来 | 装置 A は透過型、装置 B は反射型 → augmentation で消すと**評価データが装置 A/B 両方を含む場合に誤って高精度**に見える |
-| **B'. 部分的に消す（decompose）** | ノイズ・校正成分のみ augmentation、応答関数成分は grouped CV | 差が**混在（ノイズ + 応答関数）** | 校正差は `rescale_intensity` で吸収、応答関数差は grouped CV で扱う。各成分の**証拠 URI 必須** |
-| **C. Human 送り** | エージェントは判断せず flag | 差の性質が**判定不能** | 装置間差の物理的原因が特定できない → 契約に `flag_for_human_review` を書き、Human が A/B/B' を判定 |
-
-### 判断のロジックフロー
-
-```mermaid
-flowchart TD
-    START["装置間差を augmentation で消す提案"] --> Q1{"差の原因が特定できるか?"}
-    Q1 -- "No" --> C["C: Human 送り (flag)"]
-    Q1 -- "Yes" --> Q2{"差の性質は?"}
-    Q2 -- "計測ノイズ・キャリブレーション差" --> A["A: 消してよい"]
-    Q2 -- "装置の応答関数・測定原理" --> B["B: 消してはいけない (grouped CV)"]
-    Q2 -- "両方が混在" --> Q3{"成分分解の証拠があるか?"}
-    Q3 -- "Yes" --> BP["B': 部分的に消す (decompose)"]
-    Q3 -- "No" --> B
-```
-
-### なぜ「消してはいけない」ケースが多いか
-
-装置間差を augmentation で消すと、モデルは「装置間差は無視してよい」を学習します。しかし本番運用で**新しい装置**（学習時に見なかった装置）から来たデータに対しては、装置間差が**未知の分布シフト**として現れ、**信頼できない予測**を返します。
-
-**契約による予防（提案ゲート含む）**：
-
-```yaml
-# split_contract.yaml の grouped split と組み合わせる
-domain_shift_awareness:
-  cross_instrument_validation: true       # 装置別 CV で汎化性能を評価
-  augmentation_erases_instrument_diff: false  # 装置間差を消すか（デフォルト false）
-  instrument_diff_analysis_required: true # Skill 実行前に装置間差の性質を分析
-  diff_components:                        # B'（decompose）ケースの明示
-    - component: "calibration_gain"
-      evidence_source: "cross_instrument_calib_2026_01.csv"
-      approved_transform: "rescale_intensity"
-      human_review_required: false
-    - component: "detector_response_function"
-      evidence_source: "detector_spec_A_B.pdf"
-      approved_transform: null            # augmentation では消さない
-      human_review_required: true
-  # エージェントが「装置間差を消す」提案をした場合のハードゲート
-  instrument_diff_erasure_proposal:
-    default: "blocked"
-    requires_human_approval: true
-    approval_record_id: null              # 承認時に埋める
-    on_unapproved_attempt: "audit_violation"   # または "fatal"
-    attempt_log: "instrument_diff_erasure_attempts.log"
-```
-
----
-
-## 5.7 エージェントの augmentation 権限（Ch04 §4.7 の適用）
-
-第4章 §4.7 で定義した L1/L2/L3 を、augmentation に特化して具体化します。
-
-### L1/L2/L3 の augmentation 権限
-
-**重要な前提**（第4章 §4.7 と整合）：**L1 は本質的に「推論のみ」**です。したがって **L1 では学習時 augmentation は実行されません**。この節の表は、「学習ジョブが承認されて起動される場合」の各レベルでの augmentation 選択権限を示します。**学習ジョブの起動そのものは、必ず `training_job_approval` ゲート（第4章 §4.7）を通ります**。
-
-| 権限 | 学習実行可否 | augmentation でできること | 例 |
-|---|---|---|---|
-| **L1（推論のみ）** | 学習実行不可 | 推論時に augmentation なし。契約の検証・ログ確認のみ | 契約 YAML と実 provenance ログを照合、逸脱を検知 |
-| **L2（承認済み範囲内 fine-tune）** | 承認レコードに紐づく範囲で可 | `approved_augmentation_set` 内から選択可、`strength_range` 内で強度選択可 | `rescale_intensity` の `strength_range=[0.90, 1.10]` から `1.05` を選択 |
-| **L3（事前承認ワークフロー内自律）** | 承認ワークフロー内で可 | L2 + 契約内で augmentation の**組み合わせ**を選択可 | `rescale_intensity + additive_noise` の組み合わせを試す（**各 augmentation は契約範囲内**） |
-
-### 全レベル禁止
-
-以下は L1/L2/L3 すべてで禁止（第4章 §4.8 C 分類 audit violation または fatal）：
-
-| 禁止項目 | severity | 理由 |
+| 分類 | 項目 | severity |
 |---|---|---|
-| `augmentation_config` の`prohibited_augmentations` を追加せずに削除 | fatal | 物理妥当性違反の可能性 |
-| `strength_range` の上限を超える強度を選択 | audit violation | 循環設計問題の深層版 |
-| val/test への augmentation 適用 | fatal | データリーク |
-| 契約にない新 augmentation の追加 | audit violation | 事後追加は精度水増しのシグナル |
-| augmentation の適用ログを保存しない | audit violation | 事後の失敗解析が不能 |
+| A. データ流路（vol-01/02 継承） | 生データ上書き / 外部送信 | fatal |
+| A. データ流路（vol-01/02 継承） | データリーク（分割違反・特徴量に目的変数混入） | fatal |
+| A. データ流路（vol-03 追加） | **事前学習データと評価データの重複**（第3章 §3.6） | fatal |
+| A. データ流路（vol-03 追加） | augmentation を val / test に適用 | fatal |
+| B. 評価基準の後付け（vol-02 継承） | 評価指標・合格閾値の後付け変更 | audit violation |
+| B. 評価基準の後付け（vol-03 追加） | **calibration 閾値・不確かさ閾値の後付け緩和** | audit violation |
+| B. 評価基準の後付け（vol-03 追加） | 独立テストへの複数回アクセス（`test_access_log` を超過） | audit violation |
+| C. 権限違反（vol-03 新規） | 契約範囲外のハイパーパラメータで学習 | audit violation |
+| C. 権限違反（vol-03 新規） | `augmentation_config` を Skill 内で変更 | audit violation |
+| C. 権限違反（vol-03 新規） | 既存 checkpoint を Human 承認なしに上書き | fatal |
+| C. 権限違反（vol-03 新規） | Hub への `push_to_hub` を Skill 内で実行 | fatal |
+| C. 権限違反（vol-03 新規） | 契約の `revision` を Skill 内で書き換え | fatal |
+| D. 安全性（vol-03 新規） | `torch.load(..., weights_only=False)` を検証なしに実行 | fatal |
+| D. 安全性（vol-03 新規） | HF `pipeline()` を `trust_remote_code=True` で呼び出す | fatal |
+| E. 適用範囲（vol-02 継承 + 拡張） | domain gap 検知を無視して推論 / 装置固有性を無視して結果報告 | warning / flag / fatal（用途で選択） |
 
-### エージェントの意思決定ログ
+---
 
-エージェントが augmentation を選択した場合、以下を必ずログに残します（第4章 provenance Layer 3 の `augmentation_config` に加えて）：
+## 5.9 深層 × Agentic Skill 仕様書テンプレート（**成果物 1**）
+
+第6章以降のすべての深層 × Agentic Skill 設計で、以下のテンプレートを起点にします。vol-02 §5.7 のテンプレートを深層 × Agentic に拡張したものです。
+
+```markdown
+# Skill 仕様書（深層 × Agentic 版）：<Skill 名>
+
+## ① 目的
+- 何を予測/推定/分類するか、1 文で
+- どの判断に使うか（例：装置別分類・fine-tune 後の妥当性検証）
+- `task_type`：dl_regression / dl_classification / dl_segmentation / dl_uncertainty / fm_frozen_feature / fm_finetune
+- **エージェント役割**：この Skill でエージェントが判断すること・Human に投げること
+
+## ② 入力条件
+- **データ型**：spectrum / timeseries / image / pattern / tabular / multimodal
+- **特徴量スキーマ**：列名・単位・型・値域（vol-01 第8章）
+- **目的変数**：列名・単位・型・値域（教師ありの場合）
+- **サンプル数**：想定 n の最小・最大
+- **grouping key**（装置別・ロット別 CV 用、vol-02 第8章、および vol-03 第8章）
+- **事前学習重み仕様**：`weights_uri` / `revision`(commit hash) / `weights_sha256` / `weights_license` / `pretraining_data_license` / `safetensors_available`
+- **GPU 要件**：必要メモリ・fallback 可否
+
+## ③ 出力形式
+- **学習済みモデル**：`safetensors` を優先。`torch.save` を使う場合は state_dict / tensor-only 形式で保存し、**読み込み側は `torch.load(..., weights_only=True)` を必須**とする（`torch.save` 自体に `weights_only` オプションはない、第4章 §4.7）
+- **評価結果**：CV スコア（各 fold + 集計）+ **calibration 指標**（Brier/ECE）
+- **予測**：予測値 + 予測確率 + **不確かさ**（entropy / ensemble variance） + attribution（オプション）
+- **augmentation ログ**：何がどの epoch でどう適用されたか
+- **provenance**：付録 A 準拠、Layer 1-3 完全記録
+
+## ④ 成功条件（3 点セット + 深層追加）
+- **評価指標**：<task_type に応じて>
+- **目的関数**：<学習損失、label smoothing 有無>
+- **許容範囲**：<CV スコア閾値、fold ばらつき>
+- **calibration 閾値**：<ECE ≤ X、Brier ≤ Y>
+- **不確かさ閾値**：<正規化 predictive entropy（`H/log(K)`）≤ Z（エージェント自律停止条件）>
+- **GPU determinism tolerance**：<3 seed で std ≤ W>
+- **CPU smoke test**：<縮小データ・少エポックで loss 下降傾向>
+
+## ⑤ 禁止事項（§5.8 表を参照、Skill 固有項目を追記）
+
+## ⑥ 再現性条件
+- vol-01 継承：`input_sha256` / `skill_version` / `run_datetime_utc` / `package_versions` / `random_seed`
+- vol-02 継承：`cv_scheme` / `data_split` / `model_config` / `metric_definition`
+- **vol-03 Layer 1 (GPU)**：`gpu_backend.type` / `gpu_backend.cuda_version` / `gpu_backend.cudnn_version` / `gpu_backend.cudnn_deterministic` / `gpu_backend.cudnn_benchmark` / `gpu_backend.torch_deterministic_algorithms` / `gpu_backend.cublas_workspace_config` / `gpu_backend.gpu_memory_gb` / `gpu_backend.random_seed_per_worker`
+- **vol-03 Layer 2 (重み)**：`pretrained_weights.weights_uri` / `pretrained_weights.revision` / `pretrained_weights.weights_sha256` / `pretrained_weights.weights_license` / `pretrained_weights.pretraining_data_license` / `pretrained_weights.safetensors_available`
+- **vol-03 Layer 3 (学習/推論)**：`finetune_config` / `augmentation_config` / `tolerance` / `agent_authorization.checkpoint_overwrite_policy`
+
+## ⑦ Agentic 権限（§5.7）
+- `agent_authorization.level`：L1 / L2 / L3
+- `training_job_approval`：承認者・承認 ID・承認済み HP 範囲
+- `checkpoint_overwrite_policy`：append_only / overwrite_with_approval
+- `fm_update_gate`：approved_revisions リスト
+- `uncertainty_stop_gate`：閾値・on_exceed 挙動
+- `weight_load_policy`：`torch_load_weights_only` / `require_safetensors` / `require_weights_sha256_verified` / `revision_must_be_commit_hash` / `trust_remote_code`
+```
+
+---
+
+## 5.10 GPU / Agentic provenance スキーマ（**成果物 2**）
+
+§5.4 で示した 3 レイヤを、**Skill 実装が読み書きする YAML 形式**にまとめます。完全定義は付録 A、本節は概観のみ。
 
 ```yaml
-augmentation_decision_log:
-  - timestamp: "2026-02-01T10:00:00Z"
-    agent_level: L2
-    selected_augmentations:
-      - name: "rescale_intensity"
-        strength: 1.05          # strength_range=[0.90, 1.10] 内
-    reason: "val loss がプラトー、強度範囲上限側に少し寄せる"
-    approved_by_contract: true
-    contract_ref: "augmentation_contract.yaml#v1.0"
-    training_job_approval_id: "APP-2026-0201-01"
+# provenance.yaml（Skill 実行ごとに 1 ファイル生成）
+skill_version: "1.2.0"
+run_datetime_utc: "2026-01-28T14:32:11Z"
+input_sha256: "..."
+random_seed: 42
+
+# Layer 1: GPU バックエンド
+gpu_backend:
+  type: cuda      # cuda / rocm / mps / cpu
+  cuda_version: "12.1"
+  cudnn_version: "8.9"
+  cudnn_deterministic: true
+  cudnn_benchmark: false
+  torch_deterministic_algorithms: true
+  cublas_workspace_config: ":4096:8"
+  gpu_memory_gb: 24.0
+  random_seed_per_worker: [42, 43, 44, 45]
+
+# Layer 2: 事前学習重み
+pretrained_weights:
+  weights_uri: "huggingface.co/lbnlp/MatBERT-base"
+  revision: "3fa2b1c9..."  # commit hash 必須
+  weights_sha256: "d4c3b2..."
+  weights_license: "Apache-2.0"
+  pretraining_data_license: "unknown"
+  safetensors_available: true
+
+# Layer 3: 学習・推論の設定
+finetune_config:
+  lr: 3.0e-5
+  epochs: 5
+  batch_size: 32
+  freeze_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+  early_stopping:
+    monitor: "val_f1"
+    patience: 3
+    min_delta: 0.005
+
+augmentation_config:
+  train:
+    rotation: null            # 結晶方位を壊さない
+    flip: "horizontal_only"
+    intensity_jitter: 0.1
+  val_test:
+    rotation: null
+    flip: null
+    intensity_jitter: 0.0     # 契約：val/test には適用しない
+
+tolerance:
+  metric_std: 0.01
+  loss_variance: 0.02
+
+# Agentic 権限
+agent_authorization:
+  level: L2
+  checkpoint_overwrite_policy: "append_only"
+  training_job_approval:
+    required: true
+    approver: "lab_admin@example.com"
+    approval_record_id: "APP-2026-0128-01"
+    approved_hp_range:
+      lr: [1.0e-5, 1.0e-4]
+      epochs: [3, 10]
+      batch_size: [16, 32]
+  fm_update_gate:
+    required: true
+    approved_revisions:
+      - "3fa2b1c9..."
+  uncertainty_stop_gate:
+    metric: "predictive_entropy_normalized"
+    threshold: 0.3
+    on_exceed: "route_to_human"
+  weight_load_policy:
+    torch_load_weights_only: true
+    require_safetensors: true
+    require_weights_sha256_verified: true
+    revision_must_be_commit_hash: true
+    trust_remote_code: false
+
+# 評価結果
+evaluation:
+  cv_scheme: "grouped_5fold_by_instrument"
+  cv_scores:
+    f1_macro: {mean: 0.87, std: 0.03, per_fold: [0.85, 0.88, 0.90, 0.84, 0.88]}
+    ece: 0.04
+    brier: 0.12
+  test_access_log:
+    accessed_at: ["2026-01-28T15:10:00Z"]
+    access_count: 1
 ```
 
 ---
 
-## 5.8 ハンズオン概観：ARIM 風合成スペクトルの Augmentation Skill
+## 5.11 章末ワーク
 
-具体的な実装は第6章の 1D CNN Skill と統合しますが、この節では**契約と適用ログの雛形**のみを示します。
+第6章に進む前に、以下を書き下してください。**この設計工程を省略すると、第6章以降のハンズオンで「エージェントに何を許すか」の合意が取れなくなります**。
 
-### 想定するデータ
-
-- ARIM 風合成 IR スペクトル（波数 4000-400 cm⁻¹、5 装置分、各装置 200 サンプル、5 材料クラス）
-- 装置間差（**いずれも例示値；実運用では自装置の校正データから導出**）：`rescale_intensity ±10%`、`axis_shift ±2 cm⁻¹`、ノイズレベル差
-
-### 契約セット（この Skill が読み込む 2 ファイル）
-
-```
-skills/deep_split_contract/
-├── skill.yaml                  # Skill 仕様書（第4章 §4.9 テンプレート）
-├── split_contract.yaml         # §5.3 の分割契約
-└── augmentation_contract.yaml  # §5.5 の augmentation 契約
-
-skills/augmentation_contract/
-├── skill.yaml
-└── data_type_templates/       # 8 テンプレート（§5.5, §5.10）
-    ├── spectrum_ir_raman.yaml
-    ├── spectrum_uv_vis.yaml
-    ├── image_crystalline.yaml
-    ├── image_amorphous.yaml
-    ├── pattern_xrd.yaml
-    ├── timeseries.yaml
-    ├── tabular.yaml
-    └── structure.yaml
-```
-
-### CI CPU smoke test（第4章 §4.5 と連動）
-
-```yaml
-# ci_smoke_test.yaml
-data_subset:
-  n_samples: 20              # 各装置から 4 サンプル × 5 装置
-  n_classes: 3               # 5 クラス中 3 クラスのみ
-epochs: 2                    # フル学習 (30 epoch) の 15%
-augmentation:
-  applied: true              # augmentation ロジックが CI で動くか確認
-  reduced_strength: 0.5      # フル強度の 50%（時間短縮）
-expected:
-  loss_decrease: true        # 2 epoch で loss が下降傾向
-  no_nan_or_inf: true
-  augmentation_only_on_train: true  # 契約通り
-```
-
-**フル実装は第6章**で扱います。
-
----
-
-## 5.9 失敗パターンと改善版
-
-| 失敗パターン | 原因 | 改善版 |
-|---|---|---|
-| **精度が上がったので augmentation を強めたら、新装置で崩れた** | 装置間差を augmentation で消していた | 装置間差の性質を分析（§5.6）→ 消してはいけないケースなら grouped CV で扱う |
-| **train と test に同じ augmentation を適用してしまった** | データローダで applied_scope 分離不足 | `augmentation_contract.applied_scope.test: false` を契約で固定、Skill 起動時に assert |
-| **augmentation してから split したら、精度が異常に高くなった** | 順序違反（§5.4） | 契約に「[1] split → [2] augmentation」と明記、実装は split 済みインデックスに対して適用 |
-| **事前学習データとテストが重複していた** | `pretraining_data_overlap` を未チェック | §5.3 の contract で `check_method` を必須化、`unknown` の場合は `flag_and_document` |
-| **エージェントが `strength_range` を超えて augmentation を強めた** | `agent_permission` の enforcement 不足 | Skill 起動時に契約 vs 実効値を比較、範囲外なら実行前に停止（第4章 §4.8 audit violation） |
-| **同じ元サンプルの augmentation バリアントが train と val の両方に入った** | augmentation を split 前に適用 | augmentation を split 後の train のみに限定、val/test には元サンプルのみ |
-
----
-
-## 5.10 他データ型への転用（vol-01 第13章との対応）
-
-§5.5 の物理妥当性テーブルは、vol-01 第13章の 6 データ型テンプレートを **vol-03 で 8 テンプレートに拡張**したものです（UV-Vis と IR/Raman を分離、Multimodal を追加）。
-
-| vol-01 第13章のデータ型 | vol-03 第5章の契約テンプレート | 主な augmentation の判断ポイント |
-|---|---|---|
-| ① 画像（顕微鏡・SEM） | `image_crystalline.yaml` / `image_amorphous.yaml` | 結晶方位（`orientation_semantics`）で mirror / rotation の可否が変わる |
-| ② スペクトル（IR/Raman/UV-Vis） | `spectrum_ir_raman.yaml`（cm⁻¹） / `spectrum_uv_vis.yaml`（nm） | `axis_unit` が異なる → **同一テンプレートでは扱わない**（Critical fix） |
-| ③ 回折パターン（XRD） | `pattern_xrd.yaml` | rescale_intensity は OK、coordinate_reflection（2θ 反転）は fatal |
-| ④ 時系列（計測ログ） | `timeseries.yaml` | `causality_semantics: causal` なら coordinate_reflection fatal、`time_symmetric` なら override 可 |
-| ⑤ 分子・結晶構造 | `structure.yaml`（本書は骨格のみ、第12章 SSL で詳述） | 対称性群（`symmetry_group`）を尊重した augmentation のみ |
-| ⑥ Tabular（実験計画・組成） | `tabular.yaml` | 連続値のみ mixup、カテゴリカル列 permutation は禁止 |
-| — | `multimodal.yaml`（vol-03 新設） | modality 対応関係を崩す augmentation を禁止（§5.5 参照） |
-
-### applicability domain の判定
-
-vol-02 第7章 §7.10 で扱った applicability domain（AD）は、深層でも **契約フィールド**として残します：
-
-```yaml
-# augmentation_contract.yaml
-applicability_domain:
-  feature_range_check:
-    # axis_unit と対応した range キーを使う（Critical fix）
-    axis_unit: "cm^-1"
-    wavenumber_range_cm1: [400, 4000]     # IR の場合
-    # UV-Vis の場合は wavelength_range_nm: [200, 800] を使用
-    intensity_normalization: "unit_max"
-  # AD 外への対応（複数選択肢）
-  out_of_domain_action: "route_to_human"
-  # 選択肢: block_augmentation / predict_without_augmentation_with_warning /
-  #        route_to_human / reject_sample / request_calibration_data /
-  #        start_domain_adaptation_workflow
-```
-
-**AD 外の対応方針**（用途に応じて選択）：
-
-| action | 用途 |
-|---|---|
-| `block_augmentation` | AD 外サンプルに augmentation を適用しない（推論は継続） |
-| `predict_without_augmentation_with_warning` | augmentation なしで推論、警告フラグ付与 |
-| `route_to_human` | Human に判断を委ねる（デフォルト推奨） |
-| `reject_sample` | 予測を拒否（安全側運用） |
-| `request_calibration_data` | 追加校正データを要求 |
-| `start_domain_adaptation_workflow` | ドメイン適応パイプラインを起動（第7章参照） |
-
-**エージェントは AD 外のサンプルに勝手に augmentation を適用してはいけません**。AD 外に augmentation を適用すると、augmentation が「AD を広げた」と誤解される危険があります。
-
----
-
-## 5.11 章末チェックリスト・ワーク
-
-### チェックリスト
-
-- [ ] 深層版 anti-leakage split contract の 3 追加要件（事前学習データ重複・augmentation 適用範囲・multimodal leakage）を列挙できる
-- [ ] `pretraining_data_overlap.check_method` の 3 ケース（`identifier_hash_join` / `content_hash` / `unknown`）を使い分けられる
-- [ ] Augmentation contract の 3 要素（Applied scope / Physical validity / Agent permission）を YAML で書ける
-- [ ] 装置間差を augmentation で消す 3 分岐（消してよい / 消してはいけない / Human 送り）の判断基準を説明できる
-- [ ] L1/L2/L3 の augmentation 権限の差を具体例で説明できる
-- [ ] 全レベル禁止項目 5 つ（§5.7）を列挙できる
-- [ ] augmentation の順序違反（augmentation → split）が起こす漏洩を説明できる
-
-### ワーク
-
-自研究室で最頻に扱うデータ型（1 つ）を選び、以下を実施：
-
-1. §5.5 のデータ型別物理妥当性テーブルを、自装置の測定原理に照らして書き直す
-2. `allowed_augmentations` / `prohibited_augmentations` を **各 3 項目以上**で埋めた `augmentation_contract.yaml` を作成
-3. 装置間差の性質を分析し、§5.6 の 3 分岐（A/B/C）のどれに該当するかを判定
-4. 該当装置での `strength_range` を、装置校正データ（あれば）から決定
-5. L2 権限でエージェントに許す範囲を `approved_augmentation_set` として決定
+1. **自分の研究室での深層 × Agentic Skill を 1 つ想定**（例：「ARIM 風合成 SEM を装置別に分類する ViT frozen feature classifier」）
+2. **§5.9 テンプレートの①〜⑦ を埋める**——特に：
+   - ④ の calibration 閾値・不確かさ閾値
+   - ⑥ の Layer 1-3 provenance
+   - ⑦ の権限レベル（**まずは L1 から**）
+3. **§5.8 の禁止事項**から、自研究室で **fatal** に指定するもの 3 つを選ぶ（優先順位）
+4. **§5.7 の 4 つの承認ゲート**それぞれについて、**承認者・承認方法・記録場所**を書き下す
+5. **CI の smoke test 内容**（縮小データ・少エポック・許容 tolerance）を決める
 
 ---
 
 ## 5.12 本章のまとめ
 
-- 深層 × Agentic の**データ流路契約**は、vol-02 の anti-leakage split contract に、**augmentation 契約 + 事前学習データ重複 + multimodal leakage** の 3 拡張を加えたもの
-- **Augmentation contract の 3 要素**：Applied scope（train のみ）、Physical validity（データ型ごとの許可リスト）、Agent permission（L1/L2/L3 での選択範囲）
-- **装置間差の augmentation** は 3 分岐（消してよい / 消してはいけない / Human 送り）で判断。安易に消すと未知装置で崩壊
-- エージェントは augmentation の**種類追加・強度上限超え・val/test 適用**を絶対に許されない（第4章 §4.8 の C 分類・A 分類）
-- 契約は 2 ファイル（`split_contract.yaml` と `augmentation_contract.yaml`）に集約し、第6-13 章のハンズオンから参照する
-
-第6章では、この章の契約を実際に読み込んで動く**教師あり深層 Agentic Skill 3 種**（1D CNN / 2D CNN / Transformer 骨格）を実装します。
+- vol-03 の設計は **3 つの問い**——「何を成功とみなすか」「どの環境で再現するか」「**エージェントに何を許すか**」——を書き下すことから始まる
+- 成功条件の **3 点セット** に、**calibration 閾値・不確かさ閾値・GPU determinism tolerance** を追加
+- provenance を **3 レイヤ**（GPU バックエンド / 事前学習重み / 学習・推論設定）に整理
+- **循環設計問題の深層版**（augmentation 強度・エポック・LR の勝手な変更）を Skill 契約で防ぐ
+- **Agentic 学習権限設計（3 段階 L1-L3 + 4 承認ゲート）** が本章の中核。まず L1 から始める
+- 成果物 2 つ：**深層 × Agentic Skill 仕様書テンプレート**（§5.9）+ **GPU/Agentic provenance スキーマ**（§5.10）
+- 次章（第6章）から、**前処理 / Augmentation の Skill 化と Agentic 契約**——特に「augmentation を train のみで使い、エージェントが勝手に強度を変えない契約」の実装に入る
 
 ---
 
 ## 参考資料
 
-### 本書内
+### 本書内の該当章
+- 第2章 §2.3 Agentic 4 課題、§2.5 Foundation Model の 4 選択肢
+- 第3章 §3.5 GPU 非決定性と重み provenance、§3.6 fine-tune 特有のデータリーク
+- 第4章 §4.6 GPU バックエンドと CPU fallback、§4.7 HF Hub ハッシュ検証、§4.9 エージェント権限マップ
+- 第6章 augmentation 契約（次章）
+- 第8章 grouped CV と装置別 fine-tune 判断
+- 第8-9章 不確かさ推定と Agentic 停止ゲート
+- 付録 A GPU / 深層 / Agentic provenance スキーマ完全定義
 
-- **第4章 §4.7-4.10**：Agentic 学習権限設計（L1-L3）、Skill 仕様書テンプレート、provenance スキーマ
-- **第4章 §4.5**：CI CPU smoke test 設計
-- **第4章 §4.8**：禁止事項の severity 表（A/B/C/D/E）
-- **第2章 §2.6**：事前学習データと評価データの重複、fine-tune データリーク
-- **第3章 §3.7**：事前学習重みライセンス、`pretraining_data_license`
-- **第6章**：この章の契約を読み込む教師あり深層 Skill
-- **第14章**：augmentation の agent-side 強化による精度偽装事例
+### vol-01 / vol-02 参照
+- vol-01 第6章「Human-in-the-loop」、第8章「データ分析用 Skill の設計原則」、付録 A「Skill provenance の基本形」
+- vol-02 第5章「統計/ML Skill の設計原則」、§5.3 3 点セット、§5.4 循環設計問題（統計版）、§5.7 仕様書テンプレート
 
-### vol-02 / vol-01 参照
-
-- **vol-02 第4章**：anti-leakage split contract の基礎
-- **vol-02 第5章**：教師あり学習 Skill の共通構造、ハンズオン A/B/C
-- **vol-02 第7章 §7.5-7.10**：grouped CV / applicability domain
-- **vol-01 第13章**：6 データ型テンプレート（§5.10 との対応）
-- **vol-01 第6章**：Human-in-the-loop の予防的 3 原則（§5.6 の Human 送りに対応）
-
-### 外部資料
-
-- PyTorch DataLoader worker seeding — [https://pytorch.org/docs/stable/notes/randomness.html#dataloader](https://pytorch.org/docs/stable/notes/randomness.html#dataloader)
-- torchvision transforms（augmentation の物理妥当性を判断する参考リスト）— [https://pytorch.org/vision/stable/transforms.html](https://pytorch.org/vision/stable/transforms.html)
-- Materials Project データセット — [https://materialsproject.org/](https://materialsproject.org/)
-- Adebayo et al. (2018) "Sanity Checks for Saliency Maps" — attribution sanity check の原論文（第10章で本格対応）
+### 外部参考
+- PyTorch 決定性ガイド: https://pytorch.org/docs/stable/notes/randomness.html
+- PyTorch `torch.use_deterministic_algorithms`: https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
+- Hugging Face Hub Repositories & Licenses: https://huggingface.co/docs/hub/repositories-licenses
+- safetensors: https://huggingface.co/docs/safetensors
