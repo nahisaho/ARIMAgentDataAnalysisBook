@@ -137,6 +137,9 @@
 **Placebo test / プラセボ検定**
 : 実際には effect のない outcome / period で estimate が 0 になるか検証。→ Ch9 §9.6
 
+**partial_diagnostic_only**
+: refutation_gate の canonical `aggregate_status` の 1 つ。一部 required test が pass しない状況で、estimate を actionable として release せず **diagnostic 目的のみで開示** するモード。この状態の estimate は下流 downstream chain に含めてはならない（Ch4 fatal `release_actionable_estimate_under_partial_diagnostic_only`）。→ Ch9 §9.7.1
+
 **Random common cause refuter**
 : DAG に random noise variable を追加して estimate の robustness を検証。→ Ch9 §9.6
 

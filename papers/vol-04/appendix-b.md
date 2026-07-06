@@ -49,9 +49,12 @@ DAG は identification の根本。承認後の silent 差替え（Ch14 §14.3.1
 import hashlib, json
 from rfc8785 import canonicalize  # or python-jcs
 
-def compute_dag_sha256(dag_yaml_dict: dict) -> str:
-    """RFC 8785 canonicalization → SHA-256."""
-    canonical_bytes = canonicalize(dag_yaml_dict)
+def compute_canonical_sha256(payload: dict) -> str:
+    """
+    RFC 8785 canonicalization → SHA-256.
+    汎用（DAG / preregistration manifest / provenance など任意 dict に適用可）。
+    """
+    canonical_bytes = canonicalize(payload)
     return hashlib.sha256(canonical_bytes).hexdigest()
 
 def mcp_handler_verify_dag(request: dict) -> dict:
@@ -129,7 +132,7 @@ def mcp_handler_refutation_gate(request: dict) -> dict:
     
     # 2. preregistration manifest の immutability
     stored_preregistration = fetch_from_provenance(gate["preregistration_manifest_uri"])
-    if compute_dag_sha256(stored_preregistration) != gate["preregistration_manifest_sha256"]:
+    if compute_canonical_sha256(stored_preregistration) != gate["preregistration_manifest_sha256"]:
         return {
             "gate_status": "fail",
             "fatal": "Ch4.preregistration_manifest_post_hoc_modification",
@@ -144,7 +147,7 @@ def mcp_handler_refutation_gate(request: dict) -> dict:
         if status == "fail" or status == "insufficient_data":
             return {
                 "gate_status": "fail",
-                "fatal": "refutation_skip",
+                "fatal": "Ch9.refutation_skip",
                 "failing_test": test_name,
             }
         if status == "not_applicable":
@@ -153,7 +156,7 @@ def mcp_handler_refutation_gate(request: dict) -> dict:
             if test_name not in applicability["preregistered_not_applicable_tests"]:
                 return {
                     "gate_status": "fail",
-                    "fatal": "reclassify_failed_required_test_as_not_applicable_post_hoc",
+                    "fatal": "Ch9.reclassify_failed_required_test_as_not_applicable_post_hoc",
                 }
     
     # 4. estimator_provenance_reference の hash chain 検証（Ch4 §4.9 template ⑪）
@@ -161,7 +164,7 @@ def mcp_handler_refutation_gate(request: dict) -> dict:
     if not verify_hash_chain(est_ref):
         return {
             "gate_status": "fail",
-            "fatal": "estimator_contract_silent_change",
+            "fatal": "Ch13.estimator_contract_silent_change",
         }
     
     return {"gate_status": "pass", "aggregate_status": "pass"}
@@ -223,8 +226,10 @@ sequenceDiagram
 ```python
 def mcp_handler_variable_selection(request: dict) -> dict:
     """
-    L2 variable_selection_authorization: approved_covariates と実 estimator input の
-    symmetric difference が空でないと fatal (Ch14 §14.3.2 silent_confounder_removal_check)。
+    L2 variable_selection_authorization: approved_covariates と estimator input を比較。
+    2 種類の violation を区別（audit_manifest_v1 downstream で失敗モード分離のため）:
+      - actual - approved (extra covariates): Ch4 fatal
+      - approved - actual (silent removal):   Ch14 §14.3.2 silent_confounder_removal_check
     """
     approved = set(fetch_from_provenance(
         request["variable_selection_authorization_provenance_uri"]
@@ -232,12 +237,21 @@ def mcp_handler_variable_selection(request: dict) -> dict:
     
     actual = set(request["estimator_input_variables"])
     
-    diff = approved.symmetric_difference(actual)
-    if diff:
+    extra = actual - approved                             # 非承認 covariate の追加
+    missing = approved - actual                           # 承認済 covariate の silent 削除
+    
+    if missing:
+        return {
+            "gate_status": "fail",
+            "fatal": "Ch14.silent_confounder_removal_check",
+            "missing_covariates": sorted(missing),
+            "action": "fail_close",
+        }
+    if extra:
         return {
             "gate_status": "fail",
             "fatal": "Ch4.execute_estimator_without_variable_selection_authorization",
-            "symmetric_difference": list(diff),
+            "extra_covariates": sorted(extra),
             "action": "fail_close",
         }
     
@@ -264,7 +278,7 @@ def mcp_handler_intervention_execution(request: dict) -> dict:
     if not (approval["pi_signature"] and approval["facility_manager_signature"]):
         return {
             "gate_status": "fail",
-            "fatal": "unauthorized_intervention_execution",
+            "fatal": "Ch14.unauthorized_intervention_execution",
             "reason": "missing_dual_signature",
         }
     
@@ -300,28 +314,78 @@ def mcp_handler_l4_promotion(request: dict) -> dict:
     """
     L4 facility_standard_promotion: audit_manifest_v1 の 19 checks 全 pass が
     pre_condition（Ch14 §14.4）。
+    重複提出（同一 check_id 19 個）や status enum 汚染で通過するのを防ぐため、
+    canonical 19 check_id の完全一致を検証する。
     """
+    # Ch14 §14.4 canonical 19 check_ids（Ch15 §15.1.1 クイックリファレンス参照）
+    CANONICAL_19_CHECK_IDS = frozenset({
+        "dag_hash_verify", "adjustment_set_immutability",
+        "variable_selection_authorization_verify",
+        "estimator_provenance_hash_chain",
+        "refutation_gate_enum_version_verify",
+        "refutation_gate_declared_required_tests_verify",
+        "refutation_applicability_manifest_verify",
+        "intervention_authorization_dual_signature",
+        "intervention_temporal_ordering",
+        "egress_channels_declared_verify",
+        "evidence_chain_sha256_replay",
+        "assignment_log_seed_match",
+        "assignment_log_design_hash_match",
+        "assignment_log_permutation_reproducibility",
+        "assignment_log_execution_records_binding",
+        "prior_predictive_check_verify",
+        "prior_data_alignment_verify",
+        "counterfactual_scope_gate_history_verify",
+        "agent_action_log_append_only_verify",
+    })
+    ALLOWED_STATUSES = {"pass", "fail", "not_applicable"}
+    
     audit = fetch_from_provenance(request["audit_manifest_uri"])
+    checks = audit["checks"]
     
-    # 19 checks 全 pass 検証
-    pass_count = sum(1 for c in audit["checks"] if c["status"] == "pass")
-    fail_count = sum(1 for c in audit["checks"] if c["status"] == "fail")
-    na_count = sum(1 for c in audit["checks"] if c["status"] == "not_applicable")
-    total = pass_count + fail_count + na_count
-    
-    if total != 19:  # canonical total_checks_expected
+    # 1. check_id 完全一致（重複禁止、canonical セットと一致）
+    present = {c["check_id"] for c in checks}
+    if len(present) != len(checks):
         return {
             "gate_status": "fail",
             "fatal": "Ch14.claim_audit_pass_without_running_all_checks",
-            "total_checks_reported": total,
+            "reason": "duplicate_check_id_detected",
+        }
+    if present != CANONICAL_19_CHECK_IDS:
+        return {
+            "gate_status": "fail",
+            "fatal": "Ch14.claim_audit_pass_without_running_all_checks",
+            "missing": sorted(CANONICAL_19_CHECK_IDS - present),
+            "unexpected": sorted(present - CANONICAL_19_CHECK_IDS),
+        }
+    
+    # 2. status enum 汚染検出（unknown status を silent に drop しない）
+    for c in checks:
+        if c["status"] not in ALLOWED_STATUSES:
+            return {
+                "gate_status": "fail",
+                "fatal": "Ch14.claim_audit_pass_without_running_all_checks",
+                "reason": "non_canonical_status",
+                "check_id": c["check_id"],
+                "actual_status": c["status"],
+            }
+    
+    # 3. total_checks_expected == 19（Ch14 §14.4）
+    if len(checks) != 19:
+        return {
+            "gate_status": "fail",
+            "fatal": "Ch14.claim_audit_pass_without_running_all_checks",
+            "total_checks_reported": len(checks),
             "expected": 19,
         }
     
-    if fail_count > 0:
+    # 4. 一切の fail を許容しない
+    failing = [c["check_id"] for c in checks if c["status"] == "fail"]
+    if failing:
         return {
             "gate_status": "fail",
             "fatal": "Ch14.bypass_facility_standard_promotion_gate",
-            "failing_checks": [c["check_id"] for c in audit["checks"] if c["status"] == "fail"],
+            "failing_checks": failing,
         }
     
     return {"gate_status": "pass", "gate_level": "L4_facility_standard_promotion"}
@@ -444,11 +508,13 @@ def mcp_handler_assignment_log_4stage(request: dict) -> dict:
     
     # Stage 1: seed_match
     if log["actual_seed"] != preregistration["randomization_seed_pinned"]:
-        return {"stage": 1, "fail": "fatal_randomization_seed_mismatch"}
+        return {"gate_status": "fail", "stage": 1,
+                "fatal": "Ch10.randomization_seed_mismatch"}
     
     # Stage 2: design_hash_match
     if log["actual_design_sha256"] != preregistration["design_matrix_sha256"]:
-        return {"stage": 2, "fail": "fatal_design_matrix_altered_post_pin"}
+        return {"gate_status": "fail", "stage": 2,
+                "fatal": "Ch10.design_matrix_altered_post_pin"}
     
     # Stage 3: permutation_reproducibility（byte-exact replay）
     replayed = replay_permutation(
@@ -457,13 +523,15 @@ def mcp_handler_assignment_log_4stage(request: dict) -> dict:
         library_version=preregistration["permutation_library_version"],
     )
     if replayed.tobytes() != log["actual_assignment_bytes"]:
-        return {"stage": 3, "fail": "fatal_permutation_not_byte_exact"}
+        return {"gate_status": "fail", "stage": 3,
+                "fatal": "Ch10.permutation_not_byte_exact"}
     
     # Stage 4: execution_records_binding
     planned_order = log["planned_execution_order"]
     actual_order = log["actual_execution_order"]
     if planned_order != actual_order:
-        return {"stage": 4, "fail": "fatal_execution_records_unbound_to_assignment"}
+        return {"gate_status": "fail", "stage": 4,
+                "fatal": "Ch10.execution_records_unbound_to_assignment"}
     
     return {"gate_status": "pass", "all_four_stages": "pass"}
 
@@ -471,9 +539,10 @@ def mcp_handler_assignment_log_4stage(request: dict) -> dict:
 def replay_permutation(seed: int, library: str, library_version: str) -> np.ndarray:
     """
     Canonical library に応じて byte-exact な permutation を再生成。
-    numpy.random.Generator が canonical（Ch10 §10.5.3）。
+    canonical string は `numpy.random.default_rng`（Ch10 §10.5.3 SoT、appendix D §D.6）。
     """
-    assert library == "numpy.random.Generator", "Non-canonical library"
+    assert library == "numpy.random.default_rng", \
+        f"Non-canonical library: {library} (expected 'numpy.random.default_rng')"
     rng = np.random.default_rng(seed)
     return rng.permutation(...)  # implementation-specific
 ```
@@ -488,11 +557,14 @@ def replay_permutation(seed: int, library: str, library_version: str) -> np.ndar
 import dowhy
 
 # 1. Identification
+# 注：DoWhy の `graph=` 引数は GML/DOT 文字列 or ローカルファイルパスを想定。
+# `arim://` 等の URI を渡す前に、MCP handler で dereference して GML 文字列に変換すること。
+gml_graph = dereference_dag_uri_to_gml(dag_of_record_uri)   # canonical, Ch4 §4.4
 model = dowhy.CausalModel(
     data=df,
     treatment="T",
     outcome="Y",
-    graph=dag_of_record_uri,  # canonical, Ch4 §4.4
+    graph=gml_graph,
 )
 identified_estimand = model.identify_effect(
     proceed_when_unidentifiable=False,  # Ch4 §4.8 item 1 防止
@@ -640,34 +712,43 @@ iv = IV2SLS.from_formula(
 def fail_close_handler(fatal_name: str, context: dict) -> None:
     """
     canonical fatal 検知時の標準手順（Ch4 §4.6.4）：
-    1. Skill 実行を停止
-    2. estimate release を封じる
-    3. agent_action_log に fail event を append（immutable）
-    4. Human approver に notify
-    5. evidence_chain に fail event を組み込み（audit_manifest_v1 で検出可能に）
+    1. estimate release を封じる（output_class を diagnostic_only にダウングレード）
+    2. agent_action_log に fail event を append（immutable）
+    3. Human approver に notify
+    4. evidence_chain に fail event を組み込み（audit_manifest_v1 で検出可能に）
+    5. Skill 実行を停止（最後に raise。以下 4 手続きが必ず実行されるように順序を固定）
     """
-    # 1. Skill 停止
-    raise FatalError(fatal_name)
-    
-    # 2. release 封じ（output_class を diagnostic_only にダウングレード or 空）
+    # 1. release 封じ（output_class を diagnostic_only にダウングレード or 空）
     context["output"] = None
     context["output_class"] = "diagnostic_only"
     
-    # 3. agent_action_log 追記（append-only）
-    append_to_action_log({
-        "gate_id": context["gate_id"],
-        "attempt_result": "fail",
-        "fatal": fatal_name,
-        "timestamp": normalize_timestamp_to_iso8601_utc(datetime.now(timezone.utc)),
-        "suppressed": False,                              # bypass 検出
-    })
+    # 2. agent_action_log 追記（append-only）
+    try:
+        append_to_action_log({
+            "gate_id": context["gate_id"],
+            "attempt_result": "fail",
+            "fatal": fatal_name,
+            "timestamp": normalize_timestamp_to_iso8601_utc(datetime.now(timezone.utc)),
+            "suppressed": False,                          # bypass 検出
+        })
+    except Exception as log_err:
+        # ログ失敗自体を audit で拾えるよう、meta-fatal を保持しつつ後段の raise へ進む
+        context["_meta_fatal"] = f"Ch13.agent_action_log_append_failure: {log_err}"
     
-    # 4. Human notification
-    notify_approver(
-        approver=context.get("fallback_approver", "facility_causal_review_board"),
-        subject=f"FATAL: {fatal_name} in skill {context['skill_id']}",
-        evidence_uri=context["provenance_uri"],
-    )
+    # 3. Human notification（notify 失敗も raise を阻害しない）
+    try:
+        notify_approver(
+            approver=context.get("fallback_approver", "facility_causal_review_board"),
+            subject=f"FATAL: {fatal_name} in skill {context['skill_id']}",
+            evidence_uri=context["provenance_uri"],
+        )
+    except Exception:
+        pass                                              # 通知失敗は log 済み。raise は必ず実行。
+    
+    # 4. evidence_chain 側の後段処理は呼び出し側で追記（本 handler の責務外）
+    
+    # 5. 最後に例外を raise して Skill 実行を停止
+    raise FatalError(fatal_name)
 ```
 
 ---

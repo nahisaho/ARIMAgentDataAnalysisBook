@@ -85,14 +85,14 @@ skill:
     aggregate_policy: {pass_requires: all_four_pass}
     fallback: human_review
 
-  # === ⑥ 禁止事項（Ch4 §4.8 抜粋）===
+  # === ⑥ 禁止事項（Ch4 §4.8 抜粋。cross-chapter reference のため Ch{n}. prefix を付与）===
   prohibited_actions:
-    - silent_identification_switch: fatal
-    - unauthorized_dag_modification: fatal
-    - collider_adjustment_unauthorized: fatal
-    - refutation_skip: fatal
-    - execute_estimator_without_variable_selection_authorization: fatal
-    - positivity_violation_ignored: fatal
+    - Ch4.silent_identification_switch: fatal
+    - Ch4.unauthorized_dag_modification: fatal
+    - Ch5.collider_adjustment_unauthorized: fatal
+    - Ch9.refutation_skip: fatal
+    - Ch4.execute_estimator_without_variable_selection_authorization: fatal
+    - Ch7.positivity_violation_ignored: fatal
 
   # === ⑦ 再現性条件 ===
   library_stack:
@@ -186,9 +186,9 @@ skill:
     scope_gate_reverification: {status: pass, evidence_uri: ...}  # Ch8 CATE 必須
 
   prohibited_actions:
-    - use_meta_learner_covariate_not_in_approved_set: fatal
-    - ite_coverage_refutation_missing_when_ite_labeled_prediction: fatal
-    - silently_remove_covariate_from_approved_adjustment_set: fatal
+    - Ch8.use_meta_learner_covariate_not_in_approved_set: fatal
+    - Ch8.ite_coverage_refutation_missing_when_ite_labeled_prediction: fatal
+    - Ch14.silent_confounder_removal_check: fatal        # silently_remove_covariate_from_approved_adjustment_set
 ```
 
 ---
@@ -214,9 +214,9 @@ skill:
     library: linearmodels                             # linearmodels or dowhy
 
   prohibited_actions:
-    - shift_pre_post_window_after_seeing_result: fatal
-    - claim_did_without_parallel_trends_evidence: fatal
-    - use_post_treatment_covariate_in_did: fatal
+    - Ch7.shift_pre_post_window_after_seeing_result: fatal
+    - Ch7.claim_did_without_parallel_trends_evidence: fatal
+    - Ch7.use_post_treatment_covariate_in_did: fatal
 
   authorization_gates:
     variable_selection_authorization:
@@ -244,9 +244,9 @@ skill:
     library: linearmodels                             # or dowhy
 
   prohibited_actions:
-    - use_iv_with_first_stage_f_below_threshold: fatal
-    - claim_iv_without_exclusion_argument: fatal
-    - promote_iv_candidate_to_approved_without_review: fatal
+    - Ch7.use_iv_with_first_stage_f_below_threshold: fatal
+    - Ch7.claim_iv_without_exclusion_argument: fatal
+    - Ch7.promote_iv_candidate_to_approved_without_review: fatal
 ```
 
 ---
@@ -277,9 +277,9 @@ skill:
     library_used: causal-learn                        # or pgmpy | manual
 
   prohibited_actions:
-    - propose_cpdag_as_dag_without_orientation_procedure: fatal
-    - hide_undirected_edges_in_final_dag: fatal
-    - modify_dag_after_proposal_bundle_sha256_published: fatal
+    - Ch5.propose_cpdag_as_dag_without_orientation_procedure: fatal
+    - Ch5.hide_undirected_edges_in_final_dag: fatal
+    - Ch13.modify_dag_after_proposal_bundle_sha256_published: fatal
 ```
 
 ### A.4.2 `dag_approval_skill`（Human）
@@ -327,9 +327,9 @@ skill:
       - variable_role_change
 
   prohibited_actions:
-    - approve_dag_without_temporal_ordering_review: fatal
-    - approve_dag_with_undeclared_variables: fatal
-    - modify_approved_dag_after_downstream_start: fatal   # Ch13 §13.5
+    - Ch5.approve_dag_without_temporal_ordering_review: fatal
+    - Ch5.approve_dag_with_undeclared_variables: fatal
+    - Ch13.modify_approved_dag_after_downstream_start: fatal   # Ch13 §13.5
 ```
 
 ---
@@ -366,9 +366,9 @@ skill:
     aggregate_policy: {pass_requires: all_five_pass}
 
   prohibited_actions:
-    - report_counterfactual_outside_scope_gate: fatal
-    - modify_scm_after_counterfactual_query: fatal
-    - use_undeclared_exogenous_variables: fatal
+    - Ch13.report_counterfactual_outside_scope_gate: fatal
+    - Ch13.modify_scm_after_counterfactual_query: fatal
+    - Ch5.use_undeclared_exogenous_variables: fatal
 ```
 
 ### A.5.2 `gformula_skill`（Ch8 §8.4）
@@ -377,8 +377,8 @@ skill:
 skill:
   name: gformula_skill
   version: 0.1.0
-  estimand_type: ate_via_gformula
-  identification_strategy: g_formula
+  estimand_type: ate                                    # canonical enum (Ch7 §7.2)
+  identification_strategy: g_formula                    # method は identification_strategy が担う
 
   gformula_config:
     integration_distribution_uri: <artifact>           # P(X) の empirical or model-based
@@ -393,8 +393,8 @@ skill:
     e_value: {status: pass}
 
   prohibited_actions:
-    - swap_integration_distribution_after_estimation: fatal
-    - use_outcome_model_with_treatment_leakage: fatal
+    - Ch9.swap_integration_distribution_after_estimation: fatal
+    - Ch7.use_outcome_model_with_treatment_leakage: fatal
 ```
 
 ---
@@ -423,21 +423,21 @@ skill:
     assignment_log_header_uri: <artifact>              # Ch10 §10.5.3
     design_matrix_uri: <artifact>
     design_matrix_sha256: <sha256>
-    permutation_library: numpy.random.Generator
+    permutation_library: numpy.random.default_rng      # canonical string (Ch10 §10.5.3 SoT)
     permutation_library_version: numpy==1.26.4
     replay_policy: byte_exact                          # Ch10 §10.5.3 canonical
     information_gain_metric: d_efficiency
     information_gain_threshold: 0.85
 
   prohibited_actions:
-    - modify_factors_or_levels_after_design_freeze: fatal
-    - reduce_n_runs_after_partial_execution: fatal
-    - randomization_seed_override: fatal
-    - ignore_blocking_factor_in_analysis: fatal
-    - assignment_log_row_reorder_after_execution: fatal       # Ch10 §10.5.3
-    - execution_record_missing_design_matrix_sha256: fatal
-    - assignment_log_missing_header_record: fatal
-    - silent_deletion_of_failed_runs_without_design_matrix_recompute: fatal
+    - Ch10.modify_factors_or_levels_after_design_freeze: fatal
+    - Ch10.reduce_n_runs_after_partial_execution: fatal
+    - Ch10.randomization_seed_override: fatal
+    - Ch10.ignore_blocking_factor_in_analysis: fatal
+    - Ch10.assignment_log_row_reorder_after_execution: fatal       # Ch10 §10.5.3
+    - Ch10.execution_record_missing_design_matrix_sha256: fatal
+    - Ch10.assignment_log_missing_header_record: fatal
+    - Ch10.silent_deletion_of_failed_runs_without_design_matrix_recompute: fatal
 
   library_stack:
     design_generation: pyDOE2==1.3.0
@@ -467,9 +467,9 @@ skill:
       strict: true                                     # 外挿禁止
 
   prohibited_actions:
-    - report_optimum_outside_convex_hull_without_scope_gate_pass: fatal
-    - modify_scope_gate_threshold_without_calibration_evidence: fatal
-    - update_gp_alpha_after_publication_without_recalibration: fatal
+    - Ch11.report_optimum_outside_convex_hull_without_scope_gate_pass: fatal
+    - Ch11.modify_scope_gate_threshold_without_calibration_evidence: fatal
+    - Ch11.update_gp_alpha_after_publication_without_recalibration: fatal
 
   library_stack:
     surrogate: smt==2.4.0
@@ -501,11 +501,11 @@ skill:
     prior_data_alignment: {status: pass}               # canonical enum (§12.7.2 operational: prior_data_alignment_check)
 
   prohibited_actions:
-    - modify_prior_after_execution_started: fatal
-    - swap_prior_family_between_design_and_analysis: fatal
-    - modify_prior_after_alignment_check_failure: fatal
-    - report_posterior_action_without_alignment_pass: fatal
-    - use_improper_prior_without_documented_rationale: fatal
+    - Ch12.modify_prior_after_execution_started: fatal
+    - Ch12.swap_prior_family_between_design_and_analysis: fatal
+    - Ch12.modify_prior_after_alignment_check_failure: fatal
+    - Ch12.report_posterior_action_without_alignment_pass: fatal
+    - Ch12.use_improper_prior_without_documented_rationale: fatal
 
   library_stack:
     design_generation: pyDOE2==1.3.0
@@ -567,10 +567,10 @@ skill:
       not_applicable_requires_preregistered_applicability_manifest: true
 
   prohibited_actions:
-    - refutation_skip: fatal                            # Ch4 §4.8 item 5
-    - reclassify_failed_required_test_as_not_applicable_post_hoc: fatal
-    - preregistration_manifest_post_hoc_modification: fatal
-    - downgrade_declared_required_tests_enum_version_silently: fatal  # Ch14 §14.3.3
+    - Ch9.refutation_skip: fatal                            # Ch4 §4.8 item 5
+    - Ch9.reclassify_failed_required_test_as_not_applicable_post_hoc: fatal
+    - Ch4.preregistration_manifest_post_hoc_modification: fatal
+    - Ch14.downgrade_declared_required_tests_enum_version_silently: fatal  # Ch14 §14.3.3
 
   library_stack:
     refutation: dowhy==0.11.1
@@ -669,7 +669,10 @@ ate_estimation:
     R_low: {n_treated: 62, n_control: 41, min_ps: 0.18, max_ps: 0.79}
     R_mid: {n_treated: 25, n_control: 15, min_ps: 0.14, max_ps: 0.82}
     R_high: {n_treated: 5, n_control: 2, min_ps: 0.09, max_ps: 0.91}    # ⚠️ 少ない
-  positivity_check: {status: warning}                   # R_high stratum が薄い
+  positivity_check:
+    status: insufficient_data                            # canonical Ch9 status enum
+    reason: R_high_stratum_below_min_sample_size
+    evidence_uri: <artifact>
 ```
 
 ### A.8.6 Phase 5：Refutation（`refutation_skill`）
@@ -756,6 +759,54 @@ evidence_chain_sha256: 8b1d3c...                        # 17 fields → RFC 8785
 - [ ] Phase 6：`counterfactual_scope_gate` pass + L3 承認取得
 - [ ] evidence_chain_sha256（17 fields、RFC 8785）が再現可能に計算されている
 - [ ] 全 provenance URI が hash-verifiable
+
+### A.8.10 Phase 7（オプション）：L4 施設標準昇格
+
+介入実行後、当該 skill 構成を施設標準として再利用可能にする場合、`audit_manifest_v1`（Ch14 §14.4、19 checks）を実行して L4 gate を通過する必要がある：
+
+```yaml
+audit_manifest_v1:
+  audit_id: PRJ-042-audit-001
+  total_checks_expected: 19                              # canonical (Ch14 §14.4)
+  checks:
+    - {check_id: dag_hash_verify, status: pass}
+    - {check_id: adjustment_set_immutability, status: pass}
+    - {check_id: variable_selection_authorization_verify, status: pass}
+    - {check_id: estimator_provenance_hash_chain, status: pass}
+    - {check_id: refutation_gate_enum_version_verify, status: pass}
+    - {check_id: refutation_gate_declared_required_tests_verify, status: pass}
+    - {check_id: refutation_applicability_manifest_verify, status: not_applicable}
+    - {check_id: intervention_authorization_dual_signature, status: pass}
+    - {check_id: intervention_temporal_ordering, status: pass}
+    - {check_id: egress_channels_declared_verify, status: pass}
+    - {check_id: evidence_chain_sha256_replay, status: pass}
+    - {check_id: assignment_log_seed_match, status: not_applicable}   # 観測研究
+    - {check_id: assignment_log_design_hash_match, status: not_applicable}
+    - {check_id: assignment_log_permutation_reproducibility, status: not_applicable}
+    - {check_id: assignment_log_execution_records_binding, status: not_applicable}
+    - {check_id: prior_predictive_check_verify, status: not_applicable}
+    - {check_id: prior_data_alignment_verify, status: not_applicable}
+    - {check_id: counterfactual_scope_gate_history_verify, status: pass}
+    - {check_id: agent_action_log_append_only_verify, status: pass}
+
+l4_facility_standard_promotion:
+  gate_level: L4_facility_standard_promotion             # 完全形 (Ch4 §4.6.1)
+  approver: facility_causal_review_board
+  approval_timestamp: 2026-04-01T10:00:00Z
+  audit_manifest_uri: arim://provenance/audit/PRJ-042-audit-001.json
+  promoted_skill_registry_entry_uri: arim://registry/perovskite_annealing_ate_v0_1.yaml
+```
+
+L4 承認により当該 skill 構成が **施設標準テンプレート** として登録され、他プロジェクトからの reuse が可能になる（Ch15 §15.6 registry）。not_applicable は事前登録 applicability_manifest による pre-declared のみ許容される（Ch14 §14.3.3）。
+
+### A.8.11 Phase 7 チェックリスト
+
+- [ ] `audit_manifest_v1.total_checks_expected == 19`
+- [ ] 19 canonical check_id セットが完全に present（重複なし、canonical と一致）
+- [ ] `not_applicable` は applicability_manifest で事前宣言済み
+- [ ] `evidence_chain_sha256_replay` が stored hash と一致
+- [ ] `L4_facility_standard_promotion` が完全形で記載
+- [ ] Facility causal review board による署名を取得
 
 ---
 

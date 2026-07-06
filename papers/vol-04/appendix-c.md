@@ -84,8 +84,10 @@ if __name__ == "__main__":
     df = generate_c1_ate_dataset()
     df.to_csv("c1_ate_dataset.csv", index=False)
     print(f"Ground truth ATE: 2.0")
-    print(f"Naive difference: {df[df.T==1].Y.mean() - df[df.T==0].Y.mean():.3f}")
-    # naive difference は confounding で biased
+    # bracket accessor で 'T' 列を選択（df.T は pandas transpose なので注意）
+    naive_diff = df[df["T"] == 1]["Y"].mean() - df[df["T"] == 0]["Y"].mean()
+    print(f"Naive difference: {naive_diff:.3f}")
+    # naive difference は confounding で biased（期待値 ~4.2、adjust 後 ~2.0）
 ```
 
 **期待値**：naive difference は約 4.2、backdoor adjust 後は ~2.0 に収束（DoWhy / EconML どちらでも）。
@@ -212,7 +214,12 @@ def generate_c4_iv_dataset(n: int = 3000, seed: int = 42):
 Y = 5.0 + 2.0 * x1 + 3.0 * x2 - 1.5 * x1^2 - 1.0 * x2^2 + 0.8 * x1 * x2 + eps
 ```
 
-Ground truth optimum: `x1 ≈ 0.42, x2 ≈ 1.67`, `Y_max ≈ 8.5`
+Ground truth optimum（∇Y=0 の解析解）:
+
+- ∂Y/∂x1 = 2 − 3 x1 + 0.8 x2 = 0
+- ∂Y/∂x2 = 3 − 2 x2 + 0.8 x1 = 0
+
+連立を解いて **x1 ≈ 1.194, x2 ≈ 1.978, Y_max ≈ 9.16**。Skill / 応答曲面推定器の精度検証はこの値を基準にする（`test_c5_optimum_recovery` として §C.11 で pin）。
 
 ```python
 def generate_c5_doe_dataset(design: str = "ccd", seed: int = 42):
@@ -283,6 +290,10 @@ XRD-like 1D spectrum + covariate：
 
 ```python
 def generate_c7_spectrum_dataset(n: int = 200, n_points: int = 500, seed: int = 42):
+    """
+    Ground truth ATE(Y) ≈ 0.3 (treatment T が peak height を 30% 増強)。
+    位置 shift のみでは Y=max() は不変になるので、height も modulate する。
+    """
     rng = np.random.default_rng(seed)
     x_axis = np.linspace(10, 80, n_points)                # 2θ degrees
     
@@ -292,10 +303,13 @@ def generate_c7_spectrum_dataset(n: int = 200, n_points: int = 500, seed: int = 
         age_days = rng.integers(0, 365)
         # treatment: annealing (0/1)
         T = rng.binomial(1, 0.5)
-        # spectrum peak shift due to T
+        # spectrum: peak shift AND height modulation by T
         peak_center = 45.0 + 0.5 * T + 0.001 * age_days
-        spectrum = np.exp(-((x_axis - peak_center) ** 2) / 2) + rng.normal(0, 0.05, n_points)
-        # outcome: peak intensity
+        peak_amplitude = 1.0 + 0.3 * T                    # T の real causal effect on max
+        spectrum = (peak_amplitude
+                    * np.exp(-((x_axis - peak_center) ** 2) / 2)
+                    + rng.normal(0, 0.05, n_points))
+        # outcome: peak intensity (max) — T が amplitude を上げるため ATE ≈ 0.3
         Y = spectrum.max() + rng.normal(0, 0.01)
         rows.append({"id": i, "age_days": age_days, "T": T, "Y": Y,
                      "spectrum": spectrum.tolist(), "x_axis": x_axis.tolist()})
@@ -439,20 +453,56 @@ pre_review_manifest:
 
 ## C.11 全データセットの再現性検証
 
+**手順**：本付録の generator を単一 module（例：`c_generators.py`）に集約し、以下で hash を計算する。異なる環境で **同一 hash** が得られれば byte-exact determinism が保証されている。
+
 ```bash
 # 全 generator を実行し、hash 一致を確認
-python3 -c "
-from c1_generator import generate_c1_ate_dataset
+python3 <<'PY'
+from c_generators import (
+    generate_c1_ate_dataset, generate_c2_cate_dataset,
+    generate_c3_did_dataset, generate_c4_iv_dataset,
+    generate_c5_doe_dataset, generate_c6_bayesian_doe,
+    generate_c7_spectrum_dataset,
+)
 import hashlib
-df = generate_c1_ate_dataset(seed=42)
-h = hashlib.sha256(df.to_csv(index=False).encode()).hexdigest()
-print(f'C-1 hash: {h}')
-"
-# 期待値：異なる環境で同一 hash → 完全な determinism
+def h(df):
+    return hashlib.sha256(df.to_csv(index=False).encode()).hexdigest()[:12]
+print("C-1:", h(generate_c1_ate_dataset(seed=42)))
+print("C-2:", h(generate_c2_cate_dataset(seed=42)))
+print("C-5-ccd:", h(generate_c5_doe_dataset("ccd", seed=42)))
+PY
+```
+
+**pinned reference hashes**（canonical library versions を守れば env 間で不変。ズレたら env drift を疑う）：
+
+| Dataset | seed | First 12 chars of SHA-256 | Row count |
+|:---|---:|:---|---:|
+| C-1 (ATE) | 42 | pin at first run and record here | 2000 |
+| C-2 (CATE) | 42 | pin at first run and record here | 5000 |
+| C-3 (DiD) | 42 | pin at first run and record here | 10000 |
+| C-4 (IV) | 42 | pin at first run and record here | 3000 |
+| C-5 (CCD) | 42 | pin at first run and record here | 14 |
+
+**C-5 optimum recovery test**（B-3 対応）：
+
+```python
+def test_c5_optimum_recovery(tolerance: float = 0.05):
+    """Ground truth optimum: x1≈1.194, x2≈1.978, Y_max≈9.16."""
+    df = generate_c5_doe_dataset("ccd", seed=42)
+    # Fit quadratic + solve ∇Y=0
+    from smt.surrogate_models import KRG
+    gp = KRG(theta0=[1e-2, 1e-2], print_global=False)
+    gp.set_training_values(df[["x1","x2"]].values, df["y_obs"].values)
+    gp.train()
+    # grid search or scipy.optimize.minimize with -gp.predict
+    ...
+    assert abs(x1_hat - 1.194) < tolerance
+    assert abs(x2_hat - 1.978) < tolerance
+    assert abs(y_max_hat - 9.16) < 0.3
 ```
 
 **canonical library versions**（seed pinning 前提）：
-- `numpy >= 1.24, < 2.0`（Generator API 安定）
+- `numpy >= 1.24, < 2.0`（Generator API 安定、canonical string = `numpy.random.default_rng`）
 - `pandas >= 2.0`
 - `pyDOE2 >= 1.3`
 - `scipy >= 1.10`
