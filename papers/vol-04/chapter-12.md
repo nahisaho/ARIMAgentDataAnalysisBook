@@ -228,11 +228,13 @@ $$
 p(\theta \mid y) \approx \mathcal{N}(\hat{\theta}_{\text{MAP}}, \hat{H}^{-1})
 $$
 
-ここで $\hat{H}$ は事後負対数密度の Hessian。すると EIG は：
+ここで $\hat{H}(y, \mathcal{D})$ は候補設計 $\mathcal{D}$ と観測 $y$ の下での事後負対数密度の Hessian（**事後精度行列** = prior 精度 $\Sigma_0^{-1}$ + データ寄与）。この Laplace 近似の下で EIG は：
 
 $$
-\text{EIG}(\mathcal{D}) \approx \frac{1}{2} \mathbb{E}_{y}\!\left[\log\det \hat{H}(y, \mathcal{D}) - \log\det \Sigma_0^{-1}\right]
+\text{EIG}(\mathcal{D}) \approx \frac{1}{2} \mathbb{E}_{y \sim p(y \mid \mathcal{D})}\!\left[\log\det \hat{H}(y, \mathcal{D})\right] - \frac{1}{2} \log\det \Sigma_0^{-1}
 $$
+
+（第 2 項は $y$ に依存しないため期待値の外に出せる。第 1 項は非線形モデルでは $y$ に依存するため MC が必要）。
 
 > [!NOTE]
 > **線形 Gaussian の場合、$\hat{H}(y, \mathcal{D}) = X^\top X / \sigma^2 + \Sigma_0^{-1}$ は $y$ に依存しない**ため $\mathbb{E}_y[\cdot]$ は自明に消え、EIG は決定論的に計算できます（§12.9.3 実装参照）。この場合 `eig_estimation_contract.mc_variance_estimate = 0.0` を報告してください。**非線形の場合のみ MC が必要**で、§12.4.3 nested MC / §12.9.3 `eig_nested_mc` を使用します。

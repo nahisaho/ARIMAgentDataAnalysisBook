@@ -206,18 +206,25 @@ $$
 ```yaml
 experimental_design_provenance:
   design_type: fractional_factorial
-  fraction: "1/8"                                    # 2^(k-p) の 1/2^p
-  resolution: V                                       # III | IV | V | VI+
-  generator_string: "D=ABC; E=BCD; F=ACD; G=ABD"    # 定義生成子
-  defining_relation_uri: <string>                    # I = ABCD = ...（完全リスト）
+  fraction: "1/8"                                    # 2^(k-p) with p=3 → 1/8 fraction
+  resolution: IV                                      # III | IV | V | VI+ (この generator では IV)
+  # 2^(7-3) 設計: 4 base factors (A,B,C,D) + 3 generators (E,F,G) → 16 runs
+  # 定義生成子 (3 個、canonical Box-Hunter-Hunter style):
+  generator_string: "E=ABC; F=BCD; G=ACD"           # 3 generators for 2^(7-3), resolution IV
+  # defining relation: I = ABCE = BCDF = ACDG = ADEF = BDEG = ABFG = CEFG
+  # 最短ワード長 = 4 → resolution IV
+  defining_relation_uri: <string>                    # 完全 defining relation の artifact
   alias_structure_report_uri: <string>               # 各効果と alias の対応表
   alias_structure_sha256: <string>                   # design_freeze 時に凍結、以後 immutable
   alias_structure_frozen_at: <timestamp>
   alias_verification:                                # 機械検証契約（N-6）
     procedure: |
-      1. generator_string を parse → defining relation I = ABCD, ... を計算
+      1. generator_string を parse → defining relation (I = ABCE, BCDF, ...) を計算
       2. design_matrix から alias 類を経験的に列挙
       3. declared resolution == min(len(word) for word in defining_relation) を検証
+         (E=ABC → ABCE (length 4), F=BCD → BCDF (length 4), G=ACD → ACDG (length 4)
+          全積: ABCE·BCDF=ADEF (length 4), ABCE·ACDG=BDEG (length 4),
+                BCDF·ACDG=ABFG (length 4), ABCE·BCDF·ACDG=CEFG (length 4) → all length ≥ 4 → Res IV)
       4. interactions_assumed_negligible ⊇ {k-way : k >= resolution} を検証
     library: pyDOE2_alias_structure_from_generator    # or OApackage
     verification_report_uri: <string>
@@ -238,7 +245,7 @@ experimental_design_provenance:
   generation:
     library: pyDOE2                                  # or OApackage
     algorithm: fracfact
-    generator: "D=ABC; E=BCD; F=ACD; G=ABD"
+    generator: "E=ABC; F=BCD; G=ACD"                 # generator_string と同じ (immutability check)
     library_version: <string>
 prohibited_actions:
   - claim_effect_free_of_aliasing_without_higher_order_negligibility_assumption  # fatal
@@ -321,7 +328,7 @@ randomization_seed_provenance:
                                                      #  通常研究では os_urandom_at_design_time で十分。
                                                      #  概念的には notary_timestamped_at_design_time と等価）
   seed_generation_timestamp: <ISO8601>
-  seed_generator_library: python_secrets             # or numpy_default_rng | os_urandom
+  seed_generator_library: python_secrets             # or numpy.random.default_rng | os_urandom  (canonical)
   seed_generator_library_version: <string>
   seed_registration_uri: <string>                    # seed の事前登録先（immutable ledger）
 prohibited_actions:
@@ -335,7 +342,7 @@ prohibited_actions:
 assignment log は **file header（1 行目に `__header__` レコード）+ 各 run レコード** の JSONL 構造：
 
 ```jsonl
-{"__header__": {"design_matrix_uri": "artifact://designs/<name>.parquet", "design_matrix_sha256": "<hex>", "randomization_seed": 42, "randomization_algorithm": "fisher_yates", "algorithm_library": "numpy_default_rng==1.26.0", "log_frozen_at": "2026-07-06T14:20:00Z"}}
+{"__header__": {"design_matrix_uri": "artifact://designs/<name>.parquet", "design_matrix_sha256": "<hex>", "randomization_seed": 42, "randomization_algorithm": "fisher_yates", "algorithm_library": "numpy.random.default_rng", "algorithm_library_version": "numpy==1.26.0", "log_frozen_at": "2026-07-06T14:20:00Z"}}
 {"run_id": "R001", "design_matrix_row_index": 7, "unit_id": "sample_042", "assigned_cell": {"temperature": 500, "pressure": 5.0}, "assignment_timestamp": "2026-07-06T14:22:11Z", "randomization_seed": 42, "operator": "op_007", "block_id": "day_1_morning"}
 {"run_id": "R002", "design_matrix_row_index": 3, ...}
 ```
@@ -369,7 +376,7 @@ detection:
     procedure: |
       apply seeded fisher_yates(design_matrix_rows, seed) →
       expect the resulting order == assignment_log[*].design_matrix_row_index (as sequence)
-    library: numpy_default_rng | pyDOE2
+    library: numpy.random.default_rng | pyDOE2         # canonical string
     policy: byte_exact
   execution_records_binding:                         # 実行記録との bind
     each_execution_record_must_cite:
@@ -910,9 +917,10 @@ assignment_log = [
 ```python
 from pyDOE2 import fracfact
 
-# generator: D=ABC, E=BCD, F=ACD, G=ABD
-design = fracfact("a b c abc bcd acd abd")   # shape: (16, 7), coded as -1, +1
-# resolution IV
+# 2^(7-3): 4 base factors (a,b,c,d) + 3 generators (e=abc, f=bcd, g=acd)
+# defining relation: I = ABCE = BCDF = ACDG = ... (all words length ≥ 4 → Res IV)
+design = fracfact("a b c d abc bcd acd")   # shape: (16, 7), coded as -1, +1
+# resolution IV, 16 runs, 7 factors
 ```
 
 ### 10.9.3 Plackett-Burman（PB12）
@@ -968,12 +976,14 @@ design = lhs(n=3, samples=20, criterion='maximin')   # 3 factors, 20 points, max
 
 ### 演習 10.2：alias structure の解読
 
-$2^{7-3}$ resolution IV 設計で、generator を `D=AB, E=AC, F=BC, G=ABC` としたとき：
+$2^{7-4}$ resolution III 設計で、generator を `D=AB, E=AC, F=BC, G=ABC` としたとき（3 base factors A,B,C + 4 generators、8 runs）：
 
-1. defining relation を書き下せ（例：`I = ABD = ACE = ...`）
+1. defining relation を書き下せ（例：`I = ABD = ACE = BCF = ABCG = ...`）
 2. 主効果 A の aliases を列挙せよ
 3. 2-way interaction AB の aliases を列挙せよ
-4. resolution が実際に IV であることを確認せよ
+4. resolution が実際に III であることを確認せよ（最短ワード長）
+
+**参考**：本文 §10.3.2 の 2^(7-3) resolution IV 設計（generator `E=ABC; F=BCD; G=ACD`）と比較して、runs 数・resolution・alias 深刻度の trade-off を考察せよ。
 
 ### 演習 10.3：blocking factor の設計
 

@@ -239,7 +239,7 @@ uucs_config:
   robustness_value_uri: <string>                 # Cinelli-Hazlett robustness value
 refutation_pass:
   criterion: effect_estimate_remains_practically_significant_up_to_declared_strength
-  status: pass | fail
+  status: pass | fail | insufficient_data | not_applicable   # canonical enum (Ch9 §9.7.1)
 prohibited_actions:
   - use_absolute_strength_grid_without_scale_rationale  # fatal
   - benchmark_against_weakest_observed_confounder        # fatal（最強でベンチマーク）
@@ -360,7 +360,10 @@ scope_reverify_config:
 refutation_pass:
   criterion: (mode == "audit_recompute_same_artifacts") ? ch8_gate_status == ch9_gate_status AND both == "pass"
             : (mode == "data_update_recompute") ? ch9_gate_status == "pass" AND ecc_gate_status == "approved"
-  status: pass | fail | disagreement
+  status: pass | fail | insufficient_data | not_applicable   # canonical enum (§9.7.1)
+  disagreement_flag: true | false                            # audit vs Ch8 の一致不能を通知（status とは直交）
+  # policy: disagreement_flag=true でも status は必ず canonical 4 値のうち fail (audit mode) または
+  #         estimator_contract_change_gate 経由の再承認結果に紐付ける (data_update mode)
 prohibited_actions:
   - reuse_ch8_gate_status_without_independent_recomputation      # fatal
   - suppress_disagreement_by_recomputing_with_ch8_thresholds     # fatal

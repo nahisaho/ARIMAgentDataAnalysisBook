@@ -164,7 +164,7 @@ def mcp_handler_refutation_gate(request: dict) -> dict:
     if not verify_hash_chain(est_ref):
         return {
             "gate_status": "fail",
-            "fatal": "Ch13.estimator_contract_silent_change",
+            "fatal": "Ch4.estimator_contract_silent_change",
         }
     
     return {"gate_status": "pass", "aggregate_status": "pass"}
@@ -243,7 +243,7 @@ def mcp_handler_variable_selection(request: dict) -> dict:
     if missing:
         return {
             "gate_status": "fail",
-            "fatal": "Ch14.silent_confounder_removal_check",
+            "fatal": "Ch14.silently_remove_covariate_from_approved_adjustment_set",
             "missing_covariates": sorted(missing),
             "action": "fail_close",
         }
@@ -278,7 +278,7 @@ def mcp_handler_intervention_execution(request: dict) -> dict:
     if not (approval["pi_signature"] and approval["facility_manager_signature"]):
         return {
             "gate_status": "fail",
-            "fatal": "Ch14.unauthorized_intervention_execution",
+            "fatal": "Ch4.unauthorized_intervention_execution",
             "reason": "missing_dual_signature",
         }
     
@@ -317,26 +317,31 @@ def mcp_handler_l4_promotion(request: dict) -> dict:
     重複提出（同一 check_id 19 個）や status enum 汚染で通過するのを防ぐため、
     canonical 19 check_id の完全一致を検証する。
     """
-    # Ch14 §14.4 canonical 19 check_ids（Ch15 §15.1.1 クイックリファレンス参照）
+    # Ch14 §14.4 canonical 19 check_ids (SoT: chapter-14.md §14.4 detection_checks)
+    # causal_general(6) + doe_general(4) + agentic_specific(9) = 19
     CANONICAL_19_CHECK_IDS = frozenset({
-        "dag_hash_verify", "adjustment_set_immutability",
-        "variable_selection_authorization_verify",
-        "estimator_provenance_hash_chain",
-        "refutation_gate_enum_version_verify",
-        "refutation_gate_declared_required_tests_verify",
-        "refutation_applicability_manifest_verify",
-        "intervention_authorization_dual_signature",
-        "intervention_temporal_ordering",
-        "egress_channels_declared_verify",
-        "evidence_chain_sha256_replay",
-        "assignment_log_seed_match",
-        "assignment_log_design_hash_match",
-        "assignment_log_permutation_reproducibility",
-        "assignment_log_execution_records_binding",
-        "prior_predictive_check_verify",
-        "prior_data_alignment_verify",
-        "counterfactual_scope_gate_history_verify",
-        "agent_action_log_append_only_verify",
+        # causal_general (§14.1.1-§14.1.6)
+        "dag_misspecification_check",
+        "collider_bias_check",
+        "positivity_violation_check",
+        "unwarranted_extrapolation_check",
+        "cate_over_individualization_check",
+        "refutation_gate_skip_check",
+        # doe_general (§14.2.1-§14.2.4)
+        "randomization_integrity_check",
+        "blocking_design_integrity_check",
+        "response_surface_gp_extrapolation_check",
+        "taguchi_sn_ratio_interpretation_check",
+        # agentic_specific (§14.3.1-§14.3.9)
+        "silent_dag_modification_check",
+        "silent_confounder_removal_check",
+        "agentic_sensitivity_skip_check",
+        "silent_intervention_logging_check",
+        "seed_overwrite_check",
+        "unauthorized_broadcast_check",
+        "silent_facility_standard_inheritance_check",
+        "sequential_bayesian_prior_chain_break_check",
+        "transitive_evidence_chain_invalidation_check",
     })
     ALLOWED_STATUSES = {"pass", "fail", "not_applicable"}
     
@@ -506,17 +511,17 @@ def mcp_handler_assignment_log_4stage(request: dict) -> dict:
     log = request["assignment_log"]
     preregistration = fetch_from_provenance(request["preregistration_manifest_uri"])
     
-    # Stage 1: seed_match
+    # Stage 1: seed_match (Ch10 §10.5.3 canonical: randomization_seed_override)
     if log["actual_seed"] != preregistration["randomization_seed_pinned"]:
         return {"gate_status": "fail", "stage": 1,
-                "fatal": "Ch10.randomization_seed_mismatch"}
+                "fatal": "Ch10.randomization_seed_override"}
     
-    # Stage 2: design_hash_match
+    # Stage 2: design_hash_match (Ch10 §10.8 canonical: modify_design_matrix_after_randomization_seed_pinned)
     if log["actual_design_sha256"] != preregistration["design_matrix_sha256"]:
         return {"gate_status": "fail", "stage": 2,
-                "fatal": "Ch10.design_matrix_altered_post_pin"}
+                "fatal": "Ch10.modify_design_matrix_after_randomization_seed_pinned"}
     
-    # Stage 3: permutation_reproducibility（byte-exact replay）
+    # Stage 3: permutation_reproducibility (Ch10 §10.5.3 canonical: assignment_log_row_reorder_after_execution)
     replayed = replay_permutation(
         seed=log["actual_seed"],
         library=preregistration["permutation_library"],
@@ -524,14 +529,14 @@ def mcp_handler_assignment_log_4stage(request: dict) -> dict:
     )
     if replayed.tobytes() != log["actual_assignment_bytes"]:
         return {"gate_status": "fail", "stage": 3,
-                "fatal": "Ch10.permutation_not_byte_exact"}
+                "fatal": "Ch10.assignment_log_row_reorder_after_execution"}
     
-    # Stage 4: execution_records_binding
+    # Stage 4: execution_records_binding (Ch10 §10.5.3 canonical: execution_record_missing_design_matrix_sha256)
     planned_order = log["planned_execution_order"]
     actual_order = log["actual_execution_order"]
     if planned_order != actual_order:
         return {"gate_status": "fail", "stage": 4,
-                "fatal": "Ch10.execution_records_unbound_to_assignment"}
+                "fatal": "Ch10.execution_record_missing_design_matrix_sha256"}
     
     return {"gate_status": "pass", "all_four_stages": "pass"}
 

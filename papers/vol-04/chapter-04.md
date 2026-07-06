@@ -59,7 +59,7 @@ vol-01 第7章の Skill 設計 6 要素（**① 目的 / ② 入力条件 / ③ 
 - `confounders_declared` / `mediators_declared` / `colliders_declared`：変数役割の宣言リスト
 - `estimand_type`：**population target を指す canonical enum**（`ate | att | late | 2sls_linear | itt_single_unit | cate | ite_labeled_prediction | ate_trimmed | att_trimmed | ate_clipped_weight | att_clipped_weight | ate_via_gformula` 等、Ch6-8 で定義）。**mediation 分解軸は別フィールド `mediation_role`（total / direct / indirect / not_applicable）で分離**（両者は直交する意味軸——population target と mediator を通る経路の役割）
 - `mediation_role`：mediator を通る経路の役割。`total | direct | indirect | not_applicable`（mediation 分解を行わない場合は `not_applicable`）
-- `declared_required_tests`：refutation の 8 概念名 enum（`e_value | rosenbaum_bounds | placebo | random_common_cause | unobserved_common_cause_strength | data_subset_validation | scope_gate_reverification | ite_prediction_coverage_refutation`、第9章 §9.7）。旧名 `refutation_tests_required` は DoWhy Python API 名（`placebo_treatment_refuter` 等）に紐付いていたが、Ch9 で概念名ベースの enum に統一
+- `declared_required_tests`：refutation の 10 概念名 enum（`e_value | rosenbaum_bounds | placebo | random_common_cause | unobserved_common_cause_strength | data_subset_validation | scope_gate_reverification | ite_prediction_coverage_refutation | prior_predictive_check | prior_data_alignment`、第9章 §9.7、canonical enum_version `ch09_v0_3`）。旧名 `refutation_tests_required` は DoWhy Python API 名（`placebo_treatment_refuter` 等）に紐付いていたが、Ch9 で概念名ベースの enum に統一
 - `positivity_check`：assessed 段階の記録
 - `sutva_declared` / `consistency_declared` / `exchangeability_declared`：4 識別仮定の declared / assessed（第0章 §0.6）
 - `sensitivity_analysis`：E-value / Rosenbaum bounds の値と閾値
@@ -81,7 +81,7 @@ vol-02 第4章の「成功条件 3 点セット（統計的有意 / CV score / h
 | # | 成功条件 | 定義 | Skill 契約フィールド | 該当章 |
 |---|---|---|---|---|
 | 1 | **identification validity** | 与えられた DAG と変数役割で、目標 estimand が **identifiable** である | `identification_strategy` + `dag_of_record_sha256` + **戦略別 identifiability check**（backdoor/frontdoor は DoWhy、IV/DiD/RDD/SC は CausalPy/linearmodels 側の review artifact、pgmpy 直接推論は自作レポート）+ `identification_report_uri` | 第5-7章 |
-| 2 | **refutation pass** | 第9章 `refutation_gate` の 8 test セット（e_value / rosenbaum_bounds / placebo / random_common_cause / unobserved_common_cause_strength / data_subset_validation / scope_gate_reverification / ite_prediction_coverage_refutation）を、estimator 別 applicability manifest に基づいて **required 全て pass** する | `declared_required_tests` + `test_results` + `applicability_manifest_uri` | 第9章 |
+| 2 | **refutation pass** | 第9章 `refutation_gate` の 10 test セット（e_value / rosenbaum_bounds / placebo / random_common_cause / unobserved_common_cause_strength / data_subset_validation / scope_gate_reverification / ite_prediction_coverage_refutation / prior_predictive_check / prior_data_alignment、canonical enum_version `ch09_v0_3`）を、estimator 別 applicability manifest に基づいて **required 全て pass** する | `declared_required_tests` + `test_results` + `applicability_manifest_uri` | 第9章 |
 | 3 | **positivity check** | Treatment の割当が全 covariate strata で正の確率を持つ（連続 treatment では generalized propensity の common support） | `positivity_check` | 第2章 §2.4, 第6章 |
 | 4 | **external validity** | 反実仮想が学習分布の外挿にならない | `counterfactual_scope_gate` | §4.5, 第8-9章 |
 | 5 | **DoE efficiency**（DoE 章のみ） | 情報量あたりのコストが閾値内 | `information_gain_metric` + `information_gain_threshold`（§4.9 ⑫） | 第10-12章 |
@@ -425,9 +425,12 @@ Skill は以下を必須で実装します：
 sensitivity_analysis:
   method: e_value                          # or rosenbaum_bounds
   effect_scale: risk_ratio                 # or transformed_continuous with documented mapping
+  effect_direction: harmful                # harmful | protective — E-value CI-bound sidedness を決定 (§4.9 canonical)
+  ci_bound_closest_to_null: lower_bound    # harmful→lower_bound / protective→upper_bound + RR 反転 (Ch9 §9.2.3)
+  smd_to_rr_conversion: vanderweele_2020   # 連続 outcome では required (Ch9 §9.2.3)
   compute_for:
     - point_estimate                       # 点推定の E-value
-    - lower_confidence_bound               # 信頼区間下限の E-value（保守的頑健性の主指標）
+    - ci_bound_closest_to_null             # 有害効果は下限・保護効果は上限——effect_direction で自動選択（§4.9 canonical）
   threshold:
     minimum_e_value: 1.5                   # デフォルトは "弱頑健フラグ" 用の閾値のみ。研究室・領域で再校正必須
   provenance_field: sensitivity_report_uri  # 感度分析レポート artifact
@@ -438,7 +441,7 @@ sensitivity_analysis:
 
 **E-value と `declared_required_tests` の関係**：
 
-- `declared_required_tests` は **Ch9 の 8 test 概念 enum**——**別の側面の頑健性**（placebo、random common cause、data subset validation 等）
+- `declared_required_tests` は **Ch9 の 10 test 概念 enum**（ch09_v0_3）——**別の側面の頑健性**（placebo、random common cause、data subset validation 等、Bayesian DoE では prior_predictive_check / prior_data_alignment を含む）
 - `sensitivity_analysis`（E-value）は **unmeasured confounder に対する頑健性**
 - **両者は契約上は別ゲートとして扱う相補的チェック**（統計的に完全独立ではない——同じデータ・モデル・identification 仮定に依存する）——片方の pass は他方を代替しません。両方 pass しないと Skill は結果を "high confidence" として返しません
 
@@ -571,7 +574,7 @@ skill:
   # === ③ 出力形式 ===
   outputs:
     estimate: point_and_ci
-    test_results: dict                 # Ch9 refutation_gate の 8 test の結果
+    test_results: dict                 # Ch9 refutation_gate の 10 test の結果 (ch09_v0_3)
     sensitivity_analysis: dict
 
   # === ④ 成功条件（§4.3 の 6 点セット） ===
@@ -588,7 +591,7 @@ skill:
     report_uri: "artifact://identification/<name>.md"
 
   # --- refutation gate (Ch9 §9.7.1 が source of truth) ---
-  declared_required_tests:             # Ch9 の 8 test enum から estimator 別に選択
+  declared_required_tests:             # Ch9 の 10 test enum (ch09_v0_3) から estimator 別に選択
     - e_value
     - random_common_cause
     - placebo
@@ -792,7 +795,7 @@ skill:
 - [ ] ② `identification_strategy` + `dag_of_record_uri` + `adjustment_set_approval_uri` + `confounders_declared`
 - [ ] ② 識別仮定 4 つの status（`checked` は positivity のみ、`positivity_by_stratum` は §4.4.1 canonical shape）
 - [ ] ④ `success_criteria` の 6 項目（DoE 該当なしは `not_applicable`）
-- [ ] ④ `declared_required_tests`（Ch9 8 test enum から estimator 別に少なくとも 2 つ）+ `applicability_manifest_uri`
+- [ ] ④ `declared_required_tests`（Ch9 10 test enum ch09_v0_3 から estimator 別に少なくとも 2 つ）+ `applicability_manifest_uri`
 - [ ] ④ `sensitivity_analysis.threshold.minimum_e_value`（デフォルト 1.5 か、自研究室基準）+ `effect_direction` + `ci_bound_closest_to_null` + `smd_to_rr_conversion`（連続 outcome の場合）
 - [ ] ④ `counterfactual_scope_gate` の 4 判定（Mahalanobis cluster-conditional / 分散 / kNN / support envelope）と 3 状態（pass / conditional_pass / fail）
 - [ ] ⑥ `prohibited_actions` の Severity 付き列挙

@@ -183,7 +183,11 @@ iv_config:
   first_stage_f_stat: <float>                # 単純 F（参考値）
   kleibergen_paap_rk_wald_f: <float>          # robust/cluster 対応の弱操作変数 F
   montiel_olea_pflueger_effective_f: <float>  # 複数 IV / robust 環境
-  first_stage_f_threshold: 10                 # cluster/robust 環境では Kleibergen-Paap F に適用
+  first_stage_f_threshold: 10                 # Staiger-Stock (1997) 経験則、iid errors 前提。
+  # 注意 (Part II N-1)：F=10 は Stock-Yogo (2005) の閾値ではなく Staiger-Stock の rule of thumb。
+  # Stock-Yogo は 5% bias / 10% bias 等の tolerance と instrument 数に応じて表 lookup（e.g. 1 endog + 1 IV, 5% bias: F≥16.38）。
+  # cluster/robust 環境では kleibergen_paap_rk_wald_f に本閾値を適用し、複数 IV では
+  # montiel_olea_pflueger_effective_f を Stock-Yogo 5% bias 閾値 (~23.1 for single endog) と比較する。
   overid_test:
     method: sargan | hansen_j
     p_value_threshold: 0.10                  # 下回れば instrument invalidity 疑い

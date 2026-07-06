@@ -226,14 +226,15 @@ skill:
   dag_of_record_uri: "artifact://dags/ate_v1.dot"    # canonical 名（旧名 causal_graph_uri は Ch4 §4.4 で dag_of_record_uri に統一）
   dag_of_record_sha256: "abc123..."
   confounders_declared: [device_id, operator, batch_id]
-  estimand_type: total_effect
+  estimand_type: ate                                 # canonical population target (Ch4 §4.2 enum)
+  mediation_role: total                              # mediator 経路の役割 (Ch4 §4.2: total | direct | indirect | not_applicable)
   declared_required_tests:                           # canonical enum 名（旧名 refutation_tests_required は DoWhy Python API 名、Ch9 §9.7.1 で概念名ベースに統一）
     - placebo                                        # canonical enum
     - random_common_cause                            # canonical enum
     - data_subset_validation                         # canonical enum
   authorization_gates:
     dag_authorization:
-      required_for: [causal_graph_uri_change, identification_strategy_change]
+      required_for: [dag_of_record_uri_change, identification_strategy_change]   # Ch4 §4.4 canonical
       approver: research_lead
     variable_selection_authorization:
       required_for: [confounders_declared_change, design_parameter_change]
