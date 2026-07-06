@@ -51,49 +51,24 @@ $$
 
 **Skill 契約でこれを禁止する必要があります**（第3章 §3.5 の 5 逸脱に**多目的スカラー化の勝手変更**として第15章で追加）。
 
-### 9.2.2 契約要件
+### 9.2.2 契約要件（概要）
 
-```yaml
-objectives_spec:
-  version: "v0.2"
-  mode: "multi_objective"          # enum: single_objective | multi_objective
-  objectives:
-    - name: "hardness"
-      unit: "GPa"
-      direction: "maximize"
-      target_range: [8.0, 15.0]    # Human が事前に宣言する意味のある範囲
-    - name: "density"
-      unit: "g/cm^3"
-      direction: "minimize"
-      target_range: [2.5, 5.0]
-  scalarization:
-    allowed: false                 # 既定は禁止
-    method: null                   # enum: null | linear | tchebycheff | augmented_tchebycheff
-    weights: null                  # allowed=true のとき Human が明示的に設定
-    weights_change_policy: "immutable_within_run"  # enum: immutable_within_run | human_approved_switch
-```
+Skill 契約に以下を宣言（詳細スキーマは §9.4 で定義）：
+
+- `objectives_spec.mode = "multi_objective"`
+- `objectives_spec.scalarization.allowed`：既定 `false`（スカラー化禁止）
+- `objectives_spec.scalarization.method`：`null | linear | tchebycheff | augmented_tchebycheff`
+- `objectives_spec.reference.reference_point`：Human 承認付きで宣言
 
 **`scalarization.allowed: false` が既定**——エージェントが勝手にスカラー化すれば Skill fatal。
 
 ### 9.2.3 スカラー化を許可する場面
 
-- **明確な優先順位が Human から与えられ、事前承認された**ケース
+- **明確な優先順位が Human から与えられ、事前承認された**ケース（固定重み `linear`）
 - **凸 Pareto front で十分と分かっている** 単純ケース
-- **Human 承認付きの weights_change_event**（下記）
+- **qParEGO 戦略が Human 承認済み**（per-iteration に重みをランダムサンプル、§9.4.3 参照）
 
-Human が意図的に切り替える場合：
-
-```yaml
-weights_change_events:
-  - iteration: 5
-    from_weights: null
-    to_weights: [0.7, 0.3]         # hardness を優先
-    approver_id: "human:staff_id_XXXX"
-    changed_at: "2026-11-20T15:00:00Z"
-    reason: "顧客要求変更により硬度重視に転換"
-```
-
-append-only、Skill 自律での変更は fatal。
+いずれも `human_approved_strategy_id` を伴い、Skill 自律での変更は fatal（§9.4.4）。
 
 ---
 
@@ -104,10 +79,18 @@ append-only、Skill 自律での変更は fatal。
 $M$-目的関数値のセット $Y = \{\mathbf{y}_i\}$ に対して、**参照点** $\mathbf{r}$（Human が事前宣言）を使って（全目的を最大化に正規化した後）：
 
 $$
-\text{HV}(Y; \mathbf{r}) = \text{Volume}\!\left(\bigcup_{\mathbf{y} \in \text{Pareto}(Y)} [\mathbf{r}, \mathbf{y}]\right)
+\text{HV}(Y; \mathbf{r}) = \text{Volume}\!\left(\bigcup_{\mathbf{y} \in \text{Pareto}(Y),\ \mathbf{y} \succeq \mathbf{r}} [\mathbf{r}, \mathbf{y}]\right)
 $$
 
 —— Pareto front と参照点で囲まれた $M$-次元領域の体積。**Pareto front の "広さ" を測る**単一指標。
+
+> [!NOTE]
+> **参照点との関係**：$\mathbf{r}$ を全成分で dominate しない点（すなわちある成分で $y_j < r_j$）は hypervolume 寄与ゼロ。したがって参照点を過度に厳しく設定すると初期観測が全て寄与ゼロになり、qEHVI が縮退（勾配ゼロ）します。参照点は "実用最低ライン" とし、初期観測の少なくとも数点はこれを超えるように選ぶこと。
+
+> [!IMPORTANT]
+> **スケール依存性**：Hypervolume は各目的の単位に敏感（GPa と g/cm³ を混ぜると数値スケールの支配関係が生じる）。Skill 契約では以下のいずれかを明示：
+> (a) 生単位で運用し、Human が「単位選択も含めて hypervolume 意味を承認」と宣言、
+> (b) `objectives_spec.objectives[*].target_range` を使って affine 正規化した空間で hypervolume を計算（`hypervolume_scale: normalized_by_target_range`）。
 
 ### 9.3.2 qEHVI
 
@@ -130,40 +113,56 @@ qehvi_config:
   reference_point: [7.0, -6.0]      # 全 objective を maximize に正規化した後（density は minimize → -density）
   reference_point_rationale: |
     hardness 7.0 GPa 未満 / density 6.0 g/cm3 超は「実用不可」と Human が判断
-  partitioning: "non_dominated"     # BoTorch NondominatedPartitioning
+  partitioning: "non_dominated"     # BoTorch FastNondominatedPartitioning (qEHVI で使用)
+  hypervolume_scale: "raw_units"    # enum: raw_units | normalized_by_target_range
 ```
 
 > [!WARNING]
-> 参照点を後から緩めるのは **第3章 §3.5 逸脱 5（stop_condition 緩め）と同種の逸脱**——Skill fatal。参照点を厳しくする（Pareto front の要求を上げる）のも context 変更なので新 run 扱い。
+> **参照点の変更は run 中は fatal**。Human 承認付きの緩め (loosening) / 厳しく (tightening) はいずれも **新 run** として扱う。特に「観測を見た後で緩める」のは第3章 §3.5 逸脱 5（stop_condition 緩め）と同種の bias 源のため、policy で禁止するか比較不能とマークすること。
 
-### 9.3.4 BoTorch 実装
+### 9.3.4 BoTorch 実装 — qEHVI と qNEHVI
+
+多目的 EHVI には 2 種類あります。**physical 実験は観測ノイズがあるので通常 qNEHVI（`qLogNoisyExpectedHypervolumeImprovement`）を推奨**します。
+
+**(A) qLogEHVI — 観測が実質ノイズレス、posterior mean で Pareto front を評価する場合**：
 
 ```python
 import torch
 from botorch.acquisition.multi_objective.logei import (
-    qLogNoisyExpectedHypervolumeImprovement,
+    qLogExpectedHypervolumeImprovement,
 )
 from botorch.utils.multi_objective.box_decompositions.non_dominated import (
     FastNondominatedPartitioning,
 )
 from botorch.models import ModelListGP
 
-# model_list: 各目的関数に SingleTaskGP を fit した ModelList
 model = ModelListGP(*[gp_j for gp_j in per_objective_gps])
+ref_point = torch.tensor([7.0, -6.0])           # maximize-normalized
 
-# reference point (M,) — 全 objective を maximize に正規化した空間で
-ref_point = torch.tensor([7.0, -6.0])
-
-# Y_obs: (N, M) — 同じく maximize-normalized
+# Y_obs: (N, M) — maximize-normalized
 partitioning = FastNondominatedPartitioning(
     ref_point=ref_point,
     Y=Y_obs_maximize_normalized,
 )
 
+acq = qLogExpectedHypervolumeImprovement(
+    model=model,
+    ref_point=ref_point,
+    partitioning=partitioning,
+)
+```
+
+**(B) qLogNEHVI — ノイズあり観測、後述の noise-aware 定式（材料実験の既定推奨）**：
+
+```python
+from botorch.acquisition.multi_objective.logei import (
+    qLogNoisyExpectedHypervolumeImprovement,
+)
+
 acq = qLogNoisyExpectedHypervolumeImprovement(
     model=model,
     ref_point=ref_point,
-    X_baseline=X_obs,
+    X_baseline=X_obs,     # 観測入力（N, d）— partitioning は内部で MC 積分
     prune_baseline=True,
 )
 ```
@@ -171,16 +170,30 @@ acq = qLogNoisyExpectedHypervolumeImprovement(
 > [!NOTE]
 > **direction 正規化**：BoTorch 内部は全目的を最大化と仮定。`objectives_spec.direction: minimize` の目的は、outcome transform で $y_{\text{model}} = -y_{\text{raw}}$ に変換する（第7章 §7.1 の符号規約と同じ運用）。参照点も maximize-normalized 空間で宣言する。
 
+> [!IMPORTANT]
+> **qEHVI vs qNEHVI の選択**：
+> - **qLogEHVI**：観測ノイズがほぼ無い / 決定論的シミュレーション / posterior mean で Pareto を評価。`FastNondominatedPartitioning` を明示的に構築。
+> - **qLogNEHVI**：観測ノイズあり（物理実験）。`X_baseline` を渡すのみで、Pareto partitioning は MC 積分内で扱われる。**材料 BO の既定推奨**。
+
 ---
 
-## 9.4 objectives_spec の Skill 契約
+## 9.4 Skill 契約 — `objectives_spec` と `acquisition_spec` の役割分担
 
-第5章 §5.2 で導入した目的関数構造を **`objectives_spec` として拡張**（`kernel_spec` と同様、既存フィールドの内部拡張であり新規トップレベル追加ではない）：
+第5章 §5.2 で導入した目的関数構造を **`objectives_spec` として拡張**します（`kernel_spec` と同様、既存フィールドの内部拡張であり新規トップレベル追加ではない）。**acquisition の選択は Ch7 の `acquisition_spec` に集約**し、`objectives_spec` は目的関数の宣言に専念します。
+
+**役割分担**：
+
+| フィールド | 責務 | 例 |
+|---|---|---|
+| `objectives_spec` | 目的関数の宣言、direction、target_range、scalarization ポリシー、surrogate 紐付け、reference point | 何を最適化するか |
+| `acquisition_spec` | どの acquisition を使うか、hyperparameters（reference_point の参照） | どう最適化するか |
+
+### 9.4.1 objectives_spec
 
 ```yaml
 objectives_spec:
   version: "v0.2"
-  mode: "multi_objective"
+  mode: "multi_objective"            # enum: single_objective | multi_objective
   objectives:
     - name: "hardness"
       unit: "GPa"
@@ -193,12 +206,75 @@ objectives_spec:
       target_range: [2.5, 5.0]
       surrogate_ref: "gp_density"
   scalarization:
-    allowed: false
-  qehvi_config:
+    allowed: false                   # 既定は禁止（後述 §9.4.3 例外あり）
+  reference:
     reference_point: [7.0, -6.0]     # direction を全て maximize に正規化した後
-    reference_point_rationale: "..."
-    partitioning: "non_dominated"
+    reference_point_rationale: "hardness 7.0 未満 / density 6.0 超は実用不可"
+    hypervolume_scale: "raw_units"   # enum: raw_units | normalized_by_target_range
 ```
+
+### 9.4.2 acquisition_spec（Ch7 の 2 層構造を踏襲）
+
+```yaml
+acquisition_spec:
+  name: "qLogNEHVI"                  # canonical enum: qLogEHVI | qLogNEHVI | qParEGO | qNParEGO
+  implementation:
+    library: "botorch"
+    class: "qLogNoisyExpectedHypervolumeImprovement"
+    required_runtime_inputs:
+      - "model"
+      - "ref_point"                  # objectives_spec.reference.reference_point から参照
+      - "X_baseline"
+      - "prune_baseline"
+  hyperparameters:
+    prune_baseline: true
+    ref_point_source: "objectives_spec.reference.reference_point"  # 明示参照
+```
+
+> [!IMPORTANT]
+> `acquisition_spec.name` は Ch7 §7.4 の契約通り **immutable within run**。多目的でも同じ——iteration 途中で qLogNEHVI → qParEGO への切替は `acquisition_switch_events` に append し、Human 承認必須（Ch7 §7.4）。
+
+### 9.4.3 スカラー化を許可する場合 (qParEGO / qNParEGO)
+
+`scalarization.allowed: true` の場合、**weight sampling 戦略まで契約に含める**必要があります（Skill が per-iteration に勝手な重みを引かないため）：
+
+```yaml
+scalarization:
+  allowed: true
+  method: "augmented_tchebycheff"    # enum: linear | tchebycheff | augmented_tchebycheff
+  strategy: "qParEGO_random_per_iteration"
+  weight_sampling:
+    distribution: "simplex_uniform"  # 単体上一様
+    seed: 20261120
+    deterministic_rule: "hash(seed || iteration_index)"
+  human_approved_strategy_id: "approval:HITL-YYYYMMDD-XXXX"
+```
+
+**運用ルール**：
+- 重みは `deterministic_rule` から再現可能に生成、iteration ごとの実効重みは Group C の provenance（`effective_scalarization_weights`）に記録
+- `human_approved_strategy_id` は「qParEGO 戦略そのもの」に対する承認 ID。個別 iteration 承認は不要（戦略承認で covered）
+- `weight_sampling.seed` の変更は fatal（第5章 `sequential_seed_provenance` と同種契約）
+
+### 9.4.4 スカラー化変更イベントのスキーマ
+
+固定重み方式（`method: linear`）で Human が重みを切り替える場合、または戦略自体を切り替える場合：
+
+```yaml
+weights_change_events:
+  - event_id: "evt-mo-20261120-001"
+    effective_from_iteration: 5
+    from_method: "linear"
+    to_method: "linear"
+    from_weights: [0.5, 0.5]
+    to_weights: [0.7, 0.3]
+    approval_id: "approval:HITL-20261120-A17"
+    approval_scope: "weights_only"      # enum: weights_only | method_change | strategy_change
+    changed_at: "2026-11-20T15:00:00Z"
+    reason: "顧客要求変更により硬度重視に転換"
+    previous_event_hash: "sha256:abc123..."
+```
+
+append-only、Skill 自律での変更は fatal。`previous_event_hash` で改ざん検知。
 
 **目的関数間の相関**：本章では **各目的関数に独立 GP**（`ModelListGP`）を割り当てる。相関を surrogate で扱う場合は **第11章の multi-task GP** を使う。
 
@@ -245,7 +321,7 @@ ARIM 材料開発で頻出：**軽量高硬度材料**の開発。硬度 $\uparr
 - **BoTorch**：`qLogNoisyExpectedImprovement` + `GenericMCObjective`（Chebyshev） の組み合わせ
 
 > [!IMPORTANT]
-> qParEGO の重みは **iteration ごとにランダム再サンプリング**される（Pareto front を broad にカバーする戦術）。これは §9.2 の「勝手にスカラー化しない」契約と一見矛盾するように見えますが、**「Human が qParEGO 全体戦略を承認済み」**であれば、内部の per-iteration 重みサンプリングは Skill 挙動として合法。ただし `qparego_weight_seed`（重みサンプリングの seed）を provenance に記録し、再現可能にする。
+> qParEGO の重みは **iteration ごとにランダム再サンプリング**される（Pareto front を broad にカバーする戦術）。これは §9.2 の「勝手にスカラー化しない」契約と一見矛盾するように見えますが、**§9.4.3 のスキーマ**（`strategy: qParEGO_random_per_iteration` + `human_approved_strategy_id` + `weight_sampling.seed`）で「Human が qParEGO 全体戦略を承認済み」を宣言していれば、内部の per-iteration 重みサンプリングは Skill 挙動として合法。実効重みは Group C provenance `effective_scalarization_weights` に記録し、`weight_sampling.seed + iteration_index` から再現可能にする。
 
 ---
 
@@ -254,12 +330,15 @@ ARIM 材料開発で頻出：**軽量高硬度材料**の開発。硬度 $\uparr
 - [ ] `objectives_spec.mode` が `multi_objective` に設定されている
 - [ ] 各 objective に `direction` / `unit` / `target_range` が明示されている
 - [ ] `scalarization.allowed` が明示的（既定 false）
-- [ ] `qehvi_config.reference_point` が Human 承認付きで宣言されている
+- [ ] `objectives_spec.reference.reference_point` が Human 承認付きで宣言されている
 - [ ] `reference_point_rationale` が書かれている
+- [ ] `hypervolume_scale` が明示（`raw_units` または `normalized_by_target_range`）
 - [ ] 各目的関数に個別 surrogate（`surrogate_ref`）が紐付いている
+- [ ] `acquisition_spec.name` が canonical enum（qLogEHVI / qLogNEHVI / qParEGO / qNParEGO）
+- [ ] `acquisition_spec.hyperparameters.ref_point_source` が `objectives_spec.reference.reference_point` を参照
 - [ ] Skill 実行中に scalarization / reference_point を暗黙変更する経路が塞がれている
-- [ ] `weights_change_events`（許可時）が append-only、Human 承認付き
-- [ ] qParEGO 使用時、`qparego_weight_seed` が provenance に記録される
+- [ ] `weights_change_events`（許可時）が append-only、`previous_event_hash` で改ざん検知、`approval_id` 付き
+- [ ] qParEGO 使用時、`weight_sampling.seed` および `effective_scalarization_weights` が provenance に記録される
 
 ---
 
