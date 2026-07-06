@@ -73,7 +73,9 @@ pending_experiments:
   entries:
     - experiment_id: "exp-2026-1122-A01"
       facility_id: "facility_A"
-      x: {x_temperature: 550.0, x_pressure: 2.3, ...}
+      x:
+        x_temperature: 550.0
+        x_pressure: 2.3
       submitted_at: "2026-11-22T09:00:00Z"
       status: "in_progress"                    # enum: in_progress | completed | cancelled | failed
       expected_completion: "2026-11-22T15:00:00Z"
@@ -81,9 +83,14 @@ pending_experiments:
       authorization_id: "approval:HITL-20261122-A01"
     - experiment_id: "exp-2026-1122-A02"
       facility_id: "facility_B"
-      x: {...}
+      x:
+        x_temperature: 620.0
+        x_pressure: 3.1
+      submitted_at: "2026-11-22T09:15:00Z"
       status: "in_progress"
-      ...
+      expected_completion: "2026-11-22T16:00:00Z"
+      fantasized_y: null
+      authorization_id: "approval:HITL-20261122-A02"
   fantasize_policy:
     method: "posterior_mean"                   # enum: posterior_mean | posterior_sample | fixed_value
     num_samples: 128                            # posterior_sample の場合の MC サンプル数
