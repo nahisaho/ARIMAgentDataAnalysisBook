@@ -11,11 +11,11 @@ AI Agent と MCP（Model Context Protocol）を用いて、実験データの分
 | 巻 | タイトル | 主テーマ | 状態 |
 |---|---|---|---|
 | **vol-01** | [AI エージェント時代のデータ分析入門](papers/vol-01/index.md) | Skill / MCP / Human-in-the-loop の基礎、6 データ型による装置横断 | ✅ 本編 15/15 章完了 |
-| **vol-02** | [AI エージェント時代の統計・機械学習分析入門](papers/vol-02/chapter-outline.md) | Scikit-learn × PyMC、CV・不確かさ・階層モデル | ✅ 本編 16/16 章完了 |
-| **vol-03** | [AI エージェント時代の深層学習分析入門](papers/vol-03/chapter-outline.md) | PyTorch / JAX / Hugging Face、Foundation Model、fine-tune の Agentic 承認 | ✅ 本編 16/16 章完了 |
-| **vol-04** | [AI エージェント時代の因果推論・実験計画入門](papers/vol-04/chapter-outline.md) | DAG・介入効果・DoE、"なぜ" と "もし" の Skill 化 | 🚧 執筆中（7/16 章） |
-| **vol-05** | [AI エージェント時代のベイズ最適化・逐次実験計画入門](papers/vol-05/chapter-outline.md) | GP surrogate・acquisition・多目的/制約付き BO・Active Learning | 📋 章構成のみ |
-| **vol-06** | [AI エージェント時代の生成モデル・材料逆設計入門](papers/vol-06/chapter-outline.md) | VAE / Diffusion / Flow、物理制約・分布的妥当性・逆設計 | 📋 章構成のみ |
+| **vol-02** | [AI エージェント時代の統計・機械学習分析入門](papers/vol-02/index.md) | Scikit-learn × PyMC、CV・不確かさ・階層モデル | ✅ 本編 16/16 章完了 |
+| **vol-03** | [AI エージェント時代の深層学習分析入門](papers/vol-03/index.md) | PyTorch / JAX / Hugging Face、Foundation Model、fine-tune の Agentic 承認 | ✅ 本編 16/16 章完了 |
+| **vol-04** | [AI エージェント時代の因果推論・実験計画入門](papers/vol-04/index.md) | DAG・介入効果・DoE、"なぜ" と "もし" の Skill 化 | ✅ 本編 16/16 章完了 |
+| **vol-05** | [AI エージェント時代のベイズ最適化・逐次実験計画入門](papers/vol-05/index.md) | GP surrogate・acquisition・多目的/制約付き BO・Active Learning | ✅ 本編 16/16 章完了 |
+| **vol-06** | [AI エージェント時代の生成モデル・材料逆設計入門](papers/vol-06/chapter-outline.md) | VAE / Diffusion / Flow、物理制約・分布的妥当性・逆設計 | 🚧 執筆中（5/16 章：第I部 + 第II部の 2 章） |
 
 > [!NOTE]
 > シリーズ全体を通じて、多様な装置カテゴリを **6 つのデータ型**（スペクトル型／クロマトグラム・時系列型／画像・顕微鏡型／回折・散乱パターン型／表形式・プロセス条件型／マルチモーダル統合型）に抽象化して扱います。1 つの型で Skill を作れれば、同じ型の他装置へ骨格を転用できます。
@@ -55,7 +55,7 @@ vol-01 の Skill に **統計/ML の厚みと不確かさ** を積む。**Scikit
 - **第IV部** PyMC で不確かさを扱う（第10〜13章：概念／PyMC 入門／階層モデル／MCMC 実務）
 - **第V部** 総合・運用・失敗（第14〜16章：capstone／失敗パターン／組織展開）
 
-➡︎ [vol-02 章構成計画](papers/vol-02/chapter-outline.md)
+➡︎ [vol-02 全 16 章の詳細目次](papers/vol-02/index.md) ｜ [vol-02 章構成計画](papers/vol-02/chapter-outline.md)
 
 ### vol-03　深層学習分析入門（全 16 章）
 
@@ -68,7 +68,7 @@ vol-01 の Skill に **統計/ML の厚みと不確かさ** を積む。**Scikit
 - **第IV部** Foundation Model と表現学習（第12〜14章）
 - **第V部** 運用・失敗・展望（第15〜16章）
 
-➡︎ [vol-03 章構成計画](papers/vol-03/chapter-outline.md)
+➡︎ [vol-03 全 16 章の詳細目次](papers/vol-03/index.md) ｜ [vol-03 章構成計画](papers/vol-03/chapter-outline.md)
 
 ### vol-04　因果推論・実験計画入門（第0章 + 本編 15 章）
 
@@ -81,7 +81,7 @@ vol-01 の Skill に **統計/ML の厚みと不確かさ** を積む。**Scikit
 - **第IV部** 実験計画の Skill 化（第10〜12章：Full/Fractional factorial ／応答曲面・タグチ ／Bayesian DoE）
 - **第V部** 総合・失敗・運用（第13〜15章：観測→DoE→反実仮想 capstone ／失敗パターン／責任分担）
 
-➡︎ [vol-04 章構成計画](papers/vol-04/chapter-outline.md)
+➡︎ [vol-04 全 16 章の詳細目次](papers/vol-04/index.md) ｜ [vol-04 章構成計画](papers/vol-04/chapter-outline.md)
 
 ### vol-05　ベイズ最適化・逐次実験計画入門（全 16 章）
 
@@ -93,7 +93,7 @@ vol-01 の Skill に **統計/ML の厚みと不確かさ** を積む。**Scikit
 - **第III部** 多目的・制約付き・階層 BO（第9〜12章：qEHVI ／制約付き・safe BO ／階層 GP ／batch BO）
 - **第IV部** 総合ハンズオンと運用（第13〜16章：Active Learning ／因果 × 階層 × 承認 capstone ／失敗パターン／実験リソース割当）
 
-➡︎ [vol-05 章構成計画](papers/vol-05/chapter-outline.md)
+➡︎ [vol-05 全 16 章の詳細目次](papers/vol-05/index.md) ｜ [vol-05 章構成計画](papers/vol-05/chapter-outline.md)
 
 ### vol-06　生成モデル・材料逆設計入門（第0章 + 本編 15 章）
 
@@ -192,4 +192,4 @@ Issue / PR は歓迎します。特に以下は大歓迎です。
 
 ---
 
-**Status**: vol-01/02/03 完成 ✅ ｜ vol-04 執筆中 🚧 ｜ vol-05/06 章構成のみ 📋 ｜ Last update: 2026-07-06
+**Status**: vol-01/02/03/04/05 完成 ✅ ｜ vol-06 執筆中 🚧（第I部完 + 第II部 2/4 章） ｜ Last update: 2026-07-07
